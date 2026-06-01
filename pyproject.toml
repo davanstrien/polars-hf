@@ -17,9 +17,9 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    # register_io_source is @unstable in polars; pin a tested range.
     "polars>=1.40,<1.50",
     "huggingface_hub>=1.12",
+    "httpx>=0.27",
 ]
 
 [project.urls]

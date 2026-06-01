@@ -9,13 +9,15 @@ extensions — just `pip install` and scan.
 ## Why
 
 Stock Polars already reads `hf://datasets/...` and `hf://spaces/...` natively. It does **not** yet
-read `hf://buckets/...`. `polars-hf` fills that gap from the outside, using Polars'
-[`register_io_source`](https://docs.pola.rs/user-guide/plugins/io_plugins/) plugin API and
-`huggingface_hub`'s bucket support.
+read `hf://buckets/...`. `polars-hf` fills that gap from the outside.
 
-The heavy lifting stays in Rust: parquet decoding runs in Polars, and bytes are fetched lazily via
-`HfFileSystem` range requests, so **projection, predicate, and row-limit pushdown** only transfer the
-column chunks actually needed.
+It returns a **native** `pl.scan_parquet` LazyFrame: bucket files are XET-backed, so `scan_bucket`
+follows the authenticated Hub `resolve` redirect to a presigned `cas-bridge.xethub.hf.co` URL and
+hands that to Polars. Polars' own Rust object store then does async, concurrent, **range-read**
+scans — so **projection, predicate, and slice pushdown**, streaming, and multi-file concurrency all
+work natively and only the column chunks actually needed are transferred. (This is the same read
+mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Python because stock
+Polars can't attach a bearer token to a generic `https://` URL.)
 
 ## Install
 
@@ -64,6 +66,9 @@ hf://buckets/{namespace}/{name}/{path}
 - Buckets have **no** revision concept, so `@revision` is rejected (matching the Hub).
 - `hf://datasets/...` and `hf://spaces/...` are read natively by Polars — use
   `pl.scan_parquet(...)` for those.
+
+Signed URLs are resolved when `scan_bucket` is called and are valid for ~1 hour. Collect within that
+window; for long-lived query plans, call `scan_bucket` again to refresh.
 
 ## Limitations
 

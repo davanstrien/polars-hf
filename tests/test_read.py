@@ -76,3 +76,11 @@ def test_glob_projection() -> None:
 def test_revision_rejected() -> None:
     with pytest.raises(ValueError, match="do not support @revision"):
         plhf.scan_bucket(f"hf://buckets/{BUCKET}@main/x.parquet").collect()
+
+
+def test_native_parquet_scan_with_range_reads() -> None:
+    # Guard the perf fix: scan_bucket must produce a NATIVE parquet scan over a
+    # signed URL (range reads + pushdown), not a PYTHON SCAN that buffers files.
+    plan = plhf.scan_bucket(SINGLE).explain()
+    assert "Parquet SCAN" in plan
+    assert "PYTHON SCAN" not in plan

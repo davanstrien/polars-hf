@@ -1,23 +1,32 @@
-"""Scan parquet from Hugging Face buckets as a polars ``LazyFrame``.
+"""Scan parquet from Hugging Face buckets as a native polars ``LazyFrame``.
 
-Implemented as a pure-Python polars IO plugin via ``register_io_source``. The
-heavy work stays in Rust: parquet decode runs in polars, and bytes are fetched
-lazily through ``HfFileSystem`` seekable range requests, so projection and
-row-limit pushdown only transfer the column chunks actually needed.
+Bucket files are XET-backed: the Hub ``resolve`` URL 302-redirects (when
+requested with auth) to a presigned ``cas-bridge.xethub.hf.co`` URL that needs
+no auth and supports HTTP range requests. We follow that redirect in Python and
+hand the **signed URLs** to native :func:`polars.scan_parquet`, so polars' Rust
+object store does async, concurrent, range-read scans with full projection /
+predicate / slice pushdown — the same mechanism the upstream ``hf://`` reader
+uses, but reachable from stock polars.
+
+Stock polars cannot authenticate a generic ``https://`` URL itself (bearer-token
+injection is gated behind the ``hf://`` scheme), which is why we resolve the
+signed URL here rather than passing the ``resolve`` URL directly.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import polars as pl
 from huggingface_hub import HfFileSystem
-from polars.io.plugins import register_io_source
+from huggingface_hub.utils import build_hf_headers
 
 from polars_hf._uri import parse_bucket_uri
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
+# Signed URLs are valid for ~1 hour (X-Amz-Expires=3600); resolve at scan time.
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+_MAX_RESOLVE_WORKERS = 16
 
 
 def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
@@ -27,10 +36,8 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     if bp.is_glob:
         files = fs.glob(bp.fs_path)
     elif bp.path.endswith(".parquet"):
-        # A concrete single file.
         return [bp.fs_path]
     else:
-        # A directory (or the whole bucket): expand to all parquet files.
         pattern = f"{bp.fs_path.rstrip('/')}/**/*.parquet"
         files = fs.glob(pattern)
 
@@ -39,8 +46,29 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     return sorted(files)
 
 
+def _signed_url(
+    client: httpx.Client, fs: HfFileSystem, headers: dict, fs_path: str
+) -> str:
+    """Follow the authenticated resolve redirect to a range-readable signed URL."""
+    resolve_url = fs.url(fs_path)
+    r = client.get(resolve_url, headers=headers)
+    if r.status_code in _REDIRECT_CODES and "location" in r.headers:
+        return r.headers["location"]
+    if r.status_code == 200:
+        # Served directly (e.g. a public file): the resolve URL is itself
+        # readable without auth.
+        return resolve_url
+    r.raise_for_status()
+    return resolve_url  # pragma: no cover - raise_for_status covers error codes
+
+
 def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
     """Lazily scan parquet file(s) from a Hugging Face bucket.
+
+    Returns a native polars ``LazyFrame`` (via :func:`polars.scan_parquet` over
+    presigned URLs), so projection, predicate, and slice pushdown, streaming, and
+    multi-file concurrency all work natively — only the column chunks actually
+    needed are transferred.
 
     Parameters
     ----------
@@ -49,14 +77,18 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
         single ``.parquet`` file, a glob (e.g. ``data/*.parquet``), or a
         directory / the whole bucket (expanded to ``**/*.parquet``).
     token
-        Hugging Face token. If ``None``, the token is resolved by
-        ``huggingface_hub`` (the ``HF_TOKEN`` env var or the cached login).
+        Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
+        ``HF_TOKEN`` env var or cached login).
 
     Returns
     -------
     LazyFrame
-        Supports projection, predicate, and row-limit pushdown, and works with
-        the streaming engine.
+
+    Notes
+    -----
+    Signed URLs are resolved when ``scan_bucket`` is called and are valid for
+    ~1 hour. Collect within that window; for long-lived plans, call
+    ``scan_bucket`` again to refresh.
 
     Examples
     --------
@@ -66,31 +98,20 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
     """
     fs = HfFileSystem(token=token)
     files = _list_files(fs, uri)
+    headers = build_hf_headers(token=token)
 
-    with fs.open(files[0], "rb") as f:
-        schema = pl.read_parquet_schema(f)
+    with httpx.Client(follow_redirects=False, timeout=30) as client:
+        if len(files) == 1:
+            urls = [_signed_url(client, fs, headers, files[0])]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(_MAX_RESOLVE_WORKERS, len(files))
+            ) as pool:
+                urls = list(
+                    pool.map(
+                        lambda p: _signed_url(client, fs, headers, p),
+                        files,
+                    )
+                )
 
-    def source(
-        with_columns: list[str] | None,
-        predicate: pl.Expr | None,
-        n_rows: int | None,
-        batch_size: int | None,  # noqa: ARG001 (hint only)
-    ) -> Iterator[pl.DataFrame]:
-        # `remaining` tracks the row-limit budget across files. polars only
-        # pushes `n_rows` when it is safe (i.e. no filter sits below the limit),
-        # so when `predicate` is set `n_rows` is typically None and the engine
-        # applies the final limit itself.
-        remaining = n_rows
-        for path in files:
-            if remaining is not None and remaining <= 0:
-                return
-            with fs.open(path, "rb") as fh:
-                df = pl.read_parquet(fh, columns=with_columns, n_rows=remaining)
-            rows_read = df.height  # source rows read, before filtering
-            if predicate is not None:
-                df = df.filter(predicate)
-            yield df
-            if remaining is not None:
-                remaining -= rows_read
-
-    return register_io_source(source, schema=schema, is_pure=True)
+    return pl.scan_parquet(urls)
