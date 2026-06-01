@@ -1,0 +1,49 @@
+[project]
+name = "polars-hf"
+version = "0.1.0"
+description = "Read and write Hugging Face Hub buckets with Polars, as a pure-Python IO plugin"
+readme = "README.md"
+authors = [
+    { name = "Daniel van Strien", email = "daniel@huggingface.co" }
+]
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["polars", "huggingface", "parquet", "io-plugin", "buckets"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    # register_io_source is @unstable in polars; pin a tested range.
+    "polars>=1.40,<1.50",
+    "huggingface_hub>=1.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/davanstrien/polars-hf"
+Repository = "https://github.com/davanstrien/polars-hf"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.15",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+markers = [
+    "network: tests that hit the Hugging Face Hub (skipped without HF_TOKEN)",
+]
