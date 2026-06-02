@@ -88,6 +88,18 @@ hf://buckets/{namespace}/{name}/{path}
 Signed URLs are resolved when `scan_bucket` is called and are valid for ~1 hour. Collect within that
 window; for long-lived query plans, call `scan_bucket` again to refresh.
 
+## Performance
+
+Bucket reads fetch many small range requests from the XET CDN. Two things dominate:
+
+- **Concurrency.** polars' default cloud-IO concurrency (`max(cpu_threads, 10)`) is low for
+  high-latency object stores. `polars-hf` raises `POLARS_CONCURRENCY_BUDGET` to `64` by default
+  (override by setting it yourself). This is a large win on warm/repeated scans and ~15% on cold.
+- **Cold vs warm CDN.** The *first* read of freshly written/copied data pays a cold-CDN penalty
+  (the bytes aren't at the edge yet); subsequent reads are much faster. For repeated large-scale
+  reads, consider [pre-warming](https://huggingface.co/docs/hub/storage-buckets#pre-warming-and-cdn)
+  the bucket.
+
 ## Limitations
 
 - **Heterogeneous schemas across globbed files are not yet supported** (the equivalent of native
