@@ -20,6 +20,12 @@ work natively and only the column chunks actually needed are transferred. (This 
 mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Python because stock
 Polars can't attach a bearer token to a generic `https://` URL.)
 
+> [!NOTE]
+> **This may be a stopgap.** Native `hf://buckets/...` support is proposed upstream in Polars —
+> [pola-rs/polars#27611](https://github.com/pola-rs/polars/issues/27611) (reads) and
+> [pola-rs/polars#26909](https://github.com/pola-rs/polars/issues/26909) (streaming sink). If those
+> land, `polars-hf` becomes redundant; until then, it fills the gap from the outside.
+
 ## Install
 
 Not on PyPI yet — install from git:
