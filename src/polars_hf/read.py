@@ -33,13 +33,13 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     """Resolve a bucket URI to a sorted list of parquet file paths."""
     bp = parse_bucket_uri(uri)
 
-    if bp.is_glob:
-        files = fs.glob(bp.fs_path)
-    elif bp.path.endswith(".parquet"):
+    if not bp.is_glob and bp.path.endswith(".parquet"):
         return [bp.fs_path]
-    else:
-        pattern = f"{bp.fs_path.rstrip('/')}/**/*.parquet"
-        files = fs.glob(pattern)
+
+    pattern = bp.fs_path if bp.is_glob else f"{bp.fs_path.rstrip('/')}/**/*.parquet"
+    # Avoid a stale dircache when scanning right after an in-process write.
+    fs.invalidate_cache()
+    files = fs.glob(pattern)
 
     if not files:
         raise FileNotFoundError(f"no parquet files matched: {uri!r}")

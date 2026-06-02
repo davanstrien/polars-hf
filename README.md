@@ -46,6 +46,24 @@ df = (
 
 `scan_bucket` returns a lazy `LazyFrame` and works with the streaming engine.
 
+### Writing
+
+```python
+# Single file (parquet/csv/ipc/ndjson; format inferred from the extension):
+plhf.sink_bucket(lf, "hf://buckets/ns/name/out.parquet")
+
+# Partitioned: pass a base prefix + partition options (native pl.PartitionBy):
+plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year")
+plhf.sink_bucket(lf, "hf://buckets/ns/name/shards", max_rows_per_file=1_000_000)
+```
+
+`sink_bucket` accepts a `LazyFrame` (streaming) or a `DataFrame`. Partitioned writes split by key
+(hive `key=value/` layout), by size, or both. Two modes:
+
+- `atomic=True` (default) — stage partitions locally, upload in one commit; bounded by local disk.
+- `atomic=False` — stream each partition straight to the bucket; handles bigger-than-disk, one commit
+  per file (cheap on buckets, which are not git-backed).
+
 ### Authentication
 
 By default the token is resolved by `huggingface_hub` (the `HF_TOKEN` environment variable or your
@@ -74,7 +92,7 @@ window; for long-lived query plans, call `scan_bucket` again to refresh.
 
 - **Heterogeneous schemas across globbed files are not yet supported** (the equivalent of native
   Polars `missing_columns="insert"`). Like Polars' own default, mismatched schemas raise. Planned.
-- Writes (`sink_bucket`) are not implemented yet.
+- Reads cover parquet; writes cover parquet/csv/ipc/ndjson. Delta/Iceberg are out of scope.
 
 ## Development
 
