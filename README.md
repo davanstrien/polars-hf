@@ -1,10 +1,11 @@
 # polars-hf
 
-Read [Hugging Face Hub buckets](https://huggingface.co/docs/hub/storage-backends) with
+Read and write [Hugging Face Hub buckets](https://huggingface.co/docs/hub/storage-buckets) with
 [Polars](https://pola.rs), as a pure-Python **IO plugin**. No fork of Polars, no compiled
-extensions — just `pip install` and scan.
+extensions — just install and scan.
 
-> **Status:** alpha. Reads are implemented; writes (`sink_bucket`) are next.
+> **Status:** alpha, pre-release (not on PyPI yet — install from git, see below).
+> Reads (`scan_bucket`) and writes (`sink_bucket`, including partitioned) are implemented.
 
 ## Why
 
@@ -21,11 +22,36 @@ Polars can't attach a bearer token to a generic `https://` URL.)
 
 ## Install
 
+Not on PyPI yet — install from git:
+
 ```bash
-uv add polars-hf        # or: pip install polars-hf
+uv add "polars-hf @ git+https://github.com/davanstrien/polars-hf"
+# or: pip install "git+https://github.com/davanstrien/polars-hf"
 ```
 
 Requires `polars>=1.40,<1.50` and `huggingface_hub>=1.12`.
+
+### On Hugging Face Jobs
+
+Use a [PEP 723](https://peps.python.org/pep-0723/) inline-dependency script so the Job pulls the
+plugin straight from git — no build, no PyPI:
+
+```python
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["polars-hf @ git+https://github.com/davanstrien/polars-hf@main"]
+# ///
+import polars as pl
+import polars_hf as plhf
+
+plhf.scan_bucket("hf://buckets/me/data/*.parquet").filter(pl.col("score") > 0.5).collect()
+```
+
+```bash
+hf jobs uv run --secrets HF_TOKEN --flavor cpu-upgrade my_script.py
+```
+
+See [`examples/run_on_hf_jobs.py`](examples/run_on_hf_jobs.py) for a runnable example.
 
 ## Usage
 
