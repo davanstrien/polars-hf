@@ -62,7 +62,9 @@ def _signed_url(
     return resolve_url  # pragma: no cover - raise_for_status covers error codes
 
 
-def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
+def scan_bucket(
+    uri: str, *, token: str | None = None, **scan_kwargs: object
+) -> pl.LazyFrame:
     """Lazily scan parquet file(s) from a Hugging Face bucket.
 
     Returns a native polars ``LazyFrame`` (via :func:`polars.scan_parquet` over
@@ -79,6 +81,13 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
         ``HF_TOKEN`` env var or cached login).
+    **scan_kwargs
+        Forwarded to :func:`polars.scan_parquet` — e.g. ``retries=`` for flaky
+        connections, ``missing_columns="insert"`` / ``extra_columns="ignore"``
+        for heterogeneous schemas across globbed files, ``schema=``, or
+        ``cast_options=``. Options that derive meaning from the file *path*
+        (``hive_partitioning=``, ``include_file_paths=``) see the presigned
+        CDN URLs, not the bucket paths, so they are not useful here.
 
     Returns
     -------
@@ -114,4 +123,4 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
                     )
                 )
 
-    return pl.scan_parquet(urls)
+    return pl.scan_parquet(urls, **scan_kwargs)
