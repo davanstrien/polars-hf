@@ -17,7 +17,10 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --locked
+      # --frozen, not --locked: the committed lock embeds settings from a
+      # global uv config (exclude-newer) that CI doesn't have, so a
+      # consistency check would always re-resolve and fail.
+      - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run pytest -q -m "not network"
 
@@ -33,7 +36,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: "3.11"
-      - run: uv sync --locked
+      - run: uv sync --frozen
       - run: uv run pytest -q -m network
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
