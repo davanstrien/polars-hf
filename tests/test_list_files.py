@@ -17,10 +17,11 @@ class _NoListingFS:
         raise AssertionError("single-file paths must not be globbed")
 
 
-@pytest.mark.parametrize("ext", ["parquet", "pq"])
+@pytest.mark.parametrize("ext", ["parquet", "pq", "PARQUET", "Pq"])
 def test_single_file_extensions_skip_listing(ext: str) -> None:
-    # sink_bucket accepts .pq as a parquet extension; scanning the same file
-    # back must take the single-file path, not directory expansion.
+    # sink_bucket accepts .pq as a parquet extension and matches extensions
+    # case-insensitively; scanning the same file back must take the
+    # single-file path, not directory expansion.
     files = _list_files(_NoListingFS(), f"hf://buckets/ns/name/data.{ext}")
     assert files == [f"buckets/ns/name/data.{ext}"]
 

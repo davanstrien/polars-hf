@@ -34,8 +34,9 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     bp = parse_bucket_uri(uri)
 
     # Keep in sync with the parquet extensions accepted by sink_bucket
-    # (write._EXT_FORMAT): a file written as .pq must scan back.
-    if not bp.is_glob and bp.path.endswith((".parquet", ".pq")):
+    # (write._EXT_FORMAT, which matches case-insensitively): a file written
+    # as .pq / .PARQUET must scan back as a single file.
+    if not bp.is_glob and bp.path.lower().endswith((".parquet", ".pq")):
         return [bp.fs_path]
 
     pattern = bp.fs_path if bp.is_glob else f"{bp.fs_path.rstrip('/')}/**/*.parquet"
