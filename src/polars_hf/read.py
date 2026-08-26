@@ -33,7 +33,10 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     """Resolve a bucket URI to a sorted list of parquet file paths."""
     bp = parse_bucket_uri(uri)
 
-    if not bp.is_glob and bp.path.endswith(".parquet"):
+    # Keep in sync with the parquet extensions accepted by sink_bucket
+    # (write._EXT_FORMAT, which matches case-insensitively): a file written
+    # as .pq / .PARQUET must scan back as a single file.
+    if not bp.is_glob and bp.path.lower().endswith((".parquet", ".pq")):
         return [bp.fs_path]
 
     pattern = bp.fs_path if bp.is_glob else f"{bp.fs_path.rstrip('/')}/**/*.parquet"
@@ -74,8 +77,9 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
     ----------
     uri
         An ``hf://buckets/{namespace}/{name}/{path}`` URI. ``path`` may be a
-        single ``.parquet`` file, a glob (e.g. ``data/*.parquet``), or a
-        directory / the whole bucket (expanded to ``**/*.parquet``).
+        single parquet file (``.parquet`` / ``.pq``), a glob (e.g.
+        ``data/*.parquet``), or a directory / the whole bucket (expanded to
+        ``**/*.parquet``).
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
         ``HF_TOKEN`` env var or cached login).
