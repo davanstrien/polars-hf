@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Keep every uv invocation (sync + run) on the committed lock; see the
+  # --frozen note below.
+  UV_FROZEN: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # --frozen, not --locked: the committed lock embeds settings from a
+      # global uv config (exclude-newer) that CI doesn't have, so a
+      # consistency check would always re-resolve and fail.
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run pytest -q -m "not network"
+
+  # Live round-trips against the fixture bucket. Runs on pushes to main only:
+  # the tests write to a real bucket, so they don't run for PRs (and would
+  # race each other across a matrix). Without an HF_TOKEN repo secret the
+  # tests skip and the job stays green.
+  network:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # The tests write fixed paths in one shared bucket: serialize runs so two
+    # close pushes to main can't race on the same objects.
+    concurrency:
+      group: network-fixture-bucket
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest -q -m network
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
