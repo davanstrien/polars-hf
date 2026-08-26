@@ -16,7 +16,7 @@ signed URL here rather than passing the ``resolve`` URL directly.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import polars as pl
@@ -53,18 +53,22 @@ def _signed_url(client: httpx.Client, headers: dict, resolve_url: str) -> str:
 
     Uses HEAD — the same way ``HfApi.get_bucket_file_metadata`` probes this
     endpoint — so no file bytes are transferred (a plain GET would download the
-    whole file when the server serves it directly with a 200). Relative
-    redirects stay on the Hub and are followed with auth; the first absolute
-    ``location`` is the presigned CDN URL, readable without auth.
+    whole file when the server serves it directly with a 200). Redirects that
+    stay on the Hub host (relative, or absolute to the same host) are followed
+    with auth; the first ``location`` on another host is the presigned CDN
+    URL, readable without auth. The auth header is never sent off-host.
     """
+    hub_host = urlparse(resolve_url).netloc
     url = resolve_url
     for _ in range(_MAX_REDIRECT_HOPS):
         r = client.head(url, headers=headers)
         if r.status_code in _REDIRECT_CODES and "location" in r.headers:
-            location = r.headers["location"]
-            if location.startswith(("http://", "https://")):
+            # urljoin resolves relative *and* protocol-relative (//host/..)
+            # locations; compare hosts rather than sniffing the scheme prefix.
+            location = urljoin(url, r.headers["location"])
+            if urlparse(location).netloc != hub_host:
                 return location
-            url = urljoin(url, location)
+            url = location
             continue
         if r.status_code == 200:
             # Served directly (e.g. a public file): the URL is itself

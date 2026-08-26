@@ -47,6 +47,59 @@ def test_relative_redirect_followed_with_auth() -> None:
     assert seen[1].headers["authorization"] == "Bearer hf_test"
 
 
+def test_same_host_absolute_redirect_followed_with_auth() -> None:
+    # An absolute redirect that stays on the Hub host is not the CDN URL: keep
+    # following it (with auth) rather than handing polars an auth-only URL.
+    seen: list[httpx.Request] = []
+    moved = "https://huggingface.co/buckets/ns/renamed/resolve/data.parquet"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(301, headers={"location": moved})
+        return httpx.Response(302, headers={"location": SIGNED})
+
+    headers = {"authorization": "Bearer hf_test"}
+    with _client(handler) as client:
+        assert _signed_url(client, headers, RESOLVE) == SIGNED
+    assert str(seen[1].url) == moved
+    assert seen[1].headers["authorization"] == "Bearer hf_test"
+
+
+def test_protocol_relative_redirect_is_terminal() -> None:
+    # "//host/path" is off-host: return it resolved, and never send the auth
+    # header to that host.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            302, headers={"location": "//cas-bridge.xethub.hf.co/xet-bridge-us/abc"}
+        )
+
+    with _client(handler) as client:
+        got = _signed_url(client, {"authorization": "Bearer hf_test"}, RESOLVE)
+    assert got == "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc"
+    assert len(seen) == 1
+
+
+def test_multiple_relative_hops() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) < 3:
+            return httpx.Response(307, headers={"location": f"/hop{len(seen)}"})
+        return httpx.Response(302, headers={"location": SIGNED})
+
+    with _client(handler) as client:
+        assert _signed_url(client, {}, RESOLVE) == SIGNED
+    assert [str(r.url) for r in seen[1:]] == [
+        "https://huggingface.co/hop1",
+        "https://huggingface.co/hop2",
+    ]
+
+
 def test_direct_200_returns_resolve_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200)
