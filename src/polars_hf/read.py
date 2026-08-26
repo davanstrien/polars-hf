@@ -54,19 +54,23 @@ def _signed_url(client: httpx.Client, headers: dict, resolve_url: str) -> str:
     Uses HEAD — the same way ``HfApi.get_bucket_file_metadata`` probes this
     endpoint — so no file bytes are transferred (a plain GET would download the
     whole file when the server serves it directly with a 200). Redirects that
-    stay on the Hub host (relative, or absolute to the same host) are followed
-    with auth; the first ``location`` on another host is the presigned CDN
-    URL, readable without auth. The auth header is never sent off-host.
+    stay on the Hub origin (relative, or absolute with the same scheme, host
+    and port) are followed with auth; the first ``location`` on another origin
+    is the presigned CDN URL, readable without auth. The auth header is never
+    sent to another origin — including a scheme downgrade on the same host.
     """
-    hub_host = urlparse(resolve_url).netloc
+    hub = urlparse(resolve_url)
+    hub_origin = (hub.scheme, hub.hostname, hub.port)
     url = resolve_url
     for _ in range(_MAX_REDIRECT_HOPS):
         r = client.head(url, headers=headers)
         if r.status_code in _REDIRECT_CODES and "location" in r.headers:
             # urljoin resolves relative *and* protocol-relative (//host/..)
-            # locations; compare hosts rather than sniffing the scheme prefix.
+            # locations; compare origins rather than sniffing the scheme prefix.
+            # (.hostname is lower-cased by urlparse, so host case is ignored.)
             location = urljoin(url, r.headers["location"])
-            if urlparse(location).netloc != hub_host:
+            target = urlparse(location)
+            if (target.scheme, target.hostname, target.port) != hub_origin:
                 return location
             url = location
             continue

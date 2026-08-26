@@ -66,6 +66,39 @@ def test_same_host_absolute_redirect_followed_with_auth() -> None:
     assert seen[1].headers["authorization"] == "Bearer hf_test"
 
 
+def test_same_host_scheme_downgrade_is_terminal() -> None:
+    # Same host but http:// is a different origin: never re-send the Bearer
+    # header in cleartext. Stop, as the old scheme-prefix rule did.
+    seen: list[httpx.Request] = []
+    downgraded = "http://huggingface.co/buckets/ns/name/resolve/data.parquet"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"location": downgraded})
+
+    with _client(handler) as client:
+        got = _signed_url(client, {"authorization": "Bearer hf_test"}, RESOLVE)
+    assert got == downgraded
+    assert len(seen) == 1
+
+
+def test_same_host_case_insensitive() -> None:
+    # Host labels are case-insensitive: an absolute redirect to HuggingFace.co
+    # is still the Hub origin and is followed with auth.
+    seen: list[httpx.Request] = []
+    mixed = "https://HuggingFace.co/buckets/ns/name/resolve2/data.parquet"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"location": mixed})
+        return httpx.Response(302, headers={"location": SIGNED})
+
+    with _client(handler) as client:
+        assert _signed_url(client, {"authorization": "Bearer x"}, RESOLVE) == SIGNED
+    assert seen[1].headers["authorization"] == "Bearer x"
+
+
 def test_protocol_relative_redirect_is_terminal() -> None:
     # "//host/path" is off-host: return it resolved, and never send the auth
     # header to that host.
