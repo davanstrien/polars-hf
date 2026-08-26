@@ -16,6 +16,7 @@ signed URL here rather than passing the ``resolve`` URL directly.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import polars as pl
@@ -27,6 +28,7 @@ from polars_hf._uri import parse_bucket_uri
 # Signed URLs are valid for ~1 hour (X-Amz-Expires=3600); resolve at scan time.
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 _MAX_RESOLVE_WORKERS = 16
+_MAX_REDIRECT_HOPS = 5
 
 
 def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
@@ -49,20 +51,39 @@ def _list_files(fs: HfFileSystem, uri: str) -> list[str]:
     return sorted(files)
 
 
-def _signed_url(
-    client: httpx.Client, fs: HfFileSystem, headers: dict, fs_path: str
-) -> str:
-    """Follow the authenticated resolve redirect to a range-readable signed URL."""
-    resolve_url = fs.url(fs_path)
-    r = client.get(resolve_url, headers=headers)
-    if r.status_code in _REDIRECT_CODES and "location" in r.headers:
-        return r.headers["location"]
-    if r.status_code == 200:
-        # Served directly (e.g. a public file): the resolve URL is itself
-        # readable without auth.
-        return resolve_url
-    r.raise_for_status()
-    return resolve_url  # pragma: no cover - raise_for_status covers error codes
+def _signed_url(client: httpx.Client, headers: dict, resolve_url: str) -> str:
+    """Follow the authenticated resolve redirect to a range-readable signed URL.
+
+    Uses HEAD — the same way ``HfApi.get_bucket_file_metadata`` probes this
+    endpoint — so no file bytes are transferred (a plain GET would download the
+    whole file when the server serves it directly with a 200). Redirects that
+    stay on the Hub origin (relative, or absolute with the same scheme, host
+    and port) are followed with auth; the first ``location`` on another origin
+    is the presigned CDN URL, readable without auth. The auth header is never
+    sent to another origin — including a scheme downgrade on the same host.
+    """
+    hub = urlparse(resolve_url)
+    hub_origin = (hub.scheme, hub.hostname, hub.port)
+    url = resolve_url
+    for _ in range(_MAX_REDIRECT_HOPS):
+        r = client.head(url, headers=headers)
+        if r.status_code in _REDIRECT_CODES and "location" in r.headers:
+            # urljoin resolves relative *and* protocol-relative (//host/..)
+            # locations; compare origins rather than sniffing the scheme prefix.
+            # (.hostname is lower-cased by urlparse, so host case is ignored.)
+            location = urljoin(url, r.headers["location"])
+            target = urlparse(location)
+            if (target.scheme, target.hostname, target.port) != hub_origin:
+                return location
+            url = location
+            continue
+        if r.status_code == 200:
+            # Served directly (e.g. a public file): the URL is itself
+            # readable without auth.
+            return url
+        r.raise_for_status()
+        return url  # pragma: no cover - raise_for_status covers error codes
+    raise RuntimeError(f"too many redirects while resolving {resolve_url!r}")
 
 
 def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
@@ -106,14 +127,14 @@ def scan_bucket(uri: str, *, token: str | None = None) -> pl.LazyFrame:
 
     with httpx.Client(follow_redirects=False, timeout=30) as client:
         if len(files) == 1:
-            urls = [_signed_url(client, fs, headers, files[0])]
+            urls = [_signed_url(client, headers, fs.url(files[0]))]
         else:
             with ThreadPoolExecutor(
                 max_workers=min(_MAX_RESOLVE_WORKERS, len(files))
             ) as pool:
                 urls = list(
                     pool.map(
-                        lambda p: _signed_url(client, fs, headers, p),
+                        lambda p: _signed_url(client, headers, fs.url(p)),
                         files,
                     )
                 )
