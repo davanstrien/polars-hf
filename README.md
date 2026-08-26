@@ -132,12 +132,7 @@ Bucket reads fetch many small range requests from the XET CDN. Two things domina
   reads, consider [pre-warming](https://huggingface.co/docs/hub/storage-buckets#pre-warming-and-cdn)
   the bucket.
 
-## Limitations
-
-- Reads cover parquet; writes cover parquet/csv/ipc/ndjson. Delta/Iceberg are out of scope.
-- Hive-style partition columns are not inferred from paths on read (the presigned CDN URLs don't
-  preserve the bucket paths) — but partitioned writes include the key columns in the files by
-  default, so round-trips keep the data.
+## Scan options
 
 Extra keyword arguments to `scan_bucket` are forwarded to `pl.scan_parquet`, so native options
 work as-is — e.g. heterogeneous schemas across globbed files:
@@ -146,7 +141,16 @@ work as-is — e.g. heterogeneous schemas across globbed files:
 plhf.scan_bucket(uri, missing_columns="insert", extra_columns="ignore")
 ```
 
-or `retries=5` for flaky connections.
+or `retries=5` for flaky connections. Options that derive meaning from the file *path*
+(`hive_partitioning=`, `include_file_paths=`) see the presigned CDN URLs, not the bucket paths,
+so they are not useful here.
+
+## Limitations
+
+- Reads cover parquet; writes cover parquet/csv/ipc/ndjson. Delta/Iceberg are out of scope.
+- Hive-style partition columns are not inferred from paths on read (the presigned CDN URLs don't
+  preserve the bucket paths) — but partitioned writes include the key columns in the files by
+  default, so round-trips keep the data.
 
 ## Development
 
