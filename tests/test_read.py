@@ -78,6 +78,19 @@ def test_revision_rejected() -> None:
         plhf.scan_bucket(f"hf://buckets/{BUCKET}@main/x.parquet").collect()
 
 
+def test_scan_kwargs_forwarded_mixed_schemas() -> None:
+    # The top-level *.parquet fixtures have mixed schemas: scanning them raises
+    # by default (native behavior), but the scan_parquet opt-ins forwarded
+    # through scan_bucket make the union scan work.
+    mixed = f"{BASE}/*.parquet"
+    with pytest.raises(pl.exceptions.PolarsError):
+        plhf.scan_bucket(mixed).collect()
+    got = plhf.scan_bucket(
+        mixed, missing_columns="insert", extra_columns="ignore"
+    ).collect()
+    assert got.height > 0
+
+
 def test_native_parquet_scan_with_range_reads() -> None:
     # Guard the perf fix: scan_bucket must produce a NATIVE parquet scan over a
     # signed URL (range reads + pushdown), not a PYTHON SCAN that buffers files.

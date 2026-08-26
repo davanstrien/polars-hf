@@ -85,7 +85,7 @@ def _partition_by(
 
 
 def _sink_partitioned_atomic(
-    lf, base, bucket_id, prefix, fmt, *, key, max_rows, max_bytes, sink_kwargs, token
+    lf, bucket_id, prefix, fmt, *, key, max_rows, max_bytes, sink_kwargs, token
 ) -> None:
     """Design A: native local partition, then one batched bucket commit."""
     tmpdir = tempfile.mkdtemp(prefix="polars-hf-")
@@ -209,7 +209,6 @@ def sink_bucket(
     if atomic:
         _sink_partitioned_atomic(
             lf,
-            bp.fs_path,
             bp.bucket_id,
             bp.path.rstrip("/"),
             fmt,
