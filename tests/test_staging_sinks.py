@@ -375,3 +375,28 @@ def test_keyboard_interrupt_leaves_destination_unchanged(
     # gets a new one.
     sink(pl.DataFrame({"n": [1]}), _uri(staging_bucket, "after.parquet"))
     assert "after.parquet" in _files(staging_api, staging_bucket)
+
+
+@both_sinks
+def test_path_the_hub_rejects_raises(
+    staging_api: HfApi, staging_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file the Hub refuses must raise with every supported huggingface_hub.
+
+    The package's own path check is switched off, so the backslash reaches the
+    Hub, which rejects that file and applies the others. huggingface_hub 1.x
+    does not report this; the hub backend then finds the missing file with a
+    listing.
+    """
+    monkeypatch.setattr(_sinks, "validate_destination", lambda path: None)
+    df = pl.DataFrame({"g": ["ok", "a\\b", "fine"], "n": [1, 2, 3]})
+
+    with pytest.raises(plhf.BucketRegistrationError) as error:
+        sink(df, _uri(staging_bucket, "parts"), partition_by="g")
+
+    rejected = [failure["path"] for failure in error.value.failures]
+    assert rejected == ["parts/g=a\\b/00000000.parquet"]
+    assert sorted(_files(staging_api, staging_bucket)) == [
+        "parts/g=fine/00000000.parquet",
+        "parts/g=ok/00000000.parquet",
+    ]

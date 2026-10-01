@@ -11,10 +11,11 @@ visible in the bucket until the Polars sink has returned without an error.
 * :class:`HubBackend` lets Polars write into a local temporary directory and
   uploads it with the public ``HfApi.batch_bucket_files``.
 
-The two backends produce the same object names for the same call. The hub
-backend gets the partitioned layout from Polars itself (``pl.PartitionBy`` on
-a local directory); the xet backend rebuilds the same names in
-:func:`partition_file_name`.
+The two backends produce the same object names for the same call: both name
+the files of a partitioned write with :func:`partition_file_name`, which
+rebuilds the layout Polars' own hive provider writes, and both check every
+name with :func:`validate_destination` when Polars asks for the file. Deletes
+(``mode="overwrite"``) are one checked ``/batch`` request in both backends.
 
 Neither backend is transactional: the bucket API has no transactions. Files
 are registered in requests of at most 1,000 operations, and a failure between
@@ -55,6 +56,10 @@ BACKEND_NAMES = ("xet", "hub")
 
 # The Hub client sends at most this many operations per ``/batch`` request.
 BATCH_CHUNK_SIZE = 1000
+
+# Longest path segment accepted, in bytes: the file-name limit of the common
+# local file systems, where the hub backend stages the output.
+MAX_SEGMENT_BYTES = 255
 
 # Threads that finish the upload streams of one xet write.
 _FINISH_THREADS = 16
@@ -131,6 +136,37 @@ def incompatible_xet_error(error: BaseException) -> RuntimeError:
 _API_SHAPE_ERRORS = (TypeError, AttributeError)
 
 
+def _network_errors() -> tuple[type[BaseException], ...]:
+    """Timeouts and connection errors of the HTTP clients huggingface_hub uses."""
+    import httpx
+
+    errors: list[type[BaseException]] = [OSError, httpx.HTTPError]
+    try:
+        import httpx2  # huggingface_hub 2.x
+    except ImportError:
+        pass
+    else:
+        errors.append(httpx2.HTTPError)
+    return tuple(errors)
+
+
+_UNKNOWN_STATE = (
+    "The state of the destination is unknown: the request may or may not have "
+    "been applied. List the destination (for example with "
+    "HfApi.list_bucket_tree) to see which files are registered"
+)
+
+
+def hub_reports_rejected_files() -> bool:
+    """Whether ``HfApi.batch_bucket_files`` raises for rejected operations.
+
+    huggingface_hub 2.x raises ``BucketBatchError`` for the ``failed`` entries
+    of a ``/batch`` answer. Older versions ignore them, so a rejected file is
+    silently missing after a call that returned normally.
+    """
+    return hasattr(huggingface_hub.errors, "BucketBatchError")
+
+
 # ---- destination paths ------------------------------------------------------
 
 
@@ -138,9 +174,12 @@ def validate_destination(path: str) -> None:
     """Raise ``ValueError`` for a bucket path that the Hub refuses.
 
     The Hub rejects a backslash, an empty segment (a leading or trailing
-    slash, ``//``) and the segments ``.`` and ``..``. For a partitioned write
-    the offending segment is the ``key=value`` directory, so the message names
-    the partition value.
+    slash, ``//``) and the segments ``.`` and ``..``. Control characters and
+    segments of more than 255 bytes are refused here as well: the hub backend
+    cannot stage such a name on a local file system, and both backends must
+    accept the same destinations. For a partitioned write the offending
+    segment is the ``key=value`` directory, so the message names the partition
+    column and value.
     """
     for segment in path.split("/"):
         if segment == "":
@@ -149,11 +188,58 @@ def validate_destination(path: str) -> None:
             reason = f"the path segment {segment!r}"
         elif "\\" in segment:
             reason = f"a backslash in the path segment {segment!r}"
+        elif _has_control_character(segment):
+            reason = f"a control character in the path segment {segment!r}"
+        elif len(segment.encode("utf-8")) > MAX_SEGMENT_BYTES:
+            reason = (
+                f"a path segment of more than {MAX_SEGMENT_BYTES} bytes "
+                f"({segment[:40]!r}...)"
+            )
         else:
             continue
         raise ValueError(
-            f"invalid bucket path {path!r}: the Hub does not accept {reason}"
+            f"invalid bucket path {path!r}: sink_bucket does not accept {reason}"
         )
+
+
+def _has_control_character(text: str) -> bool:
+    for character in text:
+        if ord(character) < 0x20 or ord(character) == 0x7F:
+            return True
+    return False
+
+
+class _Destinations:
+    """The bucket paths one partitioned write has handed to Polars."""
+
+    def __init__(self, prefix: str, extension: str) -> None:
+        self.prefix = prefix
+        self.extension = extension
+        self.paths: list[str] = []
+        self._seen: set[str] = set()
+        self._lock = threading.Lock()
+
+    def claim(self, args: Any) -> tuple[str, str]:
+        """Name the file Polars asks for: ``(relative path, bucket path)``.
+
+        ``args`` is what Polars passes to a ``file_path_provider``. Raises for
+        a path the bucket would refuse and for a path asked for twice (a
+        second file would replace the first one under the same name).
+        """
+        relative = partition_file_name(
+            args.partition_keys, args.index_in_partition, self.extension
+        )
+        path = join_path(self.prefix, relative)
+        validate_destination(path)
+        with self._lock:
+            if path in self._seen:
+                raise RuntimeError(
+                    f"Polars asked twice for the output file {path!r}; refusing to "
+                    "write two files under one name"
+                )
+            self._seen.add(path)
+            self.paths.append(path)
+        return relative, path
 
 
 # ---- object names -----------------------------------------------------------
@@ -239,6 +325,7 @@ class SinkBackend(ABC):
         self.bucket_id = bucket_id
         self.token = token
         self.api = HfApi(token=token)
+        self.headers = build_hf_headers(token=token)
 
     @abstractmethod
     def write_file(self, run_sink: RunSink, path: str) -> list[str]:
@@ -253,9 +340,60 @@ class SinkBackend(ABC):
         The list is empty when the query produced no file.
         """
 
-    @abstractmethod
     def delete(self, paths: list[str]) -> None:
-        """Delete objects from the bucket."""
+        """Delete objects from the bucket (a missing path is not an error)."""
+        operations = []
+        for path in paths:
+            operations.append({"type": "deleteFile", "path": path})
+        self._post_batch(operations)
+
+    def _post_batch(self, operations: list[dict]) -> None:
+        """Send operations to the bucket, at most 1,000 per request."""
+        url = f"{self.api.endpoint}/api/buckets/{self.bucket_id}/batch"
+        headers = {"Content-Type": "application/x-ndjson", **self.headers}
+        for chunk in _chunks(operations, BATCH_CHUNK_SIZE):
+            lines = []
+            for operation in chunk:
+                lines.append(json.dumps(operation).encode() + b"\n")
+            body = b"".join(lines)
+            # http_backoff retries 429 and 5xx answers and connection errors.
+            # A repeated request is harmless: the operations are idempotent.
+            try:
+                response = http_backoff("POST", url, headers=headers, content=body)
+            except _API_SHAPE_ERRORS as error:
+                raise incompatible_xet_error(error) from error
+            except _network_errors() as error:
+                raise BucketRegistrationError(
+                    f"the registration request to bucket {self.bucket_id!r} got "
+                    f"no answer ({type(error).__name__}: {error}). {_UNKNOWN_STATE}."
+                ) from error
+            self._check_batch_response(response, sent=len(chunk))
+
+    def _check_batch_response(self, response: Any, sent: int) -> None:
+        """Raise unless the bucket applied all ``sent`` operations."""
+        # Rejected operations are listed in the body of a 200 (some failed)
+        # or of a 422 (all failed).
+        failures = None
+        if response.status_code in (200, 422):
+            try:
+                failures = response.json().get("failed", [])
+            except (ValueError, AttributeError):
+                failures = None
+            if failures:
+                message = _rejected(self.bucket_id, failures, sent)
+                raise BucketRegistrationError(message, failures)
+        try:
+            hf_raise_for_status(response)
+        except HfHubHTTPError as error:
+            raise BucketRegistrationError(
+                f"the registration in bucket {self.bucket_id!r} failed: {error}"
+            ) from error
+        if failures is None:
+            raise BucketRegistrationError(
+                f"bucket {self.bucket_id!r} answered {response.status_code} to a "
+                "registration request with a body that is not the expected JSON. "
+                f"{_UNKNOWN_STATE}."
+            )
 
 
 # ---- hub backend ------------------------------------------------------------
@@ -274,15 +412,56 @@ class HubBackend(SinkBackend):
         super().__init__(bucket_id, token)
         self.staging_dir = os.environ.get(STAGING_DIR_ENV_VAR) or None
 
-    def _batch(self, **operations: Any) -> None:
-        """``HfApi.batch_bucket_files``, with its errors as one error type."""
+    def _add(self, additions: list[tuple[str, str]], listing_prefix: str) -> None:
+        """Upload ``(local path, bucket path)`` pairs with the public API.
+
+        ``listing_prefix`` is a string prefix of all the bucket paths; it is
+        used to check the result when the client does not report rejections.
+        """
+        sizes = {}
+        for local, destination in additions:
+            sizes[destination] = os.path.getsize(local)
         try:
-            self.api.batch_bucket_files(self.bucket_id, **operations)
+            self.api.batch_bucket_files(self.bucket_id, add=additions)
         except HfHubHTTPError as error:
             raise BucketRegistrationError(
                 f"the upload to bucket {self.bucket_id!r} failed: {error}",
                 getattr(error, "failures", None),
             ) from error
+        except _network_errors() as error:
+            raise BucketRegistrationError(
+                f"the upload to bucket {self.bucket_id!r} got no answer "
+                f"({type(error).__name__}: {error}). {_UNKNOWN_STATE}."
+            ) from error
+        if not hub_reports_rejected_files():
+            self._verify_added(sizes, listing_prefix)
+
+    def _verify_added(self, sizes: dict[str, int], listing_prefix: str) -> None:
+        """Raise if a file of ``{bucket path: size}`` is not in the bucket.
+
+        huggingface_hub 1.x returns normally when the bucket rejects single
+        files, so the destination is listed once after the upload.
+        """
+        listed = {}
+        items = self.api.list_bucket_tree(
+            self.bucket_id, prefix=listing_prefix or None, recursive=True
+        )
+        for item in items:
+            if getattr(item, "type", None) == "file":
+                listed[item.path] = item.size
+        failures = []
+        for path, size in sizes.items():
+            if path not in listed:
+                error = "not in the bucket after the upload"
+            elif listed[path] != size:
+                error = f"has {listed[path]} bytes in the bucket, expected {size}"
+            else:
+                continue
+            failures.append({"path": path, "error": error})
+        if failures:
+            raise BucketRegistrationError(
+                _rejected(self.bucket_id, failures, len(sizes)), failures
+            )
 
     @contextmanager
     def _staging(self) -> Iterator[str]:
@@ -296,31 +475,31 @@ class HubBackend(SinkBackend):
         with self._staging() as directory:
             local = os.path.join(directory, "data")
             run_sink(local)
-            self._batch(add=[(local, path)])
+            self._add([(local, path)], listing_prefix=path)
         return [path]
 
     def write_partitioned(
         self, run_sink: RunSink, prefix: str, spec: PartitionSpec
     ) -> list[str]:
-        with self._staging() as directory:
-            run_sink(spec.partition_by(directory))
-            additions = []
-            for root, _, names in os.walk(directory):
-                for name in names:
-                    local = os.path.join(root, name)
-                    relative = os.path.relpath(local, directory).replace(os.sep, "/")
-                    additions.append((local, join_path(prefix, relative)))
-            additions.sort(key=lambda addition: addition[1])
-            # Before the upload: one refused path must not leave the others.
-            for _, destination in additions:
-                validate_destination(destination)
-            if additions:
-                self._batch(add=additions)
-        return [destination for _, destination in additions]
+        destinations = _Destinations(prefix, spec.extension)
+        additions = []
 
-    def delete(self, paths: list[str]) -> None:
-        if paths:
-            self._batch(delete=paths)
+        def provider(args: Any) -> str:
+            # The same names, checks and errors as the xet backend. Polars
+            # creates the directories below the staging directory.
+            relative, path = destinations.claim(args)
+            additions.append((relative, path))
+            return relative
+
+        with self._staging() as directory:
+            run_sink(spec.partition_by(directory, file_path_provider=provider))
+            local_additions = []
+            for relative, path in sorted(additions, key=lambda item: item[1]):
+                local = os.path.join(directory, *relative.split("/"))
+                local_additions.append((local, path))
+            if local_additions:
+                self._add(local_additions, listing_prefix=prefix)
+        return [path for _, path in local_additions]
 
 
 # ---- xet backend ------------------------------------------------------------
@@ -519,10 +698,6 @@ class XetBackend(SinkBackend):
 
     name = "xet"
 
-    def __init__(self, bucket_id: str, token: str | None) -> None:
-        super().__init__(bucket_id, token)
-        self.headers = build_hf_headers(token=token)
-
     def _upload(self, write: Callable[[_XetUpload], None]) -> list[str]:
         """Run ``write`` against a new commit; register its files on success."""
         try:
@@ -547,7 +722,13 @@ class XetBackend(SinkBackend):
             except _API_SHAPE_ERRORS as error:
                 raise incompatible_xet_error(error) from error
         except KeyboardInterrupt:
-            commit.interrupt()
+            # Cancel this commit, then the shared session. Neither call may
+            # replace the KeyboardInterrupt.
+            for stop in (commit.abort, commit.interrupt):
+                try:
+                    stop()
+                except Exception:
+                    pass
             raise
         except BaseException as error:
             try:
@@ -573,49 +754,6 @@ class XetBackend(SinkBackend):
             operation["contentType"] = content_type
         return operation
 
-    def _post_batch(self, operations: list[dict]) -> None:
-        """Send operations to the bucket, at most 1,000 per request."""
-        url = f"{self.api.endpoint}/api/buckets/{self.bucket_id}/batch"
-        headers = {"Content-Type": "application/x-ndjson", **self.headers}
-        for chunk in _chunks(operations, BATCH_CHUNK_SIZE):
-            lines = []
-            for operation in chunk:
-                lines.append(json.dumps(operation).encode() + b"\n")
-            body = b"".join(lines)
-            # http_backoff retries 429 and 5xx answers and connection errors.
-            # A repeated request is harmless: the operations are idempotent.
-            try:
-                response = http_backoff("POST", url, headers=headers, content=body)
-            except _API_SHAPE_ERRORS as error:
-                raise incompatible_xet_error(error) from error
-            self._check_batch_response(response, sent=len(chunk))
-
-    def _check_batch_response(self, response: Any, sent: int) -> None:
-        """Raise unless the bucket applied all ``sent`` operations."""
-        # Rejected operations are listed in the body of a 200 (some failed)
-        # or of a 422 (all failed).
-        failures = None
-        if response.status_code in (200, 422):
-            try:
-                failures = response.json().get("failed", [])
-            except (ValueError, AttributeError):
-                failures = None
-            if failures:
-                message = _rejected(self.bucket_id, failures, sent)
-                raise BucketRegistrationError(message, failures)
-        try:
-            hf_raise_for_status(response)
-        except HfHubHTTPError as error:
-            raise BucketRegistrationError(
-                f"the registration in bucket {self.bucket_id!r} failed: {error}"
-            ) from error
-        if failures is None:
-            raise BucketRegistrationError(
-                f"bucket {self.bucket_id!r} answered {response.status_code} to a "
-                "registration request with a body that is not the expected JSON; "
-                "the state of the operations is unknown"
-            )
-
     def write_file(self, run_sink: RunSink, path: str) -> list[str]:
         def write(upload: _XetUpload) -> None:
             run_sink(upload.open(path))
@@ -625,23 +763,17 @@ class XetBackend(SinkBackend):
     def write_partitioned(
         self, run_sink: RunSink, prefix: str, spec: PartitionSpec
     ) -> list[str]:
+        destinations = _Destinations(prefix, spec.extension)
+
         def write(upload: _XetUpload) -> None:
             def provider(args: Any) -> _StreamWriter:
-                relative = partition_file_name(
-                    args.partition_keys, args.index_in_partition, spec.extension
-                )
-                return upload.open(join_path(prefix, relative))
+                _, path = destinations.claim(args)
+                return upload.open(path)
 
             # The base path is not used: the provider returns file objects.
             run_sink(spec.partition_by("unused", file_path_provider=provider))
 
         return sorted(self._upload(write))
-
-    def delete(self, paths: list[str]) -> None:
-        operations = []
-        for path in paths:
-            operations.append({"type": "deleteFile", "path": path})
-        self._post_batch(operations)
 
 
 # ---- selection --------------------------------------------------------------

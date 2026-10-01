@@ -423,8 +423,38 @@ def test_keyboard_interrupt_stops_the_xet_session(
     with pytest.raises(KeyboardInterrupt):
         backend.write_file(interrupted, "out.parquet")
 
-    assert [commit.aborted for commit in fake_hub.commits] == [True]
+    # The commit is cancelled and the shared session is stopped.
+    (commit,) = fake_hub.commits
+    assert commit.aborted
+    assert commit.interrupted
     assert fake_hub.batch_calls == []
+
+
+@pytest.mark.parametrize("broken", ["abort", "interrupt"])
+def test_keyboard_interrupt_survives_a_failing_cleanup(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, broken: str
+) -> None:
+    from fakehub import MemoryCommit
+
+    calls = []
+
+    def fails(self: MemoryCommit) -> None:
+        calls.append(broken)
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(MemoryCommit, broken, fails)
+    backend = _sinks.XetBackend(fake_bucket, token=None)
+
+    def interrupted(target: object) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        backend.write_file(interrupted, "out.parquet")
+
+    # The other cleanup call still ran.
+    assert calls == [broken]
+    (commit,) = fake_hub.commits
+    assert commit.aborted or commit.interrupted
 
 
 def test_rejected_registration_raises_with_the_failed_paths(
@@ -1064,3 +1094,242 @@ def test_changed_registration_helper_signature_is_reported(
 
     _assert_incompatible(error)
     assert fake_hub.files(fake_bucket) == []
+
+
+# ---- review round 2 --------------------------------------------------------
+
+
+@both_sinks
+@pytest.mark.parametrize(
+    ("frame", "key", "message"),
+    [
+        (
+            pl.DataFrame({"g": ["ok", "x" * 300], "n": [1, 2]}),
+            "g",
+            "a path segment of more than 255 bytes",
+        ),
+        (
+            pl.DataFrame({"a\nb": ["v"], "n": [1]}),
+            "a\nb",
+            "a control character in the path segment 'a\\nb=v'",
+        ),
+        (
+            pl.DataFrame({"a\x00b": ["v"], "n": [1]}),
+            "a\x00b",
+            "a control character in the path segment",
+        ),
+    ],
+)
+def test_partition_names_no_backend_can_write_are_rejected(
+    fake_hub: FakeHub, fake_bucket: str, sink, frame: pl.DataFrame, key: str, message
+) -> None:
+    # The same error from both backends, raised when Polars asks for the file.
+    with pytest.raises(ValueError) as error:
+        sink(frame, _uri(fake_bucket, "parts"), partition_by=key)
+
+    assert message in str(error.value)
+    assert fake_hub.files(fake_bucket) == []
+    assert fake_hub.batch_calls == []
+    assert all(commit.aborted for commit in fake_hub.commits)
+
+
+@both_sinks
+@pytest.mark.parametrize("path", ["a\tb/c", "x" * 256, "nul\x00/c"])
+def test_destination_no_backend_can_write_is_rejected(
+    fake_hub: FakeHub, fake_bucket: str, sink, path: str
+) -> None:
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    with pytest.raises(ValueError, match="invalid bucket path"):
+        sink(df, f"hf://buckets/{fake_bucket}/{path}", partition_by="g")
+    with pytest.raises(ValueError, match="invalid bucket path"):
+        sink(df, f"hf://buckets/{fake_bucket}/{path}.parquet")
+
+    assert fake_hub.requests == []
+
+
+def test_segment_of_255_bytes_is_accepted(fake_hub: FakeHub, fake_bucket: str) -> None:
+    value = "x" * (255 - len("g="))
+    df = pl.DataFrame({"g": [value], "n": [1]})
+
+    for name, sink in (("xet", sink_streamed), ("hub", sink_staged)):
+        sink(df, _uri(fake_bucket, name), partition_by="g")
+
+    assert fake_hub.files(fake_bucket) == [
+        f"hub/g={value}/00000000.parquet",
+        f"xet/g={value}/00000000.parquet",
+    ]
+
+
+def test_same_output_file_asked_twice_is_refused() -> None:
+    from types import SimpleNamespace
+
+    destinations = _sinks._Destinations("parts", "parquet")
+    args = SimpleNamespace(
+        partition_keys=pl.DataFrame({"g": ["a"]}), index_in_partition=0
+    )
+
+    assert destinations.claim(args) == (
+        "g=a/00000000.parquet",
+        "parts/g=a/00000000.parquet",
+    )
+    with pytest.raises(RuntimeError, match="asked twice for the output file"):
+        destinations.claim(args)
+    assert destinations.paths == ["parts/g=a/00000000.parquet"]
+
+
+@both_sinks
+def test_overwrite_delete_is_a_checked_request(
+    fake_hub: FakeHub, fake_bucket: str, sink
+) -> None:
+    # Both backends delete through the package's own /batch request, whose
+    # answer is checked with every supported huggingface_hub.
+    fake_hub.put(fake_bucket, "out/stale.txt", b"stale")
+    df = pl.DataFrame({"n": [1]})
+
+    sink(df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite")
+
+    deletes = [call for call in fake_hub.batch_calls if call.deleted]
+    assert [(call.via, call.deleted) for call in deletes] == [
+        ("http", ["out/stale.txt"])
+    ]
+
+
+# -- hub backend with a client that does not report rejected files (hub 1.x) --
+
+
+def test_hub_backend_detects_a_file_the_client_dropped_silently(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: False)
+    fake_hub.drop_paths = {"parts/g=b/00000000.parquet"}
+    df = pl.DataFrame({"g": ["a", "b", "c"], "n": [1, 2, 3]})
+
+    with pytest.raises(BucketRegistrationError) as error:
+        sink_staged(df, _uri(fake_bucket, "parts"), partition_by="g")
+
+    assert error.value.failures == [
+        {
+            "path": "parts/g=b/00000000.parquet",
+            "error": "not in the bucket after the upload",
+        }
+    ]
+    assert "rejected 1 of 3 operation(s)" in str(error.value)
+
+
+def test_hub_backend_detects_a_dropped_single_file(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: False)
+    # A sibling with the same string prefix must not hide the missing file.
+    fake_hub.put(fake_bucket, "out.parquet.bak", b"sibling")
+    fake_hub.drop_paths = {"out.parquet"}
+
+    with pytest.raises(BucketRegistrationError, match="not in the bucket"):
+        sink_staged(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "out.parquet"))
+
+
+def test_hub_backend_verification_passes_and_costs_one_listing(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    df = pl.DataFrame({"g": ["a", "b"], "n": [1, 2]})
+    listings = {}
+    for reports in (True, False):
+        monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda r=reports: r)
+        fake_hub.reset_log()
+        sink_staged(df, _uri(fake_bucket, f"parts-{reports}"), partition_by="g")
+        listings[reports] = len(
+            fake_hub.matching(origin=HUB, method="GET", path_contains="/tree")
+        )
+
+    assert listings == {True: 0, False: 1}
+
+
+def test_verification_reports_a_wrong_size(fake_hub: FakeHub, fake_bucket: str) -> None:
+    fake_hub.put(fake_bucket, "dir/a.bin", b"12345")
+    fake_hub.put(fake_bucket, "dir/b.bin", b"123")
+    backend = _sinks.HubBackend(fake_bucket, token=None)
+
+    backend._verify_added({"dir/a.bin": 5, "dir/b.bin": 3}, "dir")
+    with pytest.raises(BucketRegistrationError) as error:
+        backend._verify_added({"dir/a.bin": 5, "dir/b.bin": 4, "dir/c.bin": 1}, "dir")
+
+    assert error.value.failures == [
+        {"path": "dir/b.bin", "error": "has 3 bytes in the bucket, expected 4"},
+        {"path": "dir/c.bin", "error": "not in the bucket after the upload"},
+    ]
+
+
+def test_installed_hub_reports_rejected_files_from_2_0() -> None:
+    import huggingface_hub
+
+    major = int(huggingface_hub.__version__.split(".")[0])
+
+    assert _sinks.hub_reports_rejected_files() == (major >= 2)
+
+
+# -- network failures --------------------------------------------------------
+
+
+def _assert_unknown_state(error: pytest.ExceptionInfo, cause: type) -> None:
+    assert isinstance(error.value.__cause__, cause)
+    message = str(error.value)
+    assert "state of the destination is unknown" in message
+    assert "list_bucket_tree" in message
+
+
+def test_network_error_of_the_registration_request_is_wrapped(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    def no_answer(*args: object, **kwargs: object) -> None:
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(_sinks, "http_backoff", no_answer)
+
+    with pytest.raises(BucketRegistrationError) as error:
+        sink_streamed(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
+
+    _assert_unknown_state(error, httpx.ReadTimeout)
+
+
+@pytest.mark.parametrize("backend_sink", ALL_SINKS)
+def test_network_error_of_the_delete_request_is_wrapped(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, backend_sink
+) -> None:
+    fake_hub.put(fake_bucket, "out/stale.txt", b"stale")
+    real = _sinks.http_backoff
+
+    def no_answer_for_deletes(method: str, url: str, **kwargs: object):
+        if b"deleteFile" in kwargs["content"]:
+            raise ConnectionResetError("connection reset")
+        return real(method, url, **kwargs)
+
+    monkeypatch.setattr(_sinks, "http_backoff", no_answer_for_deletes)
+    df = pl.DataFrame({"n": [1]})
+
+    with pytest.raises(BucketRegistrationError) as error:
+        backend_sink(
+            df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite"
+        )
+
+    _assert_unknown_state(error, ConnectionResetError)
+    assert fake_hub.files(fake_bucket) == ["out/00000000.parquet", "out/stale.txt"]
+
+
+def test_network_error_of_the_hub_upload_is_wrapped(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+    from huggingface_hub import HfApi
+
+    def no_answer(self: HfApi, bucket_id: str, **kwargs: object) -> None:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(HfApi, "batch_bucket_files", no_answer)
+
+    with pytest.raises(BucketRegistrationError) as error:
+        sink_staged(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
+
+    _assert_unknown_state(error, httpx.ConnectError)

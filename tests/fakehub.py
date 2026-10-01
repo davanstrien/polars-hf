@@ -202,6 +202,7 @@ class MemoryCommit:
         self.streams: list[_MemoryStream] = []
         self.finished = False
         self.aborted = False
+        self.interrupted = False
 
     def open_stream(self, name: str) -> _MemoryStream:
         stream = _MemoryStream(self, name)
@@ -222,7 +223,9 @@ class MemoryCommit:
         self.aborted = True
 
     def interrupt(self) -> None:
-        self.aborted = True
+        # The real method stops the shared Xet session; it does not abort
+        # this commit.
+        self.interrupted = True
 
 
 def _is_valid_destination(path: str) -> bool:
@@ -260,6 +263,10 @@ class FakeHub:
     reject_paths
         ``addFile`` operations of a ``POST .../batch`` request for these paths
         are refused and listed in ``failed``; the others are applied.
+    drop_paths
+        The patched ``HfApi._batch_bucket_files`` does not store these paths
+        and raises nothing, like huggingface_hub 1.x when the bucket rejects
+        single files of a request.
     commits
         Every :class:`MemoryCommit` opened by the xet backend.
     fail_stream_write_on_call, fail_stream_finish_on_call
@@ -276,6 +283,7 @@ class FakeHub:
         self.batch_calls: list[BatchCall] = []
         self.fail_batch_on_call: int | None = None
         self.reject_paths: set[str] = set()
+        self.drop_paths: set[str] = set()
         self.commits: list[MemoryCommit] = []
         self.fail_stream_write_on_call: int | None = None
         self.fail_stream_finish_on_call: int | None = None
@@ -548,6 +556,8 @@ class FakeHub:
         with self._lock:
             bucket = self._buckets[bucket_id]
             for destination, data in contents.items():
+                if destination in self.drop_paths:
+                    continue
                 bucket[destination] = data
                 self._blobs[_content_hash(data)] = data
                 call.added[destination] = len(data)
