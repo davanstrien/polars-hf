@@ -1,4 +1,4 @@
-"""Partitioned-write tests for sink_bucket (default and streamed writes), on staging.
+"""Partitioned-write tests for sink_bucket (both sink backends), on staging.
 
 Selected with ``pytest -m staging``. Each test writes to its own new bucket
 (the ``staging_bucket`` fixture), so tests cannot race on shared paths.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 from huggingface_hub import HfApi
-from sinks import sink_default, sink_streamed
+from sinks import sink_default, staging_sinks
 
 import polars_hf as plhf
 
@@ -27,7 +27,7 @@ def _bucket_parquet(api: HfApi, bucket_id: str, prefix_in_bucket: str) -> list[s
     )
 
 
-@pytest.mark.parametrize("sink", [sink_default, sink_streamed])
+@pytest.mark.parametrize("sink", staging_sinks())
 def test_partition_by_key(staging_api: HfApi, staging_bucket: str, sink) -> None:
     df = pl.DataFrame({"g": ["a", "a", "b", "c", "c", "c"], "n": range(6)})
     base = f"hf://buckets/{staging_bucket}/ptest/k"
@@ -42,7 +42,7 @@ def test_partition_by_key(staging_api: HfApi, staging_bucket: str, sink) -> None
     assert any("g=c/" in f for f in files)
 
 
-@pytest.mark.parametrize("sink", [sink_default, sink_streamed])
+@pytest.mark.parametrize("sink", staging_sinks())
 def test_partition_by_size(staging_api: HfApi, staging_bucket: str, sink) -> None:
     df = pl.DataFrame({"n": range(1000)})
     base = f"hf://buckets/{staging_bucket}/ptest/s"
