@@ -20,7 +20,7 @@ from hypothesis import HealthCheck, Phase, given, settings
 from hypothesis import strategies as st
 from polars.testing import assert_frame_equal
 from polars.testing.parametric import dataframes
-from sinks import sink_default, sink_streamed
+from sinks import ALL_SINKS, sink_streamed
 
 import polars_hf as plhf
 from polars_hf._uri import BucketPath, parse_bucket_uri
@@ -307,7 +307,7 @@ def test_single_file_round_trip(
     # The fixtures are shared by all examples: each one overwrites the file.
     uri = f"hf://buckets/{fake_bucket}/prop/single.parquet"
 
-    plhf.sink_bucket(df, uri)
+    plhf.sink_bucket(df, uri, mode="overwrite")
     back = plhf.scan_bucket(uri).collect()
 
     assert_frame_equal(back, df)
@@ -394,7 +394,7 @@ _safe_keys = st.text(
 @settings(_round_trip_settings, max_examples=6)
 @given(
     keys=st.lists(_safe_keys, min_size=1, max_size=4),
-    sink=st.sampled_from([sink_default, sink_streamed]),
+    sink=st.sampled_from(ALL_SINKS),
     max_rows=st.sampled_from([None, 1, 3]),
 )
 def test_partitioned_round_trip(
@@ -433,12 +433,6 @@ def _native_partition_directories(df: pl.DataFrame, key: str) -> set[str]:
         return {entry.name for entry in Path(tmp).iterdir()}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug c: the streamed write does not use the native Polars hive "
-    "encoding for partition directory names",
-)
 @settings(
     max_examples=40,
     phases=[Phase.explicit, Phase.generate],

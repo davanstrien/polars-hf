@@ -14,6 +14,7 @@ def test_version_comes_from_package_metadata() -> None:
 def test_public_api() -> None:
     assert sorted(plhf.__all__) == [
         "BucketPath",
+        "BucketRegistrationError",
         "parse_bucket_uri",
         "scan_bucket",
         "sink_bucket",
