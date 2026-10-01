@@ -231,6 +231,14 @@ def test_backends_write_the_same_object_names(
     assert f"g=a%2Fb/b=true/00000000.{extension}" in streamed
     null = "__HIVE_DEFAULT_PARTITION__"
     assert f"g={null}/b={null}/00000000.{extension}" in streamed
+    # Every name holds the same rows with both backends.
+    for name in streamed:
+        from_streamed = fake_hub.read(fake_bucket, f"streamed/{name}")
+        from_staged = fake_hub.read(fake_bucket, f"staged/{name}")
+        assert_frame_equal(
+            _READERS[fmt](io.BytesIO(from_streamed)),
+            _READERS[fmt](io.BytesIO(from_staged)),
+        )
 
 
 @both_sinks

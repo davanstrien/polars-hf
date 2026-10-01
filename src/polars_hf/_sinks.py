@@ -32,6 +32,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,9 @@ BACKEND_NAMES = ("xet", "hub")
 
 # The Hub client sends at most this many operations per ``/batch`` request.
 BATCH_CHUNK_SIZE = 1000
+
+# Threads that finish the upload streams of one xet write.
+_FINISH_THREADS = 16
 
 # File extension Polars gives the files of a partitioned sink, per format.
 PARTITION_EXTENSION = {
@@ -403,6 +407,20 @@ class _XetUpload:
                 self.write_error = error
 
 
+def _finish_streams(writers: list[_StreamWriter]) -> list[Any]:
+    """Finish every upload stream; return the results in the order of ``writers``.
+
+    ``finish()`` blocks on the network for each stream, so the calls run in a
+    small thread pool. The first error is raised after all calls have ended.
+    """
+    if len(writers) <= 1:
+        return [writer.stream.finish() for writer in writers]
+    workers = min(_FINISH_THREADS, len(writers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(writer.stream.finish) for writer in writers]
+    return [future.result() for future in futures]
+
+
 def _chunks(items: list, size: int) -> Iterator[list]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
@@ -432,8 +450,8 @@ class XetBackend(SinkBackend):
             if not upload.writers:
                 commit.abort()
                 return []
-            for writer in upload.writers:
-                result = writer.stream.finish()
+            results = _finish_streams(upload.writers)
+            for writer, result in zip(upload.writers, results, strict=True):
                 operations.append(self._add_operation(writer.path, result))
             commit.wait_to_finish()
         except KeyboardInterrupt:
