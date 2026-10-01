@@ -24,7 +24,7 @@ from sinks import sink_default, sink_streamed
 
 import polars_hf as plhf
 from polars_hf._uri import BucketPath, parse_bucket_uri
-from polars_hf.read import _MAX_REDIRECT_HOPS, _signed_url
+from polars_hf.read import _MAX_REDIRECT_HOPS, _Budget, _signed_url
 
 # ---- URI parsing -----------------------------------------------------------
 
@@ -229,7 +229,7 @@ def test_signed_url_never_sends_auth_off_origin(
     with hub_session(handler):
         try:
             result = _signed_url(
-                RESOLVE, AUTH, bucket_id="ns/name", uri="hf://buckets/ns/name/x"
+                RESOLVE, AUTH, uri="hf://buckets/ns/name/x", budget=_Budget("ns/name")
             )
         except RuntimeError as raised:
             error = raised

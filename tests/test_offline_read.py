@@ -329,9 +329,83 @@ def test_glob_is_one_listing_and_one_resolve_per_match(
     assert (
         _hub_calls(fake_hub) == [("GET", "tree", 200)] + [("HEAD", "resolve", 302)] * 3
     )
+    # The glob is in the last segment: its directory is listed, not the subtree.
     listing = fake_hub.matching(origin=HUB, method="GET")[0]
-    assert listing.path.endswith("/tree/data/run_")
-    assert listing.query == "recursive=true"
+    assert listing.path.endswith("/tree/data")
+    assert listing.query == "recursive=false"
+
+
+@pytest.mark.parametrize("path", ["data", "data/**/*.parquet"])
+def test_directory_and_recursive_glob_list_the_subtree(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+    fake_hub.put_parquet(fake_bucket, "data/x/y/b.parquet", _numbered_frame(5, 5))
+
+    plhf.scan_bucket(_uri(fake_bucket, path))
+
+    listings = fake_hub.matching(origin=HUB, method="GET")
+    assert [request.query for request in listings] == ["recursive=true"]
+    assert len(fake_hub.matching(origin=HUB, method="HEAD")) == 2
+
+
+def test_one_directory_glob_does_not_read_sub_directories(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+    for i in range(30):
+        fake_hub.put_parquet(
+            fake_bucket, f"data/sub/{i}.parquet", _numbered_frame(i, 1)
+        )
+    fake_hub.tree_page_size = 10
+
+    got = plhf.scan_bucket(_uri(fake_bucket, "data/*.parquet")).collect()
+
+    assert_frame_equal(got, _numbered_frame(0, 5))
+    # One page: the 30 files of data/sub are one directory entry.
+    assert len(fake_hub.matching(origin=HUB, method="GET")) == 1
+
+
+@pytest.mark.parametrize("path", ["data", "data/*.parquet"])
+def test_paginated_listing_is_read_to_the_end(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    n_files = 7
+    for i in range(n_files):
+        fake_hub.put_parquet(fake_bucket, f"data/p{i}.parquet", _numbered_frame(i, 1))
+    fake_hub.tree_page_size = 3
+
+    got = plhf.scan_bucket(_uri(fake_bucket, path)).collect()
+
+    assert sorted(got["id"].to_list()) == list(range(n_files))
+    listings = fake_hub.matching(origin=HUB, method="GET")
+    assert len(listings) == 3
+    assert all(request.has_authorization for request in listings)
+    assert len(fake_hub.matching(origin=HUB, method="HEAD")) == n_files
+
+
+def test_glob_with_trailing_slash_is_rejected(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/x/a.parquet", _numbered_frame(0, 5))
+
+    with pytest.raises(ValueError, match="a glob cannot end with '/'"):
+        plhf.scan_bucket(_uri(fake_bucket, "data/*/"))
+
+    assert fake_hub.matching(origin=HUB) == []
+
+
+def test_explicit_glob_that_selects_a_non_parquet_file_fails_at_collect(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # A glob does not filter by extension: polars reports the bad file.
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+    fake_hub.put(fake_bucket, "data/notes.txt", b"these bytes are not parquet")
+
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/*"))
+
+    with pytest.raises(pl.exceptions.PolarsError):
+        lf.collect()
 
 
 def test_file_without_parquet_extension_is_one_listing_and_one_resolve(
@@ -503,7 +577,7 @@ def test_persistent_rate_limit_raises_after_bounded_retries(
 
     assert error.value.response.status_code == 429
     attempts = fake_hub.matching(origin=HUB, path_contains="/resolve/")
-    assert len(attempts) == read._RESOLVE_MAX_RETRIES + 1
+    assert len(attempts) == read._MAX_RETRIES + 1
 
 
 def test_empty_single_file_is_rejected(fake_hub: FakeHub, fake_bucket: str) -> None:

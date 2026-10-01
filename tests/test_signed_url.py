@@ -6,14 +6,12 @@ session; ``conftest.hub_session`` answers them with a handler function.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 from conftest import fast_resolve_retries, hub_httpx, hub_session
 from huggingface_hub.errors import HfHubHTTPError
 
 from polars_hf import read
-from polars_hf.read import _signed_url
+from polars_hf.read import _Budget, _signed_url
 
 RESOLVE = "https://huggingface.co/buckets/ns/name/resolve/data.parquet"
 SIGNED = "https://us.aws.cdn.hf.co/xet-bridge-us/abc?Expires=1&Signature=sig"
@@ -23,7 +21,7 @@ Response = hub_httpx.Response
 
 
 def _resolve(headers: dict[str, str] | None = None) -> str:
-    return _signed_url(RESOLVE, headers or {}, bucket_id="ns/name", uri=URI)
+    return _signed_url(RESOLVE, headers or {}, uri=URI, budget=_Budget("ns/name"))
 
 
 @pytest.fixture(autouse=True)
@@ -274,29 +272,7 @@ def test_retries_are_bounded() -> None:
         with pytest.raises(HfHubHTTPError) as error:
             _resolve()
     assert error.value.response.status_code == 503
-    assert len(seen) == read._RESOLVE_MAX_RETRIES + 1
-
-
-def test_rate_limit_reset_header_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The header format of the Hub (IETF draft): 7 seconds until the reset.
-    limited = {
-        "ratelimit": '"resolvers";r=0;t=7',
-        "ratelimit-policy": '"fixed window";"resolvers";q=5000;w=300',
-    }
-    seen = []
-    waits: list[float] = []
-    monkeypatch.setattr(time, "sleep", waits.append)
-
-    def handler(request):
-        seen.append(request)
-        if len(seen) == 1:
-            return Response(429, headers=limited)
-        return Response(302, headers={"location": SIGNED})
-
-    with hub_session(handler):
-        assert _resolve() == SIGNED
-    assert len(seen) == 2
-    assert len(waits) == 1 and waits[0] >= 7
+    assert len(seen) == read._MAX_RETRIES + 1
 
 
 def test_network_error_is_not_retried_and_keeps_its_type() -> None:

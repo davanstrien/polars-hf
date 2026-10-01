@@ -117,6 +117,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 # ---- offline fake ----------------------------------------------------------
 
 FAKE_BUCKET = "fake-user/fake-bucket"
+# Module constants of polars_hf.read that set the backoff without server hint.
+RETRY_BACKOFF_CONSTANTS = ("_RETRY_BASE_WAIT", "_RETRY_MAX_BACKOFF")
+# On staging the CI account shares its rate limits with other projects: a
+# rate-limited test must fail within seconds, not sleep until the reset.
+STAGING_MAX_WAIT_PER_RETRY = 5.0
+STAGING_SCAN_DEADLINE = 30.0
 
 
 @pytest.fixture
@@ -146,15 +152,17 @@ def fake_bucket(fake_hub: FakeHub) -> str:
 
 
 def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the backoff between two resolve attempts negligible.
+    """Make the backoff between two attempts of a Hub request negligible.
 
-    The number of attempts is unchanged. A 429 that carries rate-limit headers
-    still waits for the announced reset (``http_backoff`` adds one second).
+    The number of attempts is unchanged, and a wait that the server asks for
+    (rate-limit reset, ``Retry-After``) is not shortened.
     """
     from polars_hf import read
 
-    monkeypatch.setattr(read, "_RESOLVE_BASE_WAIT", 0.001)
-    monkeypatch.setattr(read, "_RESOLVE_MAX_WAIT", 0.001)
+    # raising=False: a renamed constant must not break every test that uses
+    # the fake Hub. test_retry.py checks that these names exist.
+    for name in RETRY_BACKOFF_CONSTANTS:
+        monkeypatch.setattr(read, name, 0.001, raising=False)
 
 
 @contextmanager
@@ -184,9 +192,28 @@ def hub_session(handler: Callable) -> Iterator[None]:
 # ---- staging ---------------------------------------------------------------
 
 
-_TIMEOUT_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException,)
-if hub_httpx is not httpx:
-    _TIMEOUT_ERRORS = (httpx.TimeoutException, hub_httpx.TimeoutException)
+@pytest.fixture(autouse=True)
+def _short_staging_waits(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Staging tests: a short limit per wait and per ``scan_bucket`` call."""
+    if request.node.get_closest_marker("staging") is None:
+        return
+    from polars_hf import read
+
+    monkeypatch.setattr(
+        read, "_MAX_WAIT_PER_RETRY", STAGING_MAX_WAIT_PER_RETRY, raising=False
+    )
+    monkeypatch.setattr(read, "_SCAN_DEADLINE", STAGING_SCAN_DEADLINE, raising=False)
+
+
+# Collected with getattr: the exception must not be required of every httpx
+# release that a resolver can pick for the dev group.
+_TIMEOUT_ERRORS: tuple[type[Exception], ...] = ()
+for _module in (httpx, hub_httpx):
+    _timeout_error = getattr(_module, "TimeoutException", None)
+    if _timeout_error is not None and _timeout_error not in _TIMEOUT_ERRORS:
+        _TIMEOUT_ERRORS = (*_TIMEOUT_ERRORS, _timeout_error)
 
 
 def _is_transient_staging_error(error: Exception) -> bool:

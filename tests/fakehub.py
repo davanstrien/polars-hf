@@ -170,6 +170,9 @@ class FakeHub:
     before_batch
         Optional callable run at the start of every upload call, before the
         files are read. Tests use it to measure local staging.
+    tree_page_size
+        If set, a listing returns at most this many entries per request and
+        links to the next page. ``None`` (the default) returns everything.
     """
 
     def __init__(self, token: str) -> None:
@@ -178,6 +181,7 @@ class FakeHub:
         self.batch_calls: list[BatchCall] = []
         self.fail_batch_on_call: int | None = None
         self.before_batch = None
+        self.tree_page_size: int | None = None
         self._buckets: dict[str, dict[str, bytes]] = {}
         # sha256 -> content, for every object ever stored (the "CAS").
         self._blobs: dict[str, bytes] = {}
@@ -472,6 +476,26 @@ class FakeHub:
                 entries[child_path] = self._file_entry(path, files[path])
         return list(entries.values())
 
+    def _tree_page(self, entries: list, path: str, query: str) -> _Reply:
+        """One page of a listing, with the ``Link`` header of the real Hub.
+
+        The Hub paginates with ``Link: <url>; rel="next"`` (the GitHub
+        format that ``huggingface_hub.utils.paginate`` follows) and a
+        ``cursor`` query parameter. Here the cursor is the index of the first
+        entry of the page.
+        """
+        if self.tree_page_size is None:
+            return _json_reply(entries)
+        params = parse_qs(query)
+        start = int(params.get("cursor", ["0"])[0])
+        end = start + self.tree_page_size
+        reply = _json_reply(entries[start:end])
+        if end < len(entries):
+            recursive = params.get("recursive", ["false"])[0]
+            next_url = f"{self.endpoint}{path}?recursive={recursive}&cursor={end}"
+            reply.headers["Link"] = f'<{next_url}>; rel="next"'
+        return reply
+
     def _hub_reply(self, method: str, path: str, query: str, body: bytes) -> _Reply:
         parts = path.strip("/").split("/")
 
@@ -499,7 +523,8 @@ class FakeHub:
                 prefix = unquote("/".join(parts[5:]))
                 flag = parse_qs(query).get("recursive", ["false"])[0]
                 recursive = flag.lower() in ("true", "1")
-                return _json_reply(self._list_tree(files, prefix, recursive))
+                entries = self._list_tree(files, prefix, recursive)
+                return self._tree_page(entries, path, query)
 
         if parts[:1] == ["buckets"] and len(parts) >= 5 and parts[3] == "resolve":
             bucket_id = f"{parts[1]}/{parts[2]}"

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 
 from polars_hf._uri import parse_bucket_uri
-from polars_hf.read import _list_files
+from polars_hf.read import _Budget, _list_files
 
 
 @dataclass
@@ -18,7 +18,13 @@ class _Entry:
 
 
 class _StubApi:
-    """Stand-in for ``HfApi``: a bucket with string-prefix listing, like the Hub."""
+    """Stand-in for ``HfApi``: one bucket that lists like the Hub.
+
+    Recursive: every file whose path starts with the prefix (a string prefix).
+    Not recursive: the direct children (files and directories) of the prefix
+    when it is a directory, else the entries of its parent directory that
+    start with the prefix.
+    """
 
     def __init__(self, entries: list[_Entry]) -> None:
         self.entries = entries
@@ -26,9 +32,30 @@ class _StubApi:
 
     def list_bucket_tree(self, bucket_id, prefix=None, *, recursive=None):
         self.calls.append((bucket_id, prefix, recursive))
+        prefix = prefix or ""
+        paths = [entry.path for entry in self.entries]
+        if recursive:
+            return [entry for entry in self.entries if entry.path.startswith(prefix)]
+
+        directory = prefix.rstrip("/")
+        is_directory = directory == "" or any(
+            path.startswith(directory + "/") for path in paths
+        )
+        if not is_directory:
+            directory = prefix.rpartition("/")[0]
+        base = directory + "/" if directory else ""
+        children: dict[str, _Entry] = {}
         for entry in self.entries:
-            if entry.path.startswith(prefix or ""):
-                yield entry
+            if not entry.path.startswith(base):
+                continue
+            if not is_directory and not entry.path.startswith(prefix):
+                continue
+            child, _, rest = entry.path[len(base) :].partition("/")
+            if rest:
+                children[base + child] = _Entry(base + child, None, "directory")
+            else:
+                children[entry.path] = entry
+        return list(children.values())
 
 
 def _files(*paths: str) -> list[_Entry]:
@@ -37,7 +64,7 @@ def _files(*paths: str) -> list[_Entry]:
 
 def _list(api: _StubApi, path: str) -> list[str]:
     uri = f"hf://buckets/ns/name/{path}" if path else "hf://buckets/ns/name"
-    return _list_files(api, parse_bucket_uri(uri), uri)
+    return _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
 
 
 def test_one_recursive_listing_with_the_path_as_prefix() -> None:
@@ -54,14 +81,72 @@ def test_whole_bucket_lists_without_prefix() -> None:
     assert api.calls == [("ns/name", None, True)]
 
 
-def test_glob_lists_the_prefix_before_the_first_glob_character() -> None:
-    api = _StubApi(_files("data/run_0.parquet", "data/run_1.parquet", "data/x.csv"))
+def test_glob_in_the_last_segment_lists_one_directory() -> None:
+    api = _StubApi(
+        _files(
+            "data/run_0.parquet",
+            "data/run_1.parquet",
+            "data/x.csv",
+            "data/sub/run_2.parquet",
+        )
+    )
 
     assert _list(api, "data/run_*.parquet") == [
         "data/run_0.parquet",
         "data/run_1.parquet",
     ]
-    assert api.calls == [("ns/name", "data/run_", True)]
+    assert api.calls == [("ns/name", "data", False)]
+
+
+def test_glob_at_the_bucket_root_lists_the_root_only() -> None:
+    api = _StubApi(_files("a.parquet", "b.parquet", "x/c.parquet"))
+
+    assert _list(api, "*.parquet") == ["a.parquet", "b.parquet"]
+    assert api.calls == [("ns/name", None, False)]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "prefix"),
+    [
+        ("data/**/*.parquet", "data/"),
+        ("data/**", "data/"),
+        ("da*/x.parquet", "da"),
+        ("data/run_[01]/x.parquet", "data/run_"),
+    ],
+)
+def test_other_globs_list_the_subtree_of_the_literal_prefix(
+    pattern: str, prefix: str
+) -> None:
+    api = _StubApi(_files("data/x.parquet", "data/run_0/x.parquet"))
+
+    _list(api, pattern)
+
+    assert api.calls == [("ns/name", prefix, True)]
+
+
+def test_directory_named_like_the_listing_prefix_does_not_hide_siblings() -> None:
+    # 'data/part' is a directory and a prefix of the files the glob names.
+    api = _StubApi(_files("data/part/x.parquet", "data/part1.parquet"))
+
+    assert _list(api, "data/part*") == ["data/part1.parquet"]
+
+
+@pytest.mark.parametrize("pattern", ["data/*/", "*/", "data/run[1]/", "data/**/"])
+def test_glob_with_trailing_slash_is_rejected(pattern: str) -> None:
+    api = _StubApi(_files("data/run1/x.parquet"))
+
+    with pytest.raises(ValueError, match="a glob cannot end with '/'") as error:
+        _list(api, pattern)
+    assert "*.parquet" in str(error.value)
+    assert api.calls == []
+
+
+@pytest.mark.parametrize("pattern", ["data/**.parquet", "data/a**/x.parquet", "**x"])
+def test_double_star_inside_a_segment_is_rejected(pattern: str) -> None:
+    api = _StubApi(_files("data/x.parquet"))
+
+    with pytest.raises(ValueError, match="must be a whole path segment"):
+        _list(api, pattern)
 
 
 def test_directory_entries_are_never_selected() -> None:
@@ -109,9 +194,11 @@ def test_literal_file_with_glob_characters_wins_over_the_glob() -> None:
 
 
 def test_literal_directory_with_glob_characters_wins_over_the_glob() -> None:
-    api = _StubApi(_files("run[1]/a.parquet", "run1/b.parquet"))
+    api = _StubApi(_files("run[1]/a.parquet", "run[1]/sub/c.pq", "run1/b.parquet"))
 
-    assert _list(api, "run[1]") == ["run[1]/a.parquet"]
+    assert _list(api, "run[1]") == ["run[1]/a.parquet", "run[1]/sub/c.pq"]
+    # The directory is found in the listing of its parent, then listed.
+    assert api.calls == [("ns/name", None, False), ("ns/name", "run[1]", True)]
 
 
 def test_glob_is_used_when_no_literal_file_or_directory_exists() -> None:
