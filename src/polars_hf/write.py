@@ -69,8 +69,7 @@ def _check_sink_kwargs(kwargs: dict[str, Any]) -> None:
     # would be registered as an empty object.
     if kwargs.pop("lazy", False):
         raise ValueError(
-            "sink_bucket() runs the query before it returns; lazy=True is not "
-            "supported"
+            "sink_bucket() runs the query before it returns; lazy=True is not supported"
         )
 
 

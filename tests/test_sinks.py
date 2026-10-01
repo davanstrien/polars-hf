@@ -202,9 +202,7 @@ _key_columns = st.one_of(
     st.lists(
         st.one_of(
             st.none(),
-            st.datetimes(
-                datetime.datetime(1900, 1, 1), datetime.datetime(2200, 1, 1)
-            ),
+            st.datetimes(datetime.datetime(1900, 1, 1), datetime.datetime(2200, 1, 1)),
         ),
         min_size=1,
         max_size=5,
