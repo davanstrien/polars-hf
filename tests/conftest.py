@@ -48,9 +48,11 @@ for _name in ("NO_PROXY", "no_proxy"):
 import time  # noqa: E402
 import uuid  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 from typing import TypeVar  # noqa: E402
 
 import httpx  # noqa: E402
+import huggingface_hub  # noqa: E402
 import polars as pl  # noqa: E402
 import pytest  # noqa: E402
 from fakehub import FakeHub  # noqa: E402
@@ -79,6 +81,15 @@ settings.register_profile("random", derandomize=False, deadline=None, max_exampl
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "polars-hf"))
 
 T = TypeVar("T")
+
+HUB_MAJOR = int(huggingface_hub.__version__.split(".")[0])
+# The HTTP library behind the huggingface_hub session: httpx2 for
+# huggingface_hub 2.x, httpx for 1.x. Mock transports, requests and responses
+# of that session come from this module.
+if HUB_MAJOR >= 2:
+    import httpx2 as hub_httpx
+else:
+    hub_httpx = httpx
 
 # Transient staging errors only: HTTP 409/502/503/504 and timeouts. Anything
 # else (a missing file, a read error) can be a real read-after-write bug and
@@ -122,6 +133,7 @@ def fake_hub(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeHub]:
         hub.create_bucket(FAKE_BUCKET)
         monkeypatch.setattr(constants, "ENDPOINT", hub.endpoint)
         hub.patch_uploads(monkeypatch)
+        fast_resolve_retries(monkeypatch)
         HfFileSystem.clear_instance_cache()
         yield hub
         HfFileSystem.clear_instance_cache()
@@ -133,17 +145,48 @@ def fake_bucket(fake_hub: FakeHub) -> str:
     return FAKE_BUCKET
 
 
+def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the backoff between two resolve attempts negligible.
+
+    The number of attempts is unchanged. A 429 that carries rate-limit headers
+    still waits for the announced reset (``http_backoff`` adds one second).
+    """
+    from polars_hf import read
+
+    monkeypatch.setattr(read, "_RESOLVE_BASE_WAIT", 0.001)
+    monkeypatch.setattr(read, "_RESOLVE_MAX_WAIT", 0.001)
+
+
+@contextmanager
+def hub_session(handler: Callable) -> Iterator[None]:
+    """Answer every request of the ``huggingface_hub`` session with ``handler``.
+
+    ``handler`` receives the request (``hub_httpx.Request``) and returns a
+    ``hub_httpx.Response``. The client follows redirects by default, like the
+    real session, so a test sees it when the code under test forgets to turn
+    that off. The default session is restored on exit.
+    """
+    # default_client_factory is private; set_client_factory and close_session
+    # are public. Verified on huggingface_hub 1.12.0, 1.17.0 and 2.0.0.
+    from huggingface_hub.utils._http import default_client_factory
+
+    def factory():
+        transport = hub_httpx.MockTransport(handler)
+        return hub_httpx.Client(transport=transport, follow_redirects=True)
+
+    huggingface_hub.set_client_factory(factory)
+    try:
+        yield
+    finally:
+        huggingface_hub.set_client_factory(default_client_factory)
+
+
 # ---- staging ---------------------------------------------------------------
 
 
-# huggingface_hub 2.x sends its requests with httpx2; 1.x uses httpx.
 _TIMEOUT_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException,)
-try:
-    import httpx2
-except ImportError:
-    pass
-else:
-    _TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException)
+if hub_httpx is not httpx:
+    _TIMEOUT_ERRORS = (httpx.TimeoutException, hub_httpx.TimeoutException)
 
 
 def _is_transient_staging_error(error: Exception) -> bool:

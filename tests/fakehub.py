@@ -6,8 +6,10 @@ Two local HTTP servers run on different ports, so they are different origins:
   ``/buckets/{id}/resolve/{path}`` redirect, and answers 401 unless the
   ``Authorization`` header carries an accepted token, like the real Hub does
   for private buckets;
-* the **cdn** server stands in for ``cas-bridge.xethub.hf.co``: it serves the
-  "presigned" URLs with HTTP range support and no authentication.
+* the **cdn** server stands in for the host of the presigned URLs
+  (``us.aws.cdn.hf.co`` on huggingface.co, ``cas-bridge.xethub-ci.hf.co`` on
+  the Hub CI instance): it serves the "presigned" URLs with HTTP range support
+  and no authentication.
 
 Every request is recorded (:attr:`FakeHub.requests`) and faults can be scripted
 per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
@@ -36,7 +38,9 @@ The listing semantics were copied from the Hub CI instance
   directory whose path starts with the prefix;
 * an unknown prefix returns ``[]`` with status 200;
 * ``HEAD /buckets/{id}/resolve/{path}`` answers 302 for a file and 404
-  ``EntryNotFound`` for a directory or a missing path;
+  ``EntryNotFound`` for a directory or a missing path; an empty file is
+  redirected too, with ``X-Linked-Size: 0`` (huggingface.co answers it with a
+  direct 200 instead: script that with :meth:`FakeHub.add_fault`);
 * ``HEAD /buckets/{id}/tree/{path}`` (the directory web page) answers 401 to a
   token;
 * a batch on a missing bucket answers 404 ``RepoNotFound``;
