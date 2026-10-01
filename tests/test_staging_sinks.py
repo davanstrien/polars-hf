@@ -488,7 +488,7 @@ def test_file_and_directory_of_one_name_are_refused(
     staging_api: HfApi, staging_bucket: str, sink
 ) -> None:
     df = pl.DataFrame({"g": ["a"], "n": [1]})
-    sink(df, _uri(staging_bucket, "as-file"))
+    sink(df, _uri(staging_bucket, "as-file"), format="parquet")
     sink(df, _uri(staging_bucket, "as-dir.parquet"), partition_by="g")
     files_before = _files(staging_api, staging_bucket)
 
