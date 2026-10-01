@@ -112,8 +112,8 @@ writes one file with the schema and no rows, `{prefix}/00000000.{extension}` (wi
 `mode="append"`), so the prefix can be scanned afterwards.
 
 **`mode`** sets what happens if the destination exists. A single-file destination exists if there
-is an object at that path. A partitioned destination exists if there is a file at the base prefix
-itself or anywhere below it.
+is an object at that path. A partitioned destination exists if there is a file anywhere below the
+base prefix.
 
 | `mode` | Single file | Partitioned (base prefix) |
 | --- | --- | --- |
@@ -121,22 +121,37 @@ itself or anywhere below it.
 | `"append"` | not possible: `ValueError` | new files are added with names unique to the call; no existing file is replaced or deleted |
 | `"overwrite"` | the object is replaced | the new files are registered (a file with the same name is replaced), then the files that were below the prefix before the write, and that this call did not write, are deleted |
 
-`"error"` raises before anything is uploaded. Its check is a listing before the write: it does not
-exclude a concurrent writer. The listings of the write path (for all three modes) are the ones of
-the read path: sent page by page with the same bounded retries, with `PermissionError` for a token
-without access and `FileNotFoundError` for a bucket that does not exist.
+**A file and a directory of one name are refused, in every mode.** A single-file write to `out`
+raises `FileExistsError` if there are objects below `out/`, and a partitioned write to `out/...`
+raises `FileExistsError` if `out` is a file. The bucket could store both; `sink_bucket` does not
+create such a pair.
+
+The checks run before anything is uploaded and cost a fixed number of requests, whatever the
+destination and its siblings hold. They do not exclude a concurrent writer.
+
+| Write | Requests before the upload |
+| --- | --- |
+| single file, `"error"` | 2: one `HEAD` of the path, one listing page of `path/` |
+| single file, `"overwrite"` | 1: one listing page of `path/` |
+| partitioned, `"error"` | 2: one `HEAD` of the prefix, one listing page of `prefix/` (1 at the bucket root) |
+| partitioned, `"append"` | 1: one `HEAD` of the prefix (0 at the bucket root); the prefix is not listed |
+| partitioned, `"overwrite"` | one `HEAD` of the prefix, then every listing page of `prefix/` |
+
+These requests use the listing and the retry limits of the read path: bounded retries, a deadline
+of 10 minutes per call, `PermissionError` for a token without access and `FileNotFoundError` for a
+bucket that does not exist.
 
 `"append"` never replaces rows: two appends with the same partition keys keep the rows of both,
 because their file names differ by the token. Running the same job twice therefore adds the rows
-twice. A generated name that already exists is an error, not a replace.
+twice. The token has 48 random bits; `sink_bucket` does not list the prefix to look for a name that
+exists already.
 
 `"overwrite"` needs a directory below the bucket root: `hf://buckets/ns/name` and
 `hf://buckets/ns/name/` are refused with a `ValueError`. It lists the prefix before the write and
 deletes only files from that listing, so a file that another writer adds during the write is kept.
 A query that returns no rows still deletes the previous files and leaves one file with the schema
 and no rows.
-A file that another writer *replaces* during the write is still deleted. A file at the prefix itself
-(`out` as a file when the write goes to `out/...`) is neither listed nor deleted.
+A file that another writer *replaces* during the write is still deleted.
 
 **Paths.** The Hub refuses a path with a backslash, an empty segment (`a//b`) or a `.` / `..`
 segment. `sink_bucket` also refuses a control character in a path and a path segment of more than
