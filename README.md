@@ -115,13 +115,17 @@ can be scanned afterwards.
 `"overwrite"` needs a directory below the bucket root: `hf://buckets/ns/name` and
 `hf://buckets/ns/name/` are refused with a `ValueError`. It lists the prefix before the write and
 deletes only files from that listing, so a file that another writer adds during the write is kept.
-A file that another writer *replaces* during the write is still deleted. The check of `"error"` is
-also a listing before the write: it does not exclude a concurrent writer.
+A file that another writer *replaces* during the write is still deleted. A file at the prefix itself
+(`out` as a file when the write goes to `out/...`) is neither listed nor deleted. The check of
+`"error"` is also a listing before the write: it does not exclude a concurrent writer.
 
 **Paths.** The Hub refuses a path with a backslash, an empty segment (`a//b`) or a `.` / `..`
-segment. `sink_bucket` raises a `ValueError` for such a destination before it sends a request. A
-partition value can produce such a path too (a backslash is not percent-encoded); the error names
-the `key=value` segment, and no file of that write is registered.
+segment. `sink_bucket` also refuses a control character in a path and a path segment of more than
+255 bytes, with both backends, because the `"hub"` backend cannot create such a name on a local
+file system. It raises a `ValueError` for such a destination before it sends a request. A partition
+column name or value can produce such a path too (a backslash is not percent-encoded, and an
+encoded value counts with its `key=` prefix towards the 255 bytes); the error names the `key=value`
+segment, and no file of that write is registered.
 
 **`backend`** sets how the output reaches the bucket:
 
@@ -150,9 +154,10 @@ Notes on the `"hub"` backend:
 
 - It stages in the directory named by `POLARS_HF_STAGING_DIR`, else in the system temporary
   directory, and removes the files when the write ends.
-- The partition directories are created on the local file system first, so a partition value whose
-  encoded name is longer than the local file-name limit (255 bytes on common file systems) fails.
-  The same write works with `"xet"`.
+- With `huggingface_hub` 1.x, `HfApi.batch_bucket_files` does not report files that the bucket
+  rejected. The backend then lists the destination once after the upload (one extra listing of the
+  file's string prefix, or of the base prefix, per write) and raises if a file is missing or has
+  another size. `huggingface_hub` 2.x reports rejected files itself, and no listing is made.
 
 **Memory.** Peak RSS of one process, one run each, on one macOS machine, with uncompressed
 incompressible data. "Polars alone" is the same query written to a file object that discards the
@@ -171,19 +176,23 @@ use is not proven.
 **What a failure leaves behind.** With both backends, no file is registered in the bucket before the
 Polars sink has finished without an error. If the query fails or is interrupted, the destination is
 unchanged: an existing object keeps its content, and no partial or empty file appears. An upload
-error is raised to the caller; in a write of at most 1,000 files it also leaves the destination
-unchanged.
+that fails before the first registration request also leaves the destination unchanged. A failure
+of a registration request does not: see the list below.
 
-A failed upload or registration raises `polars_hf.BucketRegistrationError` (a `RuntimeError`) with
-both backends. Its `failures` attribute lists the operations the bucket rejected; with the `"hub"`
-backend the `huggingface_hub` error is its `__cause__`.
+A failed registration or delete request raises `polars_hf.BucketRegistrationError` (a
+`RuntimeError`) with both backends, and so does a failed upload of the `"hub"` backend (an HTTP
+error, a timeout or a connection error; the original error is the `__cause__`). Its `failures`
+attribute lists the operations the bucket rejected. After a timeout or a connection error the
+request may or may not have been applied: the message says so, and a listing of the destination
+shows the state. An error of the `hf_xet` upload itself is raised as `hf_xet` reports it.
 
 The write is **not transactional**, because the bucket API has no transactions:
 
 - Files are registered in requests of at most 1,000 operations. If a write of more than 1,000 files
   fails between two requests, the files of the earlier requests stay in the bucket.
-- If the bucket rejects single files of a request, it still applies the other files of that
-  request. `sink_bucket` then raises an error that lists the rejected paths.
+- If the bucket rejects single files of a request (a 200 answer with `failed` entries), it still
+  applies the other files of that request, also in a write of fewer than 1,000 files. `sink_bucket`
+  then raises an error that lists the rejected paths.
 - `mode="overwrite"` deletes the stale files only after all new files are registered, in separate
   requests. If the process stops or a request fails between the registration and the end of the
   deletion, the prefix holds the new files and the remaining stale files, and (for a failed
