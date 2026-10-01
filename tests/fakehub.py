@@ -202,7 +202,6 @@ class MemoryCommit:
         self.streams: list[_MemoryStream] = []
         self.finished = False
         self.aborted = False
-        self.interrupted = False
 
     def open_stream(self, name: str) -> _MemoryStream:
         stream = _MemoryStream(self, name)
@@ -221,11 +220,6 @@ class MemoryCommit:
 
     def abort(self) -> None:
         self.aborted = True
-
-    def interrupt(self) -> None:
-        # The real method stops the shared Xet session; it does not abort
-        # this commit.
-        self.interrupted = True
 
 
 def _is_valid_destination(path: str) -> bool:
@@ -269,6 +263,9 @@ class FakeHub:
         single files of a request.
     commits
         Every :class:`MemoryCommit` opened by the xet backend.
+    session_aborts
+        How often the xet backend stopped the shared Xet session (what it
+        does after a ``KeyboardInterrupt``). The real session is not touched.
     fail_stream_write_on_call, fail_stream_finish_on_call
         If set to ``N``, the ``N``-th ``write()`` / ``finish()`` (1-based)
         over all streams of all commits raises :class:`ScriptedUploadError`.
@@ -285,6 +282,7 @@ class FakeHub:
         self.reject_paths: set[str] = set()
         self.drop_paths: set[str] = set()
         self.commits: list[MemoryCommit] = []
+        self.session_aborts = 0
         self.fail_stream_write_on_call: int | None = None
         self.fail_stream_finish_on_call: int | None = None
         self.before_batch = None
@@ -458,6 +456,10 @@ class FakeHub:
             self._counters[name] = self._counters.get(name, 0) + 1
             return self._counters[name]
 
+    def _abort_session(self) -> None:
+        with self._lock:
+            self.session_aborts += 1
+
     def _store_blob(self, data: bytes) -> None:
         with self._lock:
             self._blobs[_content_hash(data)] = data
@@ -479,6 +481,7 @@ class FakeHub:
 
         monkeypatch.setattr(_sinks, "open_xet_commit", self.open_commit)
         monkeypatch.setattr(_sinks, "xet_unavailable_reason", lambda: None)
+        monkeypatch.setattr(_sinks, "abort_xet_session", self._abort_session)
 
         def _batch_bucket_files(
             api, bucket_id, *, add=None, copy=None, delete=None, token=None, **_

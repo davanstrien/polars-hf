@@ -426,23 +426,19 @@ def test_keyboard_interrupt_stops_the_xet_session(
     # The commit is cancelled and the shared session is stopped.
     (commit,) = fake_hub.commits
     assert commit.aborted
-    assert commit.interrupted
+    assert fake_hub.session_aborts == 1
     assert fake_hub.batch_calls == []
 
 
-@pytest.mark.parametrize("broken", ["abort", "interrupt"])
-def test_keyboard_interrupt_survives_a_failing_cleanup(
-    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, broken: str
+def test_keyboard_interrupt_survives_a_failing_commit_abort(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from fakehub import MemoryCommit
 
-    calls = []
-
     def fails(self: MemoryCommit) -> None:
-        calls.append(broken)
-        raise RuntimeError("cleanup failed")
+        raise RuntimeError("abort failed")
 
-    monkeypatch.setattr(MemoryCommit, broken, fails)
+    monkeypatch.setattr(MemoryCommit, "abort", fails)
     backend = _sinks.XetBackend(fake_bucket, token=None)
 
     def interrupted(target: object) -> None:
@@ -451,10 +447,26 @@ def test_keyboard_interrupt_survives_a_failing_cleanup(
     with pytest.raises(KeyboardInterrupt):
         backend.write_file(interrupted, "out.parquet")
 
-    # The other cleanup call still ran.
-    assert calls == [broken]
-    (commit,) = fake_hub.commits
-    assert commit.aborted or commit.interrupted
+    # The session was still stopped.
+    assert fake_hub.session_aborts == 1
+
+
+def test_keyboard_interrupt_survives_a_failing_session_abort(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fails() -> None:
+        raise RuntimeError("session abort failed")
+
+    monkeypatch.setattr(_sinks, "abort_xet_session", fails)
+    backend = _sinks.XetBackend(fake_bucket, token=None)
+
+    def interrupted(target: object) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        backend.write_file(interrupted, "out.parquet")
+
+    assert [commit.aborted for commit in fake_hub.commits] == [True]
 
 
 def test_rejected_registration_raises_with_the_failed_paths(
@@ -1031,7 +1043,7 @@ def test_registration_reply_that_is_not_json_is_an_error(
     # For example a proxy that answers 200 with an HTML page.
     fake_hub.add_fault(HUB, "POST", r"/batch$", 200, body=b"<html>ok</html>")
 
-    with pytest.raises(BucketRegistrationError, match="not the expected JSON"):
+    with pytest.raises(BucketRegistrationError, match="not the expected confirmation"):
         sink_streamed(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
 
     assert fake_hub.files(fake_bucket) == []
@@ -1073,21 +1085,6 @@ def test_changed_xet_commit_signature_is_reported(
         raise TypeError("new_upload_commit() got an unexpected keyword argument")
 
     monkeypatch.setattr(_sinks, "open_xet_commit", changed)
-
-    with pytest.raises(RuntimeError) as error:
-        sink_streamed(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
-
-    _assert_incompatible(error)
-    assert fake_hub.files(fake_bucket) == []
-
-
-def test_changed_registration_helper_signature_is_reported(
-    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def changed(*args: object, **kwargs: object) -> None:
-        raise TypeError("http_backoff() got an unexpected keyword argument 'content'")
-
-    monkeypatch.setattr(_sinks, "http_backoff", changed)
 
     with pytest.raises(RuntimeError) as error:
         sink_streamed(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
@@ -1333,3 +1330,59 @@ def test_network_error_of_the_hub_upload_is_wrapped(
         sink_staged(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
 
     _assert_unknown_state(error, httpx.ConnectError)
+
+
+# ---- review round 3 --------------------------------------------------------
+
+
+@both_sinks
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{}",
+        b'{"success": true}',
+        b'{"success": true, "processed": 1, "succeeded": 1}',
+        b'{"success": false, "processed": 1, "succeeded": 0, "failed": []}',
+        b'{"success": true, "processed": 0, "succeeded": 0, "failed": []}',
+        b"[]",
+        b"null",
+    ],
+)
+def test_registration_answer_that_does_not_confirm_is_an_error(
+    fake_hub: FakeHub, fake_bucket: str, sink, body: bytes
+) -> None:
+    # Both backends send the overwrite delete through the checked request; a
+    # 200 that does not confirm the operation is not a success.
+    fake_hub.put(fake_bucket, "out/stale.txt", b"stale")
+    headers = {"Content-Type": "application/json"}
+    fake_hub.add_fault(HUB, "POST", r"/batch$", 200, headers=headers, body=body)
+    df = pl.DataFrame({"n": [1]})
+
+    with pytest.raises(BucketRegistrationError) as error:
+        if sink is sink_staged:
+            # The first /batch request of the hub backend is the delete.
+            sink(df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite")
+        else:
+            sink(df, _uri(fake_bucket, "out/a.parquet"))
+
+    assert "not the expected confirmation of 1 operation(s)" in str(error.value)
+    assert "state of the destination is unknown" in str(error.value)
+
+
+def test_changed_http_helper_is_not_reported_as_an_xet_problem(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # http_backoff is public API and serves both backends: its errors are not
+    # relabelled as "the xet backend is not compatible".
+    fake_hub.put(fake_bucket, "out/stale.txt", b"stale")
+
+    def changed(*args: object, **kwargs: object) -> None:
+        raise TypeError("http_backoff() got an unexpected keyword argument")
+
+    monkeypatch.setattr(_sinks, "http_backoff", changed)
+    df = pl.DataFrame({"n": [1]})
+
+    with pytest.raises(TypeError, match="http_backoff"):
+        sink_staged(
+            df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite"
+        )

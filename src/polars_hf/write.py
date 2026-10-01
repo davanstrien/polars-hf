@@ -190,8 +190,12 @@ def sink_bucket(
         locally: ``key=value/`` directories with percent-encoded values and
         ``__HIVE_DEFAULT_PARTITION__`` for a null key, and files named
         ``00000000.parquet``, ``00000001.parquet``, ... (``.jsonl`` for ndjson).
-    max_rows_per_file, max_bytes_per_file
-        Split each partition further so files stay under these limits.
+    max_rows_per_file
+        Split each partition further: at most this many rows per file.
+    max_bytes_per_file
+        Split each partition further, with this size as a target. It is
+        Polars' ``approximate_bytes_per_file``: an estimate made while the
+        rows are written, so a file can be larger than the value.
     mode
         What to do with objects that are already at the destination:
 
@@ -201,8 +205,10 @@ def sink_bucket(
           write; after all new files are registered, delete the listed files
           that this call did not write. A file that another writer adds
           during the write is not deleted. The base prefix must be a
-          directory below the bucket root. For a single-file write this is
-          the same as ``"append"``.
+          directory below the bucket root. A query that returns no rows
+          still deletes the listed files and leaves one file with the schema
+          and no rows. For a single-file write this is the same as
+          ``"append"``.
         * ``"error"``: raise ``FileExistsError`` before anything is written if
           the destination file exists or, for a partitioned write, if a file
           exists at the base prefix or anywhere below it. The check and the

@@ -80,11 +80,14 @@ _HIVE_ENCODED_ASCII = frozenset(b"/=%: ")
 
 
 class BucketRegistrationError(RuntimeError):
-    """The bucket did not accept the files (or deletions) of a write.
+    """An upload or a registration of a write failed.
 
-    Raised by both backends when the upload or the ``/batch`` request fails,
-    and when the bucket rejects single operations of a request. With the hub
-    backend the error of ``huggingface_hub`` is the ``__cause__``.
+    Raised by both backends when the request that registers files in the
+    bucket (or deletes stale ones) fails, gets no answer, gets an answer that
+    does not confirm it, or is answered with rejected operations. The hub
+    backend also raises it when its upload fails, with the error of
+    ``huggingface_hub`` as the ``__cause__``. An error of the ``hf_xet``
+    stream upload of the xet backend is raised as ``hf_xet`` reports it.
 
     Attributes
     ----------
@@ -155,6 +158,19 @@ _UNKNOWN_STATE = (
     "been applied. List the destination (for example with "
     "HfApi.list_bucket_tree) to see which files are registered"
 )
+
+
+def _confirms_success(body: Any, sent: int) -> bool:
+    """Whether a ``/batch`` answer says that all ``sent`` operations were applied.
+
+    A proxy page, an empty object or a body without these fields is not a
+    confirmation, whatever the status code.
+    """
+    if not isinstance(body, dict):
+        return False
+    if body.get("failed") != [] or body.get("success") is not True:
+        return False
+    return body.get("processed") == sent and body.get("succeeded") == sent
 
 
 def hub_reports_rejected_files() -> bool:
@@ -360,8 +376,6 @@ class SinkBackend(ABC):
             # A repeated request is harmless: the operations are idempotent.
             try:
                 response = http_backoff("POST", url, headers=headers, content=body)
-            except _API_SHAPE_ERRORS as error:
-                raise incompatible_xet_error(error) from error
             except _network_errors() as error:
                 raise BucketRegistrationError(
                     f"the registration request to bucket {self.bucket_id!r} got "
@@ -370,15 +384,20 @@ class SinkBackend(ABC):
             self._check_batch_response(response, sent=len(chunk))
 
     def _check_batch_response(self, response: Any, sent: int) -> None:
-        """Raise unless the bucket applied all ``sent`` operations."""
-        # Rejected operations are listed in the body of a 200 (some failed)
-        # or of a 422 (all failed).
-        failures = None
+        """Raise unless the bucket confirms that it applied all ``sent`` operations.
+
+        The Hub answers ``{"success", "processed", "succeeded", "failed"}``.
+        Rejected operations are listed in ``failed``, in the body of a 200
+        (some failed) or of a 422 (all failed).
+        """
+        body = None
         if response.status_code in (200, 422):
             try:
-                failures = response.json().get("failed", [])
-            except (ValueError, AttributeError):
-                failures = None
+                body = response.json()
+            except ValueError:
+                body = None
+        if isinstance(body, dict) and isinstance(body.get("failed"), list):
+            failures = body["failed"]
             if failures:
                 message = _rejected(self.bucket_id, failures, sent)
                 raise BucketRegistrationError(message, failures)
@@ -388,11 +407,11 @@ class SinkBackend(ABC):
             raise BucketRegistrationError(
                 f"the registration in bucket {self.bucket_id!r} failed: {error}"
             ) from error
-        if failures is None:
+        if not _confirms_success(body, sent):
             raise BucketRegistrationError(
                 f"bucket {self.bucket_id!r} answered {response.status_code} to a "
-                "registration request with a body that is not the expected JSON. "
-                f"{_UNKNOWN_STATE}."
+                "registration request with a body that is not the expected "
+                f"confirmation of {sent} operation(s). {_UNKNOWN_STATE}."
             )
 
 
@@ -544,7 +563,7 @@ class _XetCommit:
     """One ``hf_xet`` upload commit, reduced to what the backend uses.
 
     The offline tests replace :func:`open_xet_commit` with a function that
-    returns an in-memory object with these four methods.
+    returns an in-memory object with these three methods.
     """
 
     def __init__(self, commit: Any) -> None:
@@ -568,16 +587,17 @@ class _XetCommit:
         """Cancel the commit; later writes to its streams raise."""
         self._commit.abort()
 
-    def interrupt(self) -> None:
-        """Stop the shared Xet session after a ``KeyboardInterrupt``.
 
-        The session is process-wide: other Xet uploads and downloads that run
-        in the same process are cancelled too. ``huggingface_hub`` does the
-        same in its own uploads.
-        """
-        from huggingface_hub.utils._xet import abort_xet_session
+def abort_xet_session() -> None:
+    """Stop the shared Xet session after a ``KeyboardInterrupt``.
 
-        abort_xet_session()
+    The session is process-wide: other Xet uploads and downloads that run in
+    the same process are cancelled too. ``huggingface_hub`` does the same in
+    its own uploads.
+    """
+    from huggingface_hub.utils import _xet
+
+    _xet.abort_xet_session()
 
 
 def open_xet_commit(endpoint: str, bucket_id: str, headers: dict[str, str]) -> Any:
@@ -724,7 +744,7 @@ class XetBackend(SinkBackend):
         except KeyboardInterrupt:
             # Cancel this commit, then the shared session. Neither call may
             # replace the KeyboardInterrupt.
-            for stop in (commit.abort, commit.interrupt):
+            for stop in (commit.abort, abort_xet_session):
                 try:
                     stop()
                 except Exception:
