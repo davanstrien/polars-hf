@@ -1,30 +1,26 @@
 """Write a polars frame to a Hugging Face bucket — single file or partitioned.
 
-Single-file writes open the bucket path with ``HfFileSystem`` in ``"wb"`` mode and
-hand the file object to polars' streaming ``sink_*`` (incremental, bounded memory;
-``HfFileSystem`` spills to a local temp file then commits via ``hf_xet`` on close).
+``sink_bucket`` runs the Polars streaming sink and hands the output to a sink
+backend (see ``_sinks.py``). The backend makes nothing visible in the bucket
+until the Polars sink has returned without an error, so a query that fails
+leaves the destination as it was.
 
 Partitioned writes delegate all splitting (by key, by size, or both) to native
-``pl.PartitionBy`` and land the files in the bucket one of two ways:
+``pl.PartitionBy``. The object names are the ones Polars writes to a local
+directory, with either backend.
 
-* ``atomic=True`` (default) — polars writes partitions to a local temp dir, then a
-  single ``batch_bucket_files`` commit uploads them all. One atomic commit; total
-  output is bounded by local disk.
-* ``atomic=False`` — a ``file_path_provider`` returns an ``HfFileSystem`` ``"wb"``
-  object per partition, so polars streams each partition straight to the bucket.
-  Disk-light (handles bigger-than-disk) at the cost of one commit per file — which
-  is cheap on buckets, since they are not git-backed.
+The bucket API has no transactions. Files are registered in requests of at
+most 1,000 operations; ``mode="overwrite"`` deletes stale files in later
+requests. A failure between two requests leaves the earlier ones applied.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
-from huggingface_hub import HfApi, HfFileSystem
-
+from polars_hf import _sinks
 from polars_hf._uri import parse_bucket_uri
 
 if TYPE_CHECKING:
@@ -47,7 +43,7 @@ _SINK_METHOD = {
     "ipc": "sink_ipc",
     "ndjson": "sink_ndjson",
 }
-_FORMAT_EXT = {"parquet": "parquet", "csv": "csv", "ipc": "ipc", "ndjson": "ndjson"}
+_MODES = ("append", "overwrite", "error")
 
 
 def _infer_format(path: str) -> str:
@@ -62,74 +58,74 @@ def _infer_format(path: str) -> str:
     )
 
 
-def _partition_by(
-    base_path: str,
-    *,
-    key: object,
-    max_rows_per_file: int | None,
-    max_bytes_per_file: int | None,
-    file_path_provider: object = None,
-) -> object:
-    import polars as pl
-
-    kwargs: dict = {}
-    if key is not None:
-        kwargs["key"] = key
-    if max_rows_per_file is not None:
-        kwargs["max_rows_per_file"] = max_rows_per_file
-    if max_bytes_per_file is not None:
-        kwargs["approximate_bytes_per_file"] = max_bytes_per_file
-    if file_path_provider is not None:
-        kwargs["file_path_provider"] = file_path_provider
-    return pl.PartitionBy(base_path, **kwargs)
-
-
-def _sink_partitioned_atomic(
-    lf, bucket_id, prefix, fmt, *, key, max_rows, max_bytes, sink_kwargs, token
-) -> None:
-    """Design A: native local partition, then one batched bucket commit."""
-    tmpdir = tempfile.mkdtemp(prefix="polars-hf-")
-    try:
-        part = _partition_by(
-            tmpdir, key=key, max_rows_per_file=max_rows, max_bytes_per_file=max_bytes
+def _check_sink_kwargs(kwargs: dict[str, Any]) -> None:
+    """Reject keyword arguments that ``sink_bucket`` cannot honour."""
+    if "atomic" in kwargs:
+        raise TypeError(
+            "sink_bucket() no longer accepts atomic=; see the backend= and mode= "
+            "parameters"
         )
-        getattr(lf, _SINK_METHOD[fmt])(part, **sink_kwargs)
-        adds = []
-        for root, _, files in os.walk(tmpdir):
-            for fn in files:
-                local = os.path.join(root, fn)
-                rel = os.path.relpath(local, tmpdir)
-                remote = f"{prefix}/{rel}" if prefix else rel
-                adds.append((local, remote))
-        if not adds:
-            return
-        HfApi(token=token).batch_bucket_files(bucket_id, add=adds)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    # With lazy=True Polars returns a plan and writes nothing: the destination
+    # would be registered as an empty object.
+    if kwargs.pop("lazy", False):
+        raise ValueError(
+            "sink_bucket() runs the query before it returns; lazy=True is not "
+            "supported"
+        )
 
 
-def _sink_partitioned_stream(
-    lf, base, fmt, *, key, max_rows, max_bytes, sink_kwargs, token
-) -> None:
-    """Design B: stream each partition straight to the bucket via a provider."""
-    fs = HfFileSystem(token=token)
-    ext = _FORMAT_EXT[fmt]
-    root = base.rstrip("/")
+def _make_run_sink(lf: pl.LazyFrame, fmt: str, sink_kwargs: dict[str, Any]) -> Any:
+    """Build the function a backend calls to run the Polars sink."""
 
-    def provider(args):
-        pk = args.partition_keys  # 1-row DataFrame of this partition's key columns
-        sub = "/".join(f"{c}={pk[c][0]}" for c in pk.columns)
-        rel = f"{sub}/" if sub else ""
-        return fs.open(f"{root}/{rel}{args.index_in_partition:08d}.{ext}", "wb")
+    def run_sink(target: Any) -> None:
+        result = getattr(lf, _SINK_METHOD[fmt])(target, **sink_kwargs)
+        if result is not None:
+            # The sink did not run (it returned a plan): the backend must not
+            # register anything.
+            raise TypeError(
+                f"{_SINK_METHOD[fmt]} returned {type(result).__name__} instead of "
+                "running the query; sink_bucket() cannot defer a write"
+            )
 
-    part = _partition_by(
-        root,
-        key=key,
-        max_rows_per_file=max_rows,
-        max_bytes_per_file=max_bytes,
-        file_path_provider=provider,
+    return run_sink
+
+
+def _files_with_prefix(backend: _sinks.SinkBackend, prefix: str) -> Iterator[str]:
+    """Paths of the files whose path starts with the string ``prefix``."""
+    items = backend.api.list_bucket_tree(
+        backend.bucket_id, prefix=prefix or None, recursive=True
     )
-    getattr(lf, _SINK_METHOD[fmt])(part, **sink_kwargs)
+    for item in items:
+        if getattr(item, "type", None) == "file":
+            yield item.path
+
+
+def _files_below(backend: _sinks.SinkBackend, prefix: str) -> list[str]:
+    """Paths of the files in the directory ``prefix`` (``""`` is the bucket)."""
+    paths = []
+    for path in _files_with_prefix(backend, prefix):
+        # The listing matches a string prefix: drop siblings such as "out2/x"
+        # for the prefix "out".
+        if prefix == "" or path.startswith(prefix + "/"):
+            paths.append(path)
+    return paths
+
+
+def _raise_if_file_exists(backend: _sinks.SinkBackend, path: str, uri: str) -> None:
+    for existing in _files_with_prefix(backend, path):
+        if existing == path:
+            raise FileExistsError(f"{uri!r} already exists (mode='error')")
+
+
+def _raise_if_prefix_not_empty(
+    backend: _sinks.SinkBackend, prefix: str, uri: str
+) -> None:
+    existing = _files_below(backend, prefix)
+    if existing:
+        raise FileExistsError(
+            f"{uri!r} already holds {len(existing)} file(s), for example "
+            f"{existing[0]!r} (mode='error')"
+        )
 
 
 def sink_bucket(
@@ -141,8 +137,10 @@ def sink_bucket(
     partition_by: str | list[str] | None = None,
     max_rows_per_file: int | None = None,
     max_bytes_per_file: int | None = None,
-    atomic: bool = True,
-    **kwargs: object,
+    mode: str = "append",
+    backend: str | None = None,
+    staging_dir: str | os.PathLike[str] | None = None,
+    **kwargs: Any,
 ) -> None:
     """Write a polars frame to a Hugging Face bucket.
 
@@ -150,6 +148,10 @@ def sink_bucket(
     frame is written there. If ``partition_by``, ``max_rows_per_file``, or
     ``max_bytes_per_file`` is given, ``uri`` is treated as a **base prefix** and the
     output is split into multiple files via native ``pl.PartitionBy``.
+
+    The query runs before the function returns. Files become visible in the
+    bucket only after the Polars sink has finished without an error: if the
+    query fails, nothing is written and existing objects are not changed.
 
     Parameters
     ----------
@@ -164,25 +166,78 @@ def sink_bucket(
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub``.
     partition_by
-        Column name(s) to partition by (hive ``key=value/`` layout).
+        Column name(s) to partition by. The layout is the one Polars writes
+        locally: ``key=value/`` directories with percent-encoded values and
+        ``__HIVE_DEFAULT_PARTITION__`` for a null key, and files named
+        ``00000000.parquet``, ``00000001.parquet``, ... (``.jsonl`` for ndjson).
     max_rows_per_file, max_bytes_per_file
         Split each partition further so files stay under these limits.
-    atomic
-        For partitioned writes: ``True`` (default) stages partitions locally and
-        uploads them in one commit (bounded by local disk); ``False`` streams each
-        partition straight to the bucket (handles bigger-than-disk; one commit per
-        file, which is cheap on buckets).
+    mode
+        What to do with objects that are already at the destination:
+
+        * ``"append"`` (default): keep them. An object with the same name as a
+          new file is replaced.
+        * ``"overwrite"``: after all new files are registered, delete the
+          files below the base prefix that this call did not write. For a
+          single-file write this is the same as ``"append"``.
+        * ``"error"``: raise ``FileExistsError`` before anything is written if
+          the destination file exists, or if any file exists below the base
+          prefix. The check and the write are separate requests, so a
+          concurrent writer is not excluded.
+    backend
+        ``"xet"`` streams every output file straight into Xet storage and uses
+        no local disk for the output. ``"hub"`` writes the output to a local
+        temporary directory first and uploads it with
+        ``HfApi.batch_bucket_files``, so it needs as much free disk as the
+        output is large. ``None`` (default) reads the environment variable
+        ``POLARS_HF_SINK_BACKEND`` and otherwise uses ``"xet"`` when the
+        installed ``huggingface_hub`` and ``hf_xet`` support it
+        (huggingface_hub>=1.19), else ``"hub"``.
+    staging_dir
+        Directory for the temporary files of the ``"hub"`` backend. Defaults to
+        the environment variable ``POLARS_HF_STAGING_DIR``, then to the system
+        temporary directory. The ``"xet"`` backend does not use it.
     **kwargs
-        Forwarded to the underlying polars ``sink_*``.
+        Forwarded to the underlying polars ``sink_*``. ``lazy=True`` is rejected.
+
+    Raises
+    ------
+    ValueError
+        For an invalid ``uri``, ``format``, ``mode`` or ``backend``, and for
+        ``lazy=True``.
+    FileExistsError
+        With ``mode="error"``, if the destination exists.
+    RuntimeError
+        If ``backend="xet"`` is requested and the installed packages do not
+        support it, or if the bucket rejects some of the files.
+
+    Notes
+    -----
+    The write is not transactional. Files are registered in requests of at most
+    1,000 operations, and ``mode="overwrite"`` deletes stale files afterwards.
+    If one of these requests fails, the earlier requests stay applied: the
+    destination can then hold a part of the new files, and with
+    ``mode="overwrite"`` it can hold new and stale files together.
+
+    A partitioned write whose query returns no rows writes one file with the
+    schema and no rows, ``{prefix}/00000000.{extension}``, so the prefix can
+    be scanned afterwards.
 
     Examples
     --------
     >>> import polars_hf as plhf
     >>> plhf.sink_bucket(lf, "hf://buckets/me/data/out.parquet")  # doctest: +SKIP
     >>> plhf.sink_bucket(  # doctest: +SKIP
-    ...     lf, "hf://buckets/me/data/by_year", partition_by="year"
+    ...     lf, "hf://buckets/me/data/by_year", partition_by="year", mode="overwrite"
     ... )
     """
+    import polars as pl
+
+    if mode not in _MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {_MODES}")
+    sink_kwargs = dict(kwargs)
+    _check_sink_kwargs(sink_kwargs)
+
     bp = parse_bucket_uri(uri)
     partitioned = (
         partition_by is not None
@@ -191,41 +246,53 @@ def sink_bucket(
     )
     lf = frame.lazy()
 
-    if not partitioned:
+    if partitioned:
+        fmt = format or "parquet"
+    else:
         if not bp.path:
             raise ValueError(f"a file path within the bucket is required, got {uri!r}")
+        if bp.path.endswith("/"):
+            raise ValueError(
+                f"{uri!r} names a directory; a single-file write needs a file path "
+                "(or pass a partition argument)"
+            )
         fmt = format or _infer_format(bp.path)
-        if fmt not in _SINK_METHOD:
-            raise ValueError(f"unsupported format {fmt!r}")
-        fs = HfFileSystem(token=token)
-        with fs.open(bp.fs_path, "wb") as f:
-            getattr(lf, _SINK_METHOD[fmt])(f, **kwargs)
-        return
-
-    fmt = format or "parquet"
     if fmt not in _SINK_METHOD:
         raise ValueError(f"unsupported format {fmt!r}")
 
-    if atomic:
-        _sink_partitioned_atomic(
-            lf,
-            bp.bucket_id,
-            bp.path.rstrip("/"),
-            fmt,
-            key=partition_by,
-            max_rows=max_rows_per_file,
-            max_bytes=max_bytes_per_file,
-            sink_kwargs=kwargs,
-            token=token,
-        )
-    else:
-        _sink_partitioned_stream(
-            lf,
-            bp.fs_path,
-            fmt,
-            key=partition_by,
-            max_rows=max_rows_per_file,
-            max_bytes=max_bytes_per_file,
-            sink_kwargs=kwargs,
-            token=token,
-        )
+    if staging_dir is not None:
+        staging_dir = os.fspath(staging_dir)
+    sink = _sinks.make_backend(backend, bp.bucket_id, token, staging_dir=staging_dir)
+    run_sink = _make_run_sink(lf, fmt, sink_kwargs)
+
+    if not partitioned:
+        if mode == "error":
+            _raise_if_file_exists(sink, bp.path, uri)
+        sink.write_file(run_sink, bp.path)
+        return
+
+    prefix = bp.path.rstrip("/")
+    if mode == "error":
+        _raise_if_prefix_not_empty(sink, prefix, uri)
+
+    spec = _sinks.PartitionSpec(
+        key=partition_by,
+        max_rows_per_file=max_rows_per_file,
+        max_bytes_per_file=max_bytes_per_file,
+        extension=_sinks.PARTITION_EXTENSION[fmt],
+    )
+    written = sink.write_partitioned(run_sink, prefix, spec)
+    if not written:
+        # No row, so Polars opened no file. Write the schema alone: the prefix
+        # then scans back as an empty frame instead of "no such file".
+        empty = pl.LazyFrame(schema=lf.collect_schema())
+        empty_path = _sinks.join_path(prefix, f"00000000.{spec.extension}")
+        written = sink.write_file(_make_run_sink(empty, fmt, sink_kwargs), empty_path)
+
+    if mode == "overwrite":
+        kept = set(written)
+        stale = []
+        for path in _files_below(sink, prefix):
+            if path not in kept:
+                stale.append(path)
+        sink.delete(stale)

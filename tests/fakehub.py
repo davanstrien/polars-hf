@@ -13,19 +13,40 @@ Every request is recorded (:attr:`FakeHub.requests`) and faults can be scripted
 per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
 bytes transferred and error handling without any network access.
 
-Uploads do not go over HTTP: the real client uploads to Xet storage with a
-native extension. :meth:`FakeHub.patch_uploads` replaces the private
-``HfApi._batch_bucket_files`` (one upload + one ``/batch`` request) with a
-function that stores the files in the fake bucket. The public
-``HfApi.batch_bucket_files`` stays real, so its client-side chunking (1,000
-operations per call) and its non-transactional behaviour are exercised. Both
-write paths of ``sink_bucket`` end up there (``HfFileSystem`` in ``"wb"`` mode
-commits through the same method when the file is closed).
+File data does not go over HTTP: the real client uploads to Xet storage with
+a native extension. :meth:`FakeHub.patch_uploads` adds one seam per sink
+backend of ``sink_bucket``:
 
-That patch is the ONLY way uploads are captured. A sink backend that uploads
-through ``hf_xet`` streams and posts to ``/api/buckets/{id}/batch`` itself is
-NOT covered: the fake has no ``/batch`` route and no Xet upload stand-in. The
-pull request that adds such a write path must add that seam here.
+* **hub backend.** The private ``HfApi._batch_bucket_files`` (one upload + one
+  ``/batch`` request) is replaced with a function that stores the files in the
+  fake bucket. The public ``HfApi.batch_bucket_files`` stays real, so its
+  client-side chunking (1,000 operations per call) and its non-transactional
+  behaviour are exercised.
+* **xet backend.** ``polars_hf._sinks.open_xet_commit`` is replaced with a
+  function that returns a :class:`MemoryCommit`: its streams keep the bytes in
+  memory and put them in the fake content store when the commit finishes. The
+  Xet protocol itself is not faked. Everything after the upload is real: the
+  backend registers the files with ``POST /api/buckets/{id}/batch`` over HTTP,
+  and that route stores the content the ``xetHash`` names. The patch also
+  reports the xet backend as available, so the offline suite covers it with
+  every supported ``huggingface_hub``; the real upload is covered by the
+  staging tests.
+
+Both seams append to :attr:`FakeHub.batch_calls`.
+
+The ``/batch`` route was compared with the Hub CI instance on 2026-10-01:
+
+* the reply is ``{"success", "processed", "succeeded", "failed"}``; a request
+  with some rejected operations answers 200, lists them in ``failed`` and
+  applies the others;
+* ``deleteFile`` of a missing path succeeds;
+* the server accepts more than 1,000 operations in one request (the limit of
+  1,000 is the client's), and so does the fake.
+
+Two differences: the fake rejects an ``addFile`` whose ``xetHash`` it never
+received (the Hub CI instance accepts any hash), and the 422 for a request
+whose operations all fail follows the ``huggingface_hub`` client, not an
+observation.
 
 The listing semantics were copied from the Hub CI instance
 (``hub-ci.huggingface.co``) on 2026-10-01:
@@ -55,6 +76,7 @@ import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import polars as pl
@@ -68,7 +90,7 @@ _RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 class ScriptedUploadError(RuntimeError):
-    """Raised by the patched ``_batch_bucket_files`` when told to fail."""
+    """Raised by a patched upload (hub or xet backend) when told to fail."""
 
 
 @dataclass(frozen=True)
@@ -91,12 +113,18 @@ class RecordedRequest:
 
 @dataclass
 class BatchCall:
-    """One call to the patched ``HfApi._batch_bucket_files`` (one chunk)."""
+    """One batch of bucket operations (one chunk).
+
+    ``via`` is ``"client"`` for a call to the patched
+    ``HfApi._batch_bucket_files`` and ``"http"`` for a ``POST .../batch``
+    request. ``failed`` is true if any operation of the batch was refused.
+    """
 
     bucket_id: str
     added: dict[str, int]
     deleted: list[str]
     failed: bool = False
+    via: str = "client"
 
 
 @dataclass
@@ -133,6 +161,70 @@ def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+class _MemoryStream:
+    """Stand-in for ``hf_xet.XetStreamUpload``: the bytes stay in memory."""
+
+    def __init__(self, commit: MemoryCommit, name: str) -> None:
+        self._commit = commit
+        self.name = name
+        self.chunks: list[bytes] = []
+        self.finished = False
+
+    def write(self, data: bytes) -> None:
+        hub = self._commit.hub
+        if self._commit.aborted:
+            raise RuntimeError("write to a stream of an aborted commit")
+        if hub._count("stream_writes") == hub.fail_stream_write_on_call:
+            raise ScriptedUploadError(f"scripted failure of a write to {self.name!r}")
+        self.chunks.append(bytes(data))
+
+    def finish(self) -> SimpleNamespace:
+        hub = self._commit.hub
+        if hub._count("stream_finishes") == hub.fail_stream_finish_on_call:
+            raise ScriptedUploadError(f"scripted failure of the upload {self.name!r}")
+        self.finished = True
+        data = b"".join(self.chunks)
+        info = SimpleNamespace(hash=_content_hash(data), file_size=len(data))
+        return SimpleNamespace(xet_info=info)
+
+
+class MemoryCommit:
+    """Stand-in for the upload commit of the xet backend.
+
+    The content of the finished streams reaches the fake content store in
+    :meth:`wait_to_finish`. A ``/batch`` request sent before that, or after
+    :meth:`abort`, names hashes the fake does not know and is refused.
+    """
+
+    def __init__(self, hub: FakeHub, bucket_id: str) -> None:
+        self.hub = hub
+        self.bucket_id = bucket_id
+        self.streams: list[_MemoryStream] = []
+        self.finished = False
+        self.aborted = False
+
+    def open_stream(self, name: str) -> _MemoryStream:
+        stream = _MemoryStream(self, name)
+        with self.hub._lock:
+            self.streams.append(stream)
+        return stream
+
+    def wait_to_finish(self) -> None:
+        if self.aborted:
+            raise RuntimeError("wait_to_finish on an aborted commit")
+        for stream in self.streams:
+            if not stream.finished:
+                raise RuntimeError(f"stream {stream.name!r} was not finished")
+            self.hub._store_blob(b"".join(stream.chunks))
+        self.finished = True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def interrupt(self) -> None:
+        self.aborted = True
+
+
 def _is_valid_destination(path: str) -> bool:
     """Whether the real Hub accepts ``path`` as a bucket file path."""
     if path == "" or path.startswith("/") or path.endswith("/"):
@@ -158,14 +250,24 @@ class FakeHub:
     requests
         Every request received, in arrival order.
     batch_calls
-        Every call to the patched ``HfApi._batch_bucket_files``: one per chunk
-        of at most 1,000 operations.
+        Every batch of bucket operations, in arrival order: the calls to the
+        patched ``HfApi._batch_bucket_files`` and the ``POST .../batch``
+        requests. One per chunk of at most 1,000 operations.
     fail_batch_on_call
-        If set to ``N``, the ``N``-th of those calls (1-based) raises
-        :class:`ScriptedUploadError` and stores nothing.
+        If set to ``N``, the ``N``-th batch (1-based) fails and stores
+        nothing: the patched method raises :class:`ScriptedUploadError`, the
+        HTTP route answers 403.
+    reject_paths
+        ``addFile`` operations of a ``POST .../batch`` request for these paths
+        are refused and listed in ``failed``; the others are applied.
+    commits
+        Every :class:`MemoryCommit` opened by the xet backend.
+    fail_stream_write_on_call, fail_stream_finish_on_call
+        If set to ``N``, the ``N``-th ``write()`` / ``finish()`` (1-based)
+        over all streams of all commits raises :class:`ScriptedUploadError`.
     before_batch
-        Optional callable run at the start of every upload call, before the
-        files are read. Tests use it to measure local staging.
+        Optional callable run at the start of every batch, before the files
+        are read. Tests use it to measure local staging.
     """
 
     def __init__(self, token: str) -> None:
@@ -173,7 +275,12 @@ class FakeHub:
         self.requests: list[RecordedRequest] = []
         self.batch_calls: list[BatchCall] = []
         self.fail_batch_on_call: int | None = None
+        self.reject_paths: set[str] = set()
+        self.commits: list[MemoryCommit] = []
+        self.fail_stream_write_on_call: int | None = None
+        self.fail_stream_finish_on_call: int | None = None
         self.before_batch = None
+        self._counters: dict[str, int] = {}
         self._buckets: dict[str, dict[str, bytes]] = {}
         # sha256 -> content, for every object ever stored (the "CAS").
         self._blobs: dict[str, bytes] = {}
@@ -337,11 +444,33 @@ class FakeHub:
 
     # ---- uploads -----------------------------------------------------------
 
+    def _count(self, name: str) -> int:
+        """Increment the counter ``name`` and return its new value."""
+        with self._lock:
+            self._counters[name] = self._counters.get(name, 0) + 1
+            return self._counters[name]
+
+    def _store_blob(self, data: bytes) -> None:
+        with self._lock:
+            self._blobs[_content_hash(data)] = data
+
+    def open_commit(self, endpoint: str, bucket_id: str, headers: dict) -> MemoryCommit:
+        """What replaces ``polars_hf._sinks.open_xet_commit``."""
+        commit = MemoryCommit(self, bucket_id)
+        with self._lock:
+            self.commits.append(commit)
+        return commit
+
     def patch_uploads(self, monkeypatch) -> None:
-        """Replace ``HfApi._batch_bucket_files`` with an in-memory upload."""
+        """Replace the upload of both sink backends with in-memory uploads."""
         from huggingface_hub import HfApi
 
+        from polars_hf import _sinks
+
         hub = self
+
+        monkeypatch.setattr(_sinks, "open_xet_commit", self.open_commit)
+        monkeypatch.setattr(_sinks, "xet_unavailable_reason", lambda: None)
 
         def _batch_bucket_files(
             api, bucket_id, *, add=None, copy=None, delete=None, token=None, **_
@@ -425,6 +554,55 @@ class FakeHub:
             for path in deletions:
                 bucket.pop(path, None)
 
+    def _http_batch(self, bucket_id: str, body: bytes) -> _Reply:
+        """``POST /api/buckets/{id}/batch``: NDJSON addFile / deleteFile."""
+        if self.before_batch is not None:
+            self.before_batch()
+        operations = []
+        for line in body.splitlines():
+            if line.strip():
+                operations.append(json.loads(line))
+
+        call = BatchCall(bucket_id=bucket_id, added={}, deleted=[], via="http")
+        failures = []
+        with self._lock:
+            self.batch_calls.append(call)
+            if self.fail_batch_on_call == len(self.batch_calls):
+                call.failed = True
+                return _error_reply(403, "Forbidden", "scripted failure of a batch")
+            bucket = self._buckets[bucket_id]
+            for operation in operations:
+                path = operation.get("path", "")
+                kind = operation.get("type")
+                if kind == "deleteFile":
+                    bucket.pop(path, None)
+                    call.deleted.append(path)
+                    continue
+                if kind != "addFile":
+                    error = f"the fake bucket does not implement {kind!r}"
+                elif not _is_valid_destination(path):
+                    error = "Invalid file path"
+                elif path in self.reject_paths:
+                    error = "scripted rejection"
+                elif operation.get("xetHash") not in self._blobs:
+                    error = "the fake bucket has no content for this xetHash"
+                else:
+                    data = self._blobs[operation["xetHash"]]
+                    bucket[path] = data
+                    call.added[path] = len(data)
+                    continue
+                failures.append({"path": path, "error": error})
+
+        call.failed = bool(failures)
+        payload = {
+            "success": not failures,
+            "processed": len(operations),
+            "succeeded": len(operations) - len(failures),
+            "failed": failures,
+        }
+        all_failed = bool(operations) and len(failures) == len(operations)
+        return _json_reply(payload, 422 if all_failed else 200)
+
     # ---- hub routes --------------------------------------------------------
 
     def _file_entry(self, path: str, data: bytes) -> dict:
@@ -489,6 +667,9 @@ class FakeHub:
                     "totalFiles": len(files),
                 }
                 return _json_reply(info)
+
+            if action == "batch" and method == "POST":
+                return self._http_batch(bucket_id, body)
 
             if action == "tree" and method == "GET":
                 # The client sends the prefix as ONE percent-encoded segment.
