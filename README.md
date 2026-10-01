@@ -125,7 +125,7 @@ A file that another writer *replaces* during the write is still deleted. A file 
 
 **Paths.** The Hub refuses a path with a backslash, an empty segment (`a//b`) or a `.` / `..`
 segment. `sink_bucket` also refuses a control character in a path and a path segment of more than
-255 bytes, with both backends, because the `"hub"` backend cannot create such a name on a local
+255 bytes, with both backends, because the `"staged"` backend cannot create such a name on a local
 file system. It raises a `ValueError` for such a destination before it sends a request. A partition
 column name or value can produce such a path too (a backslash is not percent-encoded, and an
 encoded value counts with its `key=` prefix towards the 255 bytes); the error names the `key=value`
@@ -135,30 +135,30 @@ segment, and no file of that write is registered.
 
 | `backend` | How | Local disk | Needs |
 | --- | --- | --- | --- |
-| `"xet"` | each output file is streamed into Xet storage with `hf_xet` while Polars writes it, then all files are registered in the bucket | none for the output | `huggingface_hub>=1.19` and the `hf_xet` that it requires (installed with it on x86_64 and arm64) |
-| `"hub"` | Polars writes the output to a temporary directory; the public `HfApi.batch_bucket_files` uploads and registers it | the size of the complete output | any supported `huggingface_hub` |
+| `"stream"` | each output file is streamed into Xet storage with `hf_xet` while Polars writes it, then all files are registered in the bucket | none for the output | `huggingface_hub>=1.19` and the `hf_xet` that it requires (installed with it on x86_64 and arm64) |
+| `"staged"` | Polars writes the output to a temporary directory; the public `HfApi.batch_bucket_files` uploads and registers it | the size of the complete output | any supported `huggingface_hub` |
 
 The default (`backend=None`) is the environment variable `POLARS_HF_SINK_BACKEND` if set, else
-`"xet"` when the installed packages support it, else `"hub"`. An explicit `"xet"` that cannot run
+`"stream"` when the installed packages support it, else `"staged"`. An explicit `"stream"` that cannot run
 raises an error; it does not fall back.
 
 With both backends, the deletes of `mode="overwrite"` are sent to the bucket batch endpoint
 (`/api/buckets/{id}/batch`) directly, not through `HfApi.batch_bucket_files`: `huggingface_hub` 1.x
 does not report a rejected delete, and the direct request lets `sink_bucket` check the answer.
 
-Notes on the `"xet"` backend:
+Notes on the `"stream"` backend:
 
 - It uses private helpers of `huggingface_hub.utils._xet` and builds the
   `/api/buckets/{id}/batch` request itself, because the public API has no streaming upload. If a
   later `huggingface_hub` or `hf_xet` changes these, `sink_bucket` raises a `RuntimeError` that
-  names the installed versions and points to `backend="hub"`; it does not fall back silently.
+  names the installed versions and points to `backend="staged"`; it does not fall back silently.
 - A `KeyboardInterrupt` during a write aborts the process-wide Xet session, as `huggingface_hub`
   does in its own uploads. Other Xet uploads and downloads that run in the same process are
   cancelled.
 - All upload streams stay open until the query ends, because Polars does not signal when one file is
   complete.
 
-Notes on the `"hub"` backend:
+Notes on the `"staged"` backend:
 
 - It stages in the directory named by `POLARS_HF_STAGING_DIR`, else in the system temporary
   directory, and removes the files when the write ends.
@@ -167,7 +167,7 @@ Notes on the `"hub"` backend:
   file's string prefix, or of the base prefix, per write) and raises if a file is missing or has
   another size. `huggingface_hub` 2.x reports rejected files itself, and no listing is made.
 
-**Memory.** In laptop runs with outputs up to 4.5 GB, the `"xet"` backend used 0.5–1.8 GB more
+**Memory.** In laptop runs with outputs up to 4.5 GB, the `"stream"` backend used 0.5–1.8 GB more
 memory than Polars alone. A bound on its memory use is not proven. See
 [Measurements](#measurements).
 
@@ -178,7 +178,7 @@ that fails before the first registration request also leaves the destination unc
 of a registration request does not: see the list below.
 
 A failed registration or delete request raises `polars_hf.BucketRegistrationError` (a
-`RuntimeError`) with both backends, and so does a failed upload of the `"hub"` backend (an HTTP
+`RuntimeError`) with both backends, and so does a failed upload of the `"staged"` backend (an HTTP
 error, a timeout or a connection error; the original error is the `__cause__`). Its `failures`
 attribute lists the operations the bucket rejected. After a timeout or a connection error the
 request may or may not have been applied: the message says so, and a listing of the destination
@@ -202,7 +202,7 @@ The write is **not transactional**, because the bucket API has no transactions:
 Peak RSS of one process, one run each, on one macOS laptop, with uncompressed incompressible data.
 "Polars alone" is the same query written to a file object that discards the bytes.
 
-| Output | Polars alone | `"hub"` | `"xet"` |
+| Output | Polars alone | `"staged"` | `"stream"` |
 | --- | --- | --- | --- |
 | 1 file, 2.2 GB | 1.05 GB | 1.58 GB | 1.78 GB |
 | 1 file, 4.5 GB | 1.56 GB | not measured | 2.99 GB |
@@ -283,11 +283,11 @@ uv run pytest -m staging      # live tests against the Hub CI staging instance
 server for the bucket API and the `resolve` redirect, and a second one (another origin) that serves
 the "presigned" URLs with range requests. It records every request and the bytes it serves, and can
 be scripted to fail (`429`, `503`, `403`, ...). File uploads do not go over HTTP; the fake has one
-seam per sink backend. For the `"hub"` backend, a patched `HfApi._batch_bucket_files` stores the
-files in memory, so the client-side chunking of the public method stays real. For the `"xet"`
+seam per sink backend. For the `"staged"` backend, a patched `HfApi._batch_bucket_files` stores the
+files in memory, so the client-side chunking of the public method stays real. For the `"stream"`
 backend, an in-memory object replaces the `hf_xet` upload commit, and the backend's own
 registration request goes to the fake's `POST /api/buckets/{id}/batch` route. The fake also reports
-the `"xet"` backend as available, so the offline suite runs both backends with every supported
+the `"stream"` backend as available, so the offline suite runs both backends with every supported
 `huggingface_hub`. The real `hf_xet` upload is covered by the staging tests only. Use the
 `fake_hub` / `fake_bucket` fixtures. `tests/sinks.py` is the one place that names the write design
 (backends and failure switches); write tests go through its helpers.
@@ -297,7 +297,7 @@ instance `huggingface_hub` uses for its own tests. `tests/conftest.py` sets `HF_
 `HF_TOKEN` to the staging endpoint and its public CI token *before* `huggingface_hub` is imported,
 so the test process never talks to `huggingface.co` and never reads your own token. Each test
 creates a uniquely named bucket and deletes it afterwards. `tests/test_staging_sinks.py` runs the
-same write scenarios for both sink backends; the `xet` cases are skipped when the installed
+same write scenarios for both sink backends; the `stream` cases are skipped when the installed
 `huggingface_hub` is older than 1.19. `test_local_disk_use` measures the growth of the temporary
 directory during a write (16 MB by default; `POLARS_HF_DISK_TEST_MB=300 uv run pytest -m staging -k
 test_local_disk_use -s` prints a larger measurement).

@@ -4,11 +4,11 @@
 and how the result is uploaded. Both backends follow the same rule: nothing is
 visible in the bucket until the Polars sink has returned without an error.
 
-* :class:`XetBackend` hands Polars write-only file objects. Every ``write()``
+* :class:`StreamBackend` hands Polars write-only file objects. Every ``write()``
   goes into an ``hf_xet`` upload stream, so no output is staged on local disk.
   When the sink has returned, the streams are finished and the files are
   registered with the bucket ``/batch`` endpoint.
-* :class:`HubBackend` lets Polars write into a local temporary directory and
+* :class:`StagedBackend` lets Polars write into a local temporary directory and
   uploads it with the public ``HfApi.batch_bucket_files``.
 
 The two backends produce the same object names for the same call: both name
@@ -21,7 +21,7 @@ Neither backend is transactional: the bucket API has no transactions. Files
 are registered in requests of at most 1,000 operations, and a failure between
 two requests leaves the earlier ones applied.
 
-The xet backend relies on private parts of its dependencies: the session
+The stream backend relies on private parts of its dependencies: the session
 helpers of ``huggingface_hub.utils._xet`` and the ``/api/buckets/{id}/batch``
 request, which it builds itself the way ``HfApi._batch_bucket_files`` does.
 """
@@ -52,16 +52,16 @@ if TYPE_CHECKING:
 
 BACKEND_ENV_VAR = "POLARS_HF_SINK_BACKEND"
 STAGING_DIR_ENV_VAR = "POLARS_HF_STAGING_DIR"
-BACKEND_NAMES = ("xet", "hub")
+BACKEND_NAMES = ("stream", "staged")
 
 # The Hub client sends at most this many operations per ``/batch`` request.
 BATCH_CHUNK_SIZE = 1000
 
 # Longest path segment accepted, in bytes: the file-name limit of the common
-# local file systems, where the hub backend stages the output.
+# local file systems, where the staged backend stages the output.
 MAX_SEGMENT_BYTES = 255
 
-# Threads that finish the upload streams of one xet write.
+# Threads that finish the upload streams of one stream write.
 _FINISH_THREADS = 16
 
 # File extension Polars gives the files of a partitioned sink, per format.
@@ -84,10 +84,10 @@ class BucketRegistrationError(RuntimeError):
 
     Raised by both backends when the request that registers files in the
     bucket (or deletes stale ones) fails, gets no answer, gets an answer that
-    does not confirm it, or is answered with rejected operations. The hub
+    does not confirm it, or is answered with rejected operations. The staged
     backend also raises it when its upload fails, with the error of
     ``huggingface_hub`` as the ``__cause__``. An error of the ``hf_xet``
-    stream upload of the xet backend is raised as ``hf_xet`` reports it.
+    stream upload of the stream backend is raised as ``hf_xet`` reports it.
 
     Attributes
     ----------
@@ -128,9 +128,9 @@ def incompatible_xet_error(error: BaseException) -> RuntimeError:
     except Exception:
         hf_xet_version = "unknown"
     return RuntimeError(
-        "the 'xet' sink backend is not compatible with the installed "
+        "the 'stream' sink backend is not compatible with the installed "
         f"huggingface_hub {huggingface_hub.__version__} / hf_xet {hf_xet_version} "
-        f"({type(error).__name__}: {error}). Use backend='hub'."
+        f"({type(error).__name__}: {error}). Use backend='staged'."
     )
 
 
@@ -191,7 +191,7 @@ def validate_destination(path: str) -> None:
 
     The Hub rejects a backslash, an empty segment (a leading or trailing
     slash, ``//``) and the segments ``.`` and ``..``. Control characters and
-    segments of more than 255 bytes are refused here as well: the hub backend
+    segments of more than 255 bytes are refused here as well: the staged backend
     cannot stage such a name on a local file system, and both backends must
     accept the same destinations. For a partitioned write the offending
     segment is the ``key=value`` directory, so the message names the partition
@@ -415,17 +415,17 @@ class SinkBackend(ABC):
             )
 
 
-# ---- hub backend ------------------------------------------------------------
+# ---- staged backend ------------------------------------------------------------
 
 
-class HubBackend(SinkBackend):
+class StagedBackend(SinkBackend):
     """Stage the output on local disk, then upload it with the public API.
 
     Local disk use equals the size of the complete output. The staging
     directory is removed when the write ends, with or without an error.
     """
 
-    name = "hub"
+    name = "staged"
 
     def __init__(self, bucket_id: str, token: str | None) -> None:
         super().__init__(bucket_id, token)
@@ -504,7 +504,7 @@ class HubBackend(SinkBackend):
         additions = []
 
         def provider(args: Any) -> str:
-            # The same names, checks and errors as the xet backend. Polars
+            # The same names, checks and errors as the stream backend. Polars
             # creates the directories below the staging directory.
             relative, path = destinations.claim(args)
             additions.append((relative, path))
@@ -521,16 +521,16 @@ class HubBackend(SinkBackend):
         return [path for _, path in local_additions]
 
 
-# ---- xet backend ------------------------------------------------------------
+# ---- stream backend ------------------------------------------------------------
 
 _XET_REQUIREMENT = (
-    "the 'xet' sink backend needs huggingface_hub>=1.19 and the hf_xet that it "
+    "the 'stream' sink backend needs huggingface_hub>=1.19 and the hf_xet that it "
     "requires (installed by huggingface_hub on x86_64 and arm64)"
 )
 
 
-def xet_unavailable_reason() -> str | None:
-    """Why the xet backend cannot run here, or ``None`` if it can.
+def stream_unavailable_reason() -> str | None:
+    """Why the stream backend cannot run here, or ``None`` if it can.
 
     The backend needs ``XetUploadCommit.start_upload_stream`` from ``hf_xet``
     and the Xet session helpers of ``huggingface_hub.utils._xet`` (a private
@@ -708,7 +708,7 @@ def _chunks(items: list, size: int) -> Iterator[list]:
         yield items[start : start + size]
 
 
-class XetBackend(SinkBackend):
+class StreamBackend(SinkBackend):
     """Stream every output file into Xet storage; no local staging.
 
     All upload streams stay open until the Polars sink returns, because Polars
@@ -716,7 +716,7 @@ class XetBackend(SinkBackend):
     bucket only after every stream has been stored.
     """
 
-    name = "xet"
+    name = "stream"
 
     def _upload(self, write: Callable[[_XetUpload], None]) -> list[str]:
         """Run ``write`` against a new commit; register its files on success."""
@@ -802,27 +802,27 @@ class XetBackend(SinkBackend):
 def resolve_backend_name(backend: str | None) -> str:
     """Pick the backend: the argument, then the environment, then the default.
 
-    The default is ``"xet"`` when it can run here and ``"hub"`` otherwise. An
-    explicit ``"xet"`` that cannot run raises instead of falling back.
+    The default is ``"stream"`` when it can run here and ``"staged"`` otherwise. An
+    explicit ``"stream"`` that cannot run raises instead of falling back.
     """
     requested = backend
     if requested is None:
         requested = os.environ.get(BACKEND_ENV_VAR) or None
     if requested is None:
-        return "xet" if xet_unavailable_reason() is None else "hub"
+        return "stream" if stream_unavailable_reason() is None else "staged"
     if requested not in BACKEND_NAMES:
         raise ValueError(
             f"unknown sink backend {requested!r}; expected one of {BACKEND_NAMES}"
         )
-    if requested == "xet":
-        reason = xet_unavailable_reason()
+    if requested == "stream":
+        reason = stream_unavailable_reason()
         if reason is not None:
-            raise RuntimeError(f"{_XET_REQUIREMENT}; {reason}. Use backend='hub'.")
+            raise RuntimeError(f"{_XET_REQUIREMENT}; {reason}. Use backend='staged'.")
     return requested
 
 
 def make_backend(backend: str | None, bucket_id: str, token: str | None) -> SinkBackend:
     name = resolve_backend_name(backend)
-    if name == "xet":
-        return XetBackend(bucket_id, token)
-    return HubBackend(bucket_id, token)
+    if name == "stream":
+        return StreamBackend(bucket_id, token)
+    return StagedBackend(bucket_id, token)

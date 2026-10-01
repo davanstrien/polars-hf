@@ -214,14 +214,14 @@ def sink_bucket(
           exists at the base prefix or anywhere below it. The check and the
           write are separate requests, so a concurrent writer is not excluded.
     backend
-        ``"xet"`` streams every output file straight into Xet storage and uses
-        no local disk for the output. ``"hub"`` writes the output to a local
+        ``"stream"`` streams every output file straight into Xet storage and uses
+        no local disk for the output. ``"staged"`` writes the output to a local
         temporary directory first and uploads it with
         ``HfApi.batch_bucket_files``, so it needs as much free disk as the
         output is large. ``None`` (default) reads the environment variable
-        ``POLARS_HF_SINK_BACKEND`` and otherwise uses ``"xet"`` when the
+        ``POLARS_HF_SINK_BACKEND`` and otherwise uses ``"stream"`` when the
         installed ``huggingface_hub`` and ``hf_xet`` support it
-        (huggingface_hub>=1.19), else ``"hub"``. The ``"hub"`` backend stages
+        (huggingface_hub>=1.19), else ``"staged"``. The ``"staged"`` backend stages
         in the directory named by the environment variable
         ``POLARS_HF_STAGING_DIR``, else in the system temporary directory.
     **kwargs
@@ -241,7 +241,7 @@ def sink_bucket(
         If the upload or the registration request fails, or if the bucket
         rejects some of the files (see ``failures``). It is a ``RuntimeError``.
     RuntimeError
-        If ``backend="xet"`` is requested and the installed packages do not
+        If ``backend="stream"`` is requested and the installed packages do not
         support it or are not compatible with it.
 
     Notes

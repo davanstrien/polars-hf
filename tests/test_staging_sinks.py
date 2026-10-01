@@ -1,7 +1,7 @@
 """Staging tests of the sink backends: the real uploads, same scenarios for both.
 
 Selected with ``pytest -m staging``. Each test writes to its own new bucket
-(the ``staging_bucket`` fixture). The ``xet`` parameter is skipped when the
+(the ``staging_bucket`` fixture). The ``stream`` parameter is skipped when the
 installed ``huggingface_hub`` cannot run that backend (see ``sinks.py``).
 """
 
@@ -57,9 +57,9 @@ def _failing_frame() -> pl.LazyFrame:
 
 
 def test_default_backend_on_staging() -> None:
-    # Nothing is patched here: the default is the xet backend exactly when the
+    # Nothing is patched here: the default is the stream backend exactly when the
     # installed packages can run it.
-    expected = "xet" if _sinks.xet_unavailable_reason() is None else "hub"
+    expected = "stream" if _sinks.stream_unavailable_reason() is None else "staged"
 
     assert _sinks.resolve_backend_name(None) == expected
 
@@ -242,19 +242,19 @@ def test_write_of_more_than_one_batch(
 def test_backends_write_identical_names_and_data(
     staging_api: HfApi, staging_bucket: str
 ) -> None:
-    if _sinks.xet_unavailable_reason() is not None:
-        pytest.skip("the xet backend is not available")
+    if _sinks.stream_unavailable_reason() is not None:
+        pytest.skip("the stream backend is not available")
     df = pl.DataFrame({"g": ["a", "a", "b", None], "n": range(4)})
 
-    sink_streamed(df, _uri(staging_bucket, "xet"), partition_by="g")
-    sink_staged(df, _uri(staging_bucket, "hub"), partition_by="g")
+    sink_streamed(df, _uri(staging_bucket, "stream"), partition_by="g")
+    sink_staged(df, _uri(staging_bucket, "staged"), partition_by="g")
 
     streamed = {}
-    for path, info in _files(staging_api, staging_bucket, "xet/").items():
-        streamed[path[len("xet/") :]] = info
+    for path, info in _files(staging_api, staging_bucket, "stream/").items():
+        streamed[path[len("stream/") :]] = info
     staged = {}
-    for path, info in _files(staging_api, staging_bucket, "hub/").items():
-        staged[path[len("hub/") :]] = info
+    for path, info in _files(staging_api, staging_bucket, "staged/").items():
+        staged[path[len("staged/") :]] = info
     # Same names, same sizes, same content hashes.
     assert streamed == staged
     assert len(streamed) == 3
@@ -285,15 +285,15 @@ def test_local_disk_use(
     """Peak growth of the temp directory during a partitioned write.
 
     The output is about 16 MB by default; set ``POLARS_HF_DISK_TEST_MB`` for a
-    larger measurement (the result is printed, see ``pytest -s``). The xet
-    backend must not stage the output; the hub backend stages all of it.
+    larger measurement (the result is printed, see ``pytest -s``). The stream
+    backend must not stage the output; the staged backend stages all of it.
     """
     import tempfile
 
     megabytes = int(os.environ.get("POLARS_HF_DISK_TEST_MB", "16"))
     staging = tmp_path / "staging"
     staging.mkdir()
-    # tempfile.mkdtemp (hub backend) and any temp file of the Hub client go
+    # tempfile.mkdtemp (staged backend) and any temp file of the Hub client go
     # below this directory; hf_xet reads TMPDIR.
     monkeypatch.setattr(tempfile, "tempdir", str(staging))
     monkeypatch.setenv("TMPDIR", str(staging))
@@ -328,7 +328,7 @@ def test_local_disk_use(
 
     files = _files(staging_api, staging_bucket, "disk/")
     total = sum(size for size, _ in files.values())
-    name = "hub" if sink is sink_staged else "xet"
+    name = "staged" if sink is sink_staged else "stream"
     print(
         f"\nlocal disk [{name}]: output {total / 1e6:.1f} MB in {len(files)} files, "
         f"peak temp-dir growth {peak / 1e6:.1f} MB"
@@ -371,7 +371,7 @@ def test_keyboard_interrupt_leaves_destination_unchanged(
         sink(interrupted, uri, row_group_size=10_000)
 
     assert _files(staging_api, staging_bucket) == files_before
-    # The xet backend aborted the process-wide Xet session; the next write
+    # The stream backend aborted the process-wide Xet session; the next write
     # gets a new one.
     sink(pl.DataFrame({"n": [1]}), _uri(staging_bucket, "after.parquet"))
     assert "after.parquet" in _files(staging_api, staging_bucket)
@@ -385,7 +385,7 @@ def test_path_the_hub_rejects_raises(
 
     The package's own path check is switched off, so the backslash reaches the
     Hub, which rejects that file and applies the others. huggingface_hub 1.x
-    does not report this; the hub backend then finds the missing file with a
+    does not report this; the staged backend then finds the missing file with a
     listing.
     """
     monkeypatch.setattr(_sinks, "validate_destination", lambda path: None)
@@ -413,8 +413,8 @@ def test_big_write_is_identical_with_both_backends(
 
     ``POLARS_HF_BIG_STAGING_MB`` sets the uncompressed size (default 300).
     """
-    if _sinks.xet_unavailable_reason() is not None:
-        pytest.skip("the xet backend is not available")
+    if _sinks.stream_unavailable_reason() is not None:
+        pytest.skip("the stream backend is not available")
     megabytes = int(os.environ.get("POLARS_HF_BIG_STAGING_MB", "300"))
     rows = megabytes * 1_000_000 // 30
     ids = pl.int_range(0, rows, eager=False)
@@ -433,21 +433,21 @@ def test_big_write_is_identical_with_both_backends(
         "maintain_order": True,
     }
 
-    sink_streamed(frame, _uri(staging_bucket, "xet"), **options)
-    sink_staged(frame, _uri(staging_bucket, "hub"), **options)
+    sink_streamed(frame, _uri(staging_bucket, "stream"), **options)
+    sink_staged(frame, _uri(staging_bucket, "staged"), **options)
 
     streamed = {}
-    for path, info in _files(staging_api, staging_bucket, "xet/").items():
-        streamed[path[len("xet/") :]] = info
+    for path, info in _files(staging_api, staging_bucket, "stream/").items():
+        streamed[path[len("stream/") :]] = info
     staged = {}
-    for path, info in _files(staging_api, staging_bucket, "hub/").items():
-        staged[path[len("hub/") :]] = info
+    for path, info in _files(staging_api, staging_bucket, "staged/").items():
+        staged[path[len("staged/") :]] = info
     total = sum(size for size, _ in streamed.values())
     print(f"\nbig write: {len(streamed)} files, {total / 1e6:.0f} MB per backend")
     assert len(streamed) >= 20
     assert total > megabytes * 500_000
     # Same names, same sizes, same xet hashes.
     assert streamed == staged
-    for name in ("xet", "hub"):
+    for name in ("stream", "staged"):
         count = plhf.scan_bucket(_uri(staging_bucket, name)).select(pl.len()).collect()
         assert count.item() == rows

@@ -28,7 +28,7 @@ def test_xet_backend_availability_matches_the_installed_versions() -> None:
     # 1.19.0, which also requires an hf_xet with streaming uploads.
     pytest.importorskip("hf_xet")
 
-    reason = _sinks.xet_unavailable_reason()
+    reason = _sinks.stream_unavailable_reason()
 
     if _hub_version() >= (1, 19):
         assert reason is None
@@ -43,7 +43,7 @@ def no_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _set_xet(monkeypatch: pytest.MonkeyPatch, reason: str | None) -> None:
-    monkeypatch.setattr(_sinks, "xet_unavailable_reason", lambda: reason)
+    monkeypatch.setattr(_sinks, "stream_unavailable_reason", lambda: reason)
 
 
 def test_default_backend_is_xet_when_available(
@@ -51,7 +51,7 @@ def test_default_backend_is_xet_when_available(
 ) -> None:
     _set_xet(monkeypatch, None)
 
-    assert _sinks.resolve_backend_name(None) == "xet"
+    assert _sinks.resolve_backend_name(None) == "stream"
 
 
 def test_default_backend_falls_back_to_hub(
@@ -59,8 +59,8 @@ def test_default_backend_falls_back_to_hub(
 ) -> None:
     _set_xet(monkeypatch, "hf_xet is not installed")
 
-    assert _sinks.resolve_backend_name(None) == "hub"
-    assert _sinks.resolve_backend_name("hub") == "hub"
+    assert _sinks.resolve_backend_name(None) == "staged"
+    assert _sinks.resolve_backend_name("staged") == "staged"
 
 
 @pytest.mark.parametrize("how", ["argument", "environment"])
@@ -68,9 +68,9 @@ def test_explicit_xet_backend_raises_when_unavailable(
     monkeypatch: pytest.MonkeyPatch, no_backend_env: None, how: str
 ) -> None:
     _set_xet(monkeypatch, "huggingface_hub 1.12.0 has no Xet session helpers")
-    requested = "xet" if how == "argument" else None
+    requested = "stream" if how == "argument" else None
     if how == "environment":
-        monkeypatch.setenv(_sinks.BACKEND_ENV_VAR, "xet")
+        monkeypatch.setenv(_sinks.BACKEND_ENV_VAR, "stream")
 
     with pytest.raises(RuntimeError) as error:
         _sinks.resolve_backend_name(requested)
@@ -78,18 +78,18 @@ def test_explicit_xet_backend_raises_when_unavailable(
     message = str(error.value)
     assert "huggingface_hub>=1.19" in message
     assert "huggingface_hub 1.12.0 has no Xet session helpers" in message
-    assert "backend='hub'" in message
+    assert "backend='staged'" in message
 
 
 def test_environment_variable_selects_the_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_xet(monkeypatch, None)
-    monkeypatch.setenv(_sinks.BACKEND_ENV_VAR, "hub")
+    monkeypatch.setenv(_sinks.BACKEND_ENV_VAR, "staged")
 
-    assert _sinks.resolve_backend_name(None) == "hub"
+    assert _sinks.resolve_backend_name(None) == "staged"
     # The argument has priority over the environment.
-    assert _sinks.resolve_backend_name("xet") == "xet"
+    assert _sinks.resolve_backend_name("stream") == "stream"
 
 
 def test_empty_environment_variable_means_default(
@@ -98,7 +98,7 @@ def test_empty_environment_variable_means_default(
     _set_xet(monkeypatch, None)
     monkeypatch.setenv(_sinks.BACKEND_ENV_VAR, "")
 
-    assert _sinks.resolve_backend_name(None) == "xet"
+    assert _sinks.resolve_backend_name(None) == "stream"
 
 
 def test_unknown_backend_is_rejected(no_backend_env: None) -> None:
@@ -144,7 +144,7 @@ class _Discard:
 
 
 def _provider_names(df: pl.DataFrame, **partition: object) -> set[str]:
-    """The names the xet backend's provider builds for a partitioned sink."""
+    """The names the stream backend's provider builds for a partitioned sink."""
     names = set()
 
     def provider(args: object) -> _Discard:

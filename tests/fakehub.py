@@ -17,18 +17,18 @@ File data does not go over HTTP: the real client uploads to Xet storage with
 a native extension. :meth:`FakeHub.patch_uploads` adds one seam per sink
 backend of ``sink_bucket``:
 
-* **hub backend.** The private ``HfApi._batch_bucket_files`` (one upload + one
+* **staged backend.** The private ``HfApi._batch_bucket_files`` (one upload + one
   ``/batch`` request) is replaced with a function that stores the files in the
   fake bucket. The public ``HfApi.batch_bucket_files`` stays real, so its
   client-side chunking (1,000 operations per call) and its non-transactional
   behaviour are exercised.
-* **xet backend.** ``polars_hf._sinks.open_xet_commit`` is replaced with a
+* **stream backend.** ``polars_hf._sinks.open_xet_commit`` is replaced with a
   function that returns a :class:`MemoryCommit`: its streams keep the bytes in
   memory and put them in the fake content store when the commit finishes. The
   Xet protocol itself is not faked. Everything after the upload is real: the
   backend registers the files with ``POST /api/buckets/{id}/batch`` over HTTP,
   and that route stores the content the ``xetHash`` names. The patch also
-  reports the xet backend as available, so the offline suite covers it with
+  reports the stream backend as available, so the offline suite covers it with
   every supported ``huggingface_hub``; the real upload is covered by the
   staging tests.
 
@@ -90,7 +90,7 @@ _RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 class ScriptedUploadError(RuntimeError):
-    """Raised by a patched upload (hub or xet backend) when told to fail."""
+    """Raised by a patched upload (hub or stream backend) when told to fail."""
 
 
 @dataclass(frozen=True)
@@ -189,7 +189,7 @@ class _MemoryStream:
 
 
 class MemoryCommit:
-    """Stand-in for the upload commit of the xet backend.
+    """Stand-in for the upload commit of the stream backend.
 
     The content of the finished streams reaches the fake content store in
     :meth:`wait_to_finish`. A ``/batch`` request sent before that, or after
@@ -262,9 +262,9 @@ class FakeHub:
         and raises nothing, like huggingface_hub 1.x when the bucket rejects
         single files of a request.
     commits
-        Every :class:`MemoryCommit` opened by the xet backend.
+        Every :class:`MemoryCommit` opened by the stream backend.
     session_aborts
-        How often the xet backend stopped the shared Xet session (what it
+        How often the stream backend stopped the shared Xet session (what it
         does after a ``KeyboardInterrupt``). The real session is not touched.
     fail_stream_write_on_call, fail_stream_finish_on_call
         If set to ``N``, the ``N``-th ``write()`` / ``finish()`` (1-based)
@@ -480,7 +480,7 @@ class FakeHub:
         hub = self
 
         monkeypatch.setattr(_sinks, "open_xet_commit", self.open_commit)
-        monkeypatch.setattr(_sinks, "xet_unavailable_reason", lambda: None)
+        monkeypatch.setattr(_sinks, "stream_unavailable_reason", lambda: None)
         monkeypatch.setattr(_sinks, "abort_xet_session", self._abort_session)
 
         def _batch_bucket_files(

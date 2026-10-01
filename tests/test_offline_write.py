@@ -367,7 +367,7 @@ def test_upload_error_propagates_and_registers_nothing(
     # Bug d: the streamed write uploaded in __del__, so the error was
     # swallowed and the files uploaded before it stayed in the bucket.
     df = pl.DataFrame({"g": ["a", "b", "c"], "n": [1, 2, 3]})
-    # The hub backend uploads one batch; the xet backend uploads three files.
+    # The staged backend uploads one batch; the stream backend uploads three files.
     if sink is sink_staged:
         fail_batch(fake_hub, 1)
     else:
@@ -382,7 +382,7 @@ def test_upload_error_propagates_and_registers_nothing(
 def test_failed_stream_write_raises_the_upload_error(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
-    # Polars reports a failed write() as its own ComputeError; the xet backend
+    # Polars reports a failed write() as its own ComputeError; the stream backend
     # raises the error of the upload stream instead.
     fake_hub.put_parquet(fake_bucket, "keep.parquet", pl.DataFrame({"a": [1]}))
     before = _snapshot(fake_hub, fake_bucket)
@@ -415,7 +415,7 @@ def test_streamed_files_are_stored_before_they_are_registered(
 def test_keyboard_interrupt_stops_the_xet_session(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
-    backend = _sinks.XetBackend(fake_bucket, token=None)
+    backend = _sinks.StreamBackend(fake_bucket, token=None)
 
     def interrupted(target: object) -> None:
         raise KeyboardInterrupt
@@ -439,7 +439,7 @@ def test_keyboard_interrupt_survives_a_failing_commit_abort(
         raise RuntimeError("abort failed")
 
     monkeypatch.setattr(MemoryCommit, "abort", fails)
-    backend = _sinks.XetBackend(fake_bucket, token=None)
+    backend = _sinks.StreamBackend(fake_bucket, token=None)
 
     def interrupted(target: object) -> None:
         raise KeyboardInterrupt
@@ -458,7 +458,7 @@ def test_keyboard_interrupt_survives_a_failing_session_abort(
         raise RuntimeError("session abort failed")
 
     monkeypatch.setattr(_sinks, "abort_xet_session", fails)
-    backend = _sinks.XetBackend(fake_bucket, token=None)
+    backend = _sinks.StreamBackend(fake_bucket, token=None)
 
     def interrupted(target: object) -> None:
         raise KeyboardInterrupt
@@ -775,7 +775,7 @@ def test_streamed_write_does_not_stage_on_local_disk(
     fake_hub: FakeHub, fake_bucket: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Bug n: the partitioned write staged the complete output in a local temp
-    # dir. The xet backend hands Polars file objects, so nothing is staged.
+    # dir. The stream backend hands Polars file objects, so nothing is staged.
     # (Offline the upload stream is the in-memory stand-in; the staging test
     # test_local_disk_use measures the real hf_xet upload.)
     staging = tmp_path / "staging"
@@ -792,7 +792,7 @@ def test_streamed_write_does_not_stage_on_local_disk(
 def test_staged_write_uses_as_much_local_disk_as_the_output(
     fake_hub: FakeHub, fake_bucket: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The documented limitation of the hub backend (bug n does not apply).
+    # The documented limitation of the staged backend (bug n does not apply).
     staging = tmp_path / "staging"
     staging.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(staging))
@@ -948,7 +948,7 @@ def test_partition_value_the_hub_refuses_is_rejected_before_registration(
     assert "'g=a\\\\b'" in str(error.value)
     assert fake_hub.files(fake_bucket) == []
     assert fake_hub.batch_calls == []
-    # The xet backend may have opened streams for other partitions: the
+    # The stream backend may have opened streams for other partitions: the
     # commit is aborted, so nothing is stored.
     assert all(commit.aborted for commit in fake_hub.commits)
 
@@ -1007,7 +1007,7 @@ def test_write_error_is_raised_even_if_the_sink_swallows_it(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
     # The backend does not rely on Polars to raise for a failed write().
-    backend = _sinks.XetBackend(fake_bucket, token=None)
+    backend = _sinks.StreamBackend(fake_bucket, token=None)
     fake_hub.fail_stream_write_on_call = 2
 
     def sink_that_hides_errors(target) -> None:
@@ -1074,7 +1074,7 @@ def _assert_incompatible(error: pytest.ExceptionInfo) -> None:
     assert "not compatible with the installed" in message
     assert f"huggingface_hub {huggingface_hub.__version__}" in message
     assert "hf_xet " in message
-    assert "backend='hub'" in message
+    assert "backend='staged'" in message
     assert isinstance(error.value.__cause__, TypeError)
 
 
@@ -1149,12 +1149,12 @@ def test_segment_of_255_bytes_is_accepted(fake_hub: FakeHub, fake_bucket: str) -
     value = "x" * (255 - len("g="))
     df = pl.DataFrame({"g": [value], "n": [1]})
 
-    for name, sink in (("xet", sink_streamed), ("hub", sink_staged)):
+    for name, sink in (("stream", sink_streamed), ("staged", sink_staged)):
         sink(df, _uri(fake_bucket, name), partition_by="g")
 
     assert fake_hub.files(fake_bucket) == [
-        f"hub/g={value}/00000000.parquet",
-        f"xet/g={value}/00000000.parquet",
+        f"staged/g={value}/00000000.parquet",
+        f"stream/g={value}/00000000.parquet",
     ]
 
 
@@ -1192,7 +1192,7 @@ def test_overwrite_delete_is_a_checked_request(
     ]
 
 
-# -- hub backend with a client that does not report rejected files (hub 1.x) --
+# -- staged backend with a client that does not report rejected files (hub 1.x) --
 
 
 def test_hub_backend_detects_a_file_the_client_dropped_silently(
@@ -1245,7 +1245,7 @@ def test_hub_backend_verification_passes_and_costs_one_listing(
 def test_verification_reports_a_wrong_size(fake_hub: FakeHub, fake_bucket: str) -> None:
     fake_hub.put(fake_bucket, "dir/a.bin", b"12345")
     fake_hub.put(fake_bucket, "dir/b.bin", b"123")
-    backend = _sinks.HubBackend(fake_bucket, token=None)
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
 
     backend._verify_added({"dir/a.bin": 5, "dir/b.bin": 3}, "dir")
     with pytest.raises(BucketRegistrationError) as error:
@@ -1360,7 +1360,7 @@ def test_registration_answer_that_does_not_confirm_is_an_error(
 
     with pytest.raises(BucketRegistrationError) as error:
         if sink is sink_staged:
-            # The first /batch request of the hub backend is the delete.
+            # The first /batch request of the staged backend is the delete.
             sink(df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite")
         else:
             sink(df, _uri(fake_bucket, "out/a.parquet"))
@@ -1373,7 +1373,7 @@ def test_changed_http_helper_is_not_reported_as_an_xet_problem(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # http_backoff is public API and serves both backends: its errors are not
-    # relabelled as "the xet backend is not compatible".
+    # relabelled as "the stream backend is not compatible".
     fake_hub.put(fake_bucket, "out/stale.txt", b"stale")
 
     def changed(*args: object, **kwargs: object) -> None:
