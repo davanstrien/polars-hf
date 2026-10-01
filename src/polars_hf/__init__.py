@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from importlib.metadata import PackageNotFoundError, version
 
 # Bucket reads fetch many small, high-latency range requests from the XET CDN.
 # polars' default cloud-IO concurrency is max(cpu_threads, 10) ≈ 10, which
@@ -14,6 +15,9 @@ from polars_hf._uri import BucketPath, parse_bucket_uri  # noqa: E402
 from polars_hf.read import scan_bucket
 from polars_hf.write import sink_bucket
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("polars-hf")
+except PackageNotFoundError:  # running from a source tree that is not installed
+    __version__ = "0+unknown"
 
 __all__ = ["BucketPath", "parse_bucket_uri", "scan_bucket", "sink_bucket"]
