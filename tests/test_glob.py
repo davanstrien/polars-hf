@@ -19,7 +19,7 @@ def _matches(pattern: str, path: str) -> bool:
         ("a/b[1].parquet", "a/b"),
         ("**/*.parquet", ""),
         ("no/glob.parquet", "no/glob.parquet"),
-        ("a]b", "a"),
+        ("a]b", "a]b"),
     ],
 )
 def test_literal_prefix(pattern: str, prefix: str) -> None:

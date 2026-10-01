@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_GLOB_CHARS = frozenset("*?[]")
+# A lone "]" is a normal character: only these start a glob.
+_GLOB_CHARS = frozenset("*?[")
 
 
 @dataclass(frozen=True)

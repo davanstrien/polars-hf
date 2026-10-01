@@ -155,3 +155,13 @@ def test_trailing_whitespace_rejected(uri: str) -> None:
 def test_space_inside_the_path_is_allowed() -> None:
     bp = parse_bucket_uri("hf://buckets/ns/name/my dir /my file.parquet")
     assert bp.path == "my dir /my file.parquet"
+
+
+@pytest.mark.parametrize("path", ["a]b.parquet", "]", "x/y]/z"])
+def test_lone_closing_bracket_is_not_a_glob(path: str) -> None:
+    assert not parse_bucket_uri(f"hf://buckets/ns/name/{path}").is_glob
+
+
+@pytest.mark.parametrize("path", ["a*.parquet", "a?.parquet", "a[1].parquet", "a["])
+def test_glob_characters(path: str) -> None:
+    assert parse_bucket_uri(f"hf://buckets/ns/name/{path}").is_glob
