@@ -343,6 +343,9 @@ class FakeHub:
         ) -> None:
             hub._batch(api.endpoint, bucket_id, add or [], copy or [], delete or [])
 
+        # This relies on a PRIVATE method of huggingface_hub. Its name and
+        # keyword arguments were verified on 1.12.0, 1.17.0 and 2.0.0; check
+        # them again when the supported range moves.
         monkeypatch.setattr(HfApi, "_batch_bucket_files", _batch_bucket_files)
 
     def _raise_http_error(self, url: str, status: int, message: str) -> None:

@@ -58,6 +58,10 @@ from huggingface_hub import HfApi, HfFileSystem, constants  # noqa: E402
 from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
 from hypothesis import settings  # noqa: E402
 
+# If a pytest plugin imported huggingface_hub before this module, the constant
+# (and any HfApi / HfFileSystem object the plugin already created) keeps the
+# production endpoint, whatever the environment says now. Abort the session
+# instead of running tests against production.
 if constants.ENDPOINT != STAGING_ENDPOINT:  # pragma: no cover - safety stop
     pytest.exit(
         "huggingface_hub was imported before tests/conftest.py could force the "
@@ -227,10 +231,12 @@ def staging_seed_files() -> dict[str, pl.DataFrame]:
 def staging_read_bucket(staging_api: HfApi) -> Iterator[str]:
     """A staging bucket seeded once per module; tests must not write to it."""
     bucket_id = _create_staging_bucket(staging_api)
-    add = []
-    for path, frame in staging_seed_files().items():
-        add.append((_parquet_bytes(frame), path))
     try:
+        # Inside the try: an error while the seed data is built must still
+        # delete the bucket.
+        add = []
+        for path, frame in staging_seed_files().items():
+            add.append((_parquet_bytes(frame), path))
         _staging_retry(lambda: staging_api.batch_bucket_files(bucket_id, add=add))
         yield bucket_id
     finally:
