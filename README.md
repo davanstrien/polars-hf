@@ -35,7 +35,7 @@ uv add "polars-hf @ git+https://github.com/davanstrien/polars-hf"
 # or: pip install "git+https://github.com/davanstrien/polars-hf"
 ```
 
-Requires `polars>=1.40,<3`, `huggingface_hub>=1.12` and `httpx>=0.27,<1`.
+Requires `polars>=1.40,<3`, `huggingface_hub>=1.12,<3` and `httpx>=0.27,<1`.
 
 ### On Hugging Face Jobs
 

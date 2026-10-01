@@ -79,9 +79,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv venv
-      - run: ${{ matrix.install }}
+      # Dev tools first, the dependency pins last: the last install decides
+      # the versions under test, and a later step cannot move them.
       - run: uv pip install --group dev
-      - run: uv pip list
+      - run: ${{ matrix.install }}
+      # Make the versions under test visible in the log.
+      - run: uv pip list | grep -Ei 'polars|huggingface|httpx|hf-xet'
       - run: uv run --no-sync pytest -q -m "not staging"
 
   # Live round-trips against the Hub CI staging instance, on every push and
