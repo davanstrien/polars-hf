@@ -110,6 +110,9 @@ jobs:
     env:
       HF_ENDPOINT: https://hub-ci.huggingface.co
       HF_TOKEN: hf_HubCITokenXXXXXXXXXXXXXXXXXXXXX
+      # The weekly run also uploads a few hundred MB with both sink backends
+      # (tests/test_staging_sinks.py::test_big_write_is_identical_with_both_backends).
+      POLARS_HF_BIG_STAGING: ${{ github.event_name == 'schedule' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0

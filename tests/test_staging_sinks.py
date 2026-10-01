@@ -400,3 +400,54 @@ def test_path_the_hub_rejects_raises(
         "parts/g=fine/00000000.parquet",
         "parts/g=ok/00000000.parquet",
     ]
+
+
+@pytest.mark.skipif(
+    os.environ.get("POLARS_HF_BIG_STAGING") != "1",
+    reason="large upload: set POLARS_HF_BIG_STAGING=1 (the weekly CI run does)",
+)
+def test_big_write_is_identical_with_both_backends(
+    staging_api: HfApi, staging_bucket: str
+) -> None:
+    """A few hundred MB over several partitions: same objects from both backends.
+
+    ``POLARS_HF_BIG_STAGING_MB`` sets the uncompressed size (default 300).
+    """
+    if _sinks.xet_unavailable_reason() is not None:
+        pytest.skip("the xet backend is not available")
+    megabytes = int(os.environ.get("POLARS_HF_BIG_STAGING_MB", "300"))
+    rows = megabytes * 1_000_000 // 30
+    ids = pl.int_range(0, rows, eager=False)
+    frame = pl.select(id=ids, eager=False).with_columns(
+        g=pl.col("id") % 5,
+        text=(pl.col("id") * 2654435761 % 1000003).cast(pl.String)
+        + "-"
+        + pl.col("id").cast(pl.String),
+    )
+    options = {
+        "partition_by": "g",
+        "max_rows_per_file": rows // 20,
+        "compression": "uncompressed",
+        # Ordered output: the same rows reach the same file in both runs.
+        "engine": "streaming",
+        "maintain_order": True,
+    }
+
+    sink_streamed(frame, _uri(staging_bucket, "xet"), **options)
+    sink_staged(frame, _uri(staging_bucket, "hub"), **options)
+
+    streamed = {}
+    for path, info in _files(staging_api, staging_bucket, "xet/").items():
+        streamed[path[len("xet/") :]] = info
+    staged = {}
+    for path, info in _files(staging_api, staging_bucket, "hub/").items():
+        staged[path[len("hub/") :]] = info
+    total = sum(size for size, _ in streamed.values())
+    print(f"\nbig write: {len(streamed)} files, {total / 1e6:.0f} MB per backend")
+    assert len(streamed) >= 20
+    assert total > megabytes * 500_000
+    # Same names, same sizes, same xet hashes.
+    assert streamed == staged
+    for name in ("xet", "hub"):
+        count = plhf.scan_bucket(_uri(staging_bucket, name)).select(pl.len()).collect()
+        assert count.item() == rows
