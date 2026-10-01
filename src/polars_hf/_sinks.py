@@ -48,7 +48,14 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import build_hf_headers, hf_raise_for_status, http_backoff
 
-from polars_hf.read import _Budget, _list_tree
+from polars_hf.read import (
+    _REDIRECT_CODES,
+    _Budget,
+    _iter_tree_pages,
+    _no_access_error,
+    _request,
+    _resolve_url,
+)
 
 if TYPE_CHECKING:
     import polars as pl
@@ -143,25 +150,30 @@ _API_SHAPE_ERRORS = (TypeError, AttributeError)
 
 
 def _network_errors() -> tuple[type[BaseException], ...]:
-    """Timeouts and connection errors of the HTTP clients huggingface_hub uses."""
+    """Timeouts and connection errors of a request to the Hub.
+
+    Not ``OSError`` as a whole: a local error (a full disk, a staged file that
+    cannot be read) must not be reported as "no answer from the Hub".
+    """
     import importlib
 
-    errors: list[type[BaseException]] = [OSError]
+    errors: list[type[BaseException]] = [ConnectionError, TimeoutError]
     # huggingface_hub 1.x sends its requests with httpx, 2.x with httpx2.
-    # Neither is a dependency of this package.
+    # Neither is a dependency of this package. TransportError covers their
+    # timeouts and connection errors, not HTTP status errors.
     for name in ("httpx", "httpx2"):
         try:
             module = importlib.import_module(name)
         except ImportError:
             continue
-        errors.append(module.HTTPError)
+        errors.append(module.TransportError)
     return tuple(errors)
 
 
 _UNKNOWN_STATE = (
     "The state of the destination is unknown: the request may or may not have "
-    "been applied. List the destination (for example with "
-    "HfApi.list_bucket_tree) to see which files are registered"
+    "been applied. List the destination (`hf buckets ls`, or scan_bucket for "
+    "parquet files) to see which files are registered"
 )
 
 
@@ -247,9 +259,8 @@ class _Destinations:
         """Name the file Polars asks for: ``(relative path, bucket path)``.
 
         ``args`` is what Polars passes to a ``file_path_provider``. Raises for
-        a path the bucket would refuse, for a path asked for twice (a second
-        file would replace the first one under the same name) and for a path
-        that must not be replaced (``spec.existing``).
+        a path the bucket would refuse and for a path asked for twice (a
+        second file would replace the first one under the same name).
         """
         relative = partition_file_name(
             args.partition_keys,
@@ -259,7 +270,6 @@ class _Destinations:
         )
         path = join_path(self.prefix, relative)
         validate_destination(path)
-        raise_if_existing(path, self.spec.existing)
         with self._lock:
             if path in self._seen:
                 raise RuntimeError(
@@ -291,16 +301,6 @@ def hive_encode(value: str | None) -> str:
 def new_run_id() -> str:
     """A random token that marks the files of one ``mode="append"`` call."""
     return secrets.token_hex(6)
-
-
-def raise_if_existing(path: str, existing: frozenset[str]) -> None:
-    """Refuse a generated name that is already in the bucket (append mode)."""
-    if path in existing:
-        raise FileExistsError(
-            f"the generated file name {path!r} already exists in the bucket; "
-            "mode='append' does not replace files. Run the write again to get "
-            "new names"
-        )
 
 
 def partition_file_name(
@@ -342,8 +342,6 @@ class PartitionSpec:
     extension: str
     # Appended to the file index of every file name; "" gives native names.
     suffix: str = ""
-    # Bucket paths that this write must not replace.
-    existing: frozenset[str] = frozenset()
 
     def partition_by(self, base_path: str, file_path_provider: Any = None) -> Any:
         """Build the ``pl.PartitionBy`` target for this spec."""
@@ -404,21 +402,60 @@ class SinkBackend(ABC):
         retries, and with ``PermissionError`` / ``FileNotFoundError`` for a
         bucket that cannot be read or does not exist.
         """
-        uri = f"hf://buckets/{self.bucket_id}/{prefix}"
-        entries = _list_tree(
+        files = {}
+        for page in self._tree_pages(prefix):
+            for entry in page:
+                if entry.type == "file" and entry.path.startswith(prefix):
+                    files[entry.path] = entry.size
+        return files
+
+    def _tree_pages(self, prefix: str) -> Iterator[list[Any]]:
+        return _iter_tree_pages(
             self.api.endpoint,
             self.headers,
             self.bucket_id,
             prefix,
             recursive=True,
-            uri=uri,
-            budget=_Budget(self.bucket_id),
+            uri=f"hf://buckets/{self.bucket_id}/{prefix}",
+            budget=_Budget(self.bucket_id, operation="sink_bucket"),
         )
-        files = {}
-        for entry in entries:
-            if entry.type == "file" and entry.path.startswith(prefix):
-                files[entry.path] = entry.size
-        return files
+
+    def first_file(self, prefix: str) -> str | None:
+        """The path of one file whose path starts with ``prefix``, if any.
+
+        One request when the first listing page holds a file (or the listing
+        is empty), however many files match.
+        """
+        for page in self._tree_pages(prefix):
+            for entry in page:
+                if entry.type == "file" and entry.path.startswith(prefix):
+                    return entry.path
+        return None
+
+    def file_exists(self, path: str) -> bool:
+        """Whether there is a file at exactly ``path`` (one HEAD request).
+
+        The ``resolve`` endpoint answers a redirect (or 200) for a file and
+        404 for a directory or a missing path.
+        """
+        uri = f"hf://buckets/{self.bucket_id}/{path}"
+        url = _resolve_url(self.api.endpoint, self.bucket_id, path)
+        budget = _Budget(self.bucket_id, operation="sink_bucket")
+        response = _request("HEAD", url, self.headers, budget, "resolve")
+        status = response.status_code
+        if status in _REDIRECT_CODES or status == 200:
+            return True
+        if status == 404:
+            if response.headers.get("x-error-code") == "RepoNotFound":
+                raise FileNotFoundError(
+                    f"bucket {self.bucket_id!r} not found (or the token has no "
+                    f"access to it): {uri!r}"
+                )
+            return False
+        if status in (401, 403):
+            raise _no_access_error(self.bucket_id, uri, status)
+        hf_raise_for_status(response)
+        raise RuntimeError(f"unexpected answer of the Hub for {uri!r} (HTTP {status})")
 
     def delete(self, paths: list[str]) -> None:
         """Delete objects from the bucket (a missing path is not an error)."""
@@ -525,7 +562,15 @@ class StagedBackend(SinkBackend):
         huggingface_hub 1.x returns normally when the bucket rejects single
         files, so the destination is listed once after the upload.
         """
-        listed = self.list_files(listing_prefix)
+        try:
+            listed = self.list_files(listing_prefix)
+        except Exception as error:
+            raise BucketRegistrationError(
+                f"the upload to bucket {self.bucket_id!r} returned, but the "
+                "listing that checks the registration failed "
+                f"({type(error).__name__}: {error}). The files may be "
+                f"registered. {_UNKNOWN_STATE}."
+            ) from error
         failures = []
         for path, size in sizes.items():
             if path not in listed:

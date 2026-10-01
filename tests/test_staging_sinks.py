@@ -481,3 +481,22 @@ def test_big_write_is_identical_with_both_backends(
     for name in ("stream", "staged"):
         count = plhf.scan_bucket(_uri(staging_bucket, name)).select(pl.len()).collect()
         assert count.item() == rows
+
+
+@both_sinks
+def test_file_and_directory_of_one_name_are_refused(
+    staging_api: HfApi, staging_bucket: str, sink
+) -> None:
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+    sink(df, _uri(staging_bucket, "as-file"))
+    sink(df, _uri(staging_bucket, "as-dir.parquet"), partition_by="g")
+    files_before = _files(staging_api, staging_bucket)
+
+    for mode in ("error", "append", "overwrite"):
+        with pytest.raises(FileExistsError, match="'as-file' is a file"):
+            sink(df, _uri(staging_bucket, "as-file"), partition_by="g", mode=mode)
+    for mode in ("error", "overwrite"):
+        with pytest.raises(FileExistsError, match="'as-dir.parquet/' is a directory"):
+            sink(df, _uri(staging_bucket, "as-dir.parquet"), mode=mode)
+
+    assert _files(staging_api, staging_bucket) == files_before

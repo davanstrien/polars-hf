@@ -30,6 +30,7 @@ import re
 import threading
 import time
 import warnings
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode, urljoin, urlparse
@@ -111,11 +112,13 @@ class _Budget:
     """Retry limits and progress of one ``scan_bucket`` call.
 
     One instance is shared by the listing and by all resolve threads, so the
-    deadline applies to the call as a whole.
+    deadline applies to the call as a whole. ``operation`` names the public
+    function in messages; the write path passes ``"sink_bucket"``.
     """
 
-    def __init__(self, bucket_id: str) -> None:
+    def __init__(self, bucket_id: str, operation: str = "scan_bucket") -> None:
         self.bucket_id = bucket_id
+        self.operation = operation
         self.deadline = time.monotonic() + _SCAN_DEADLINE
         self.files_total = 0
         self._files_resolved = 0
@@ -215,15 +218,15 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
         asked = "the Hub asks to wait" if hint is not None else "the next retry is in"
         reason = (
             f"{asked} {wait:.0f} s, but only {left:.0f} s are left of the "
-            f"{_SCAN_DEADLINE:.0f} s allowed for one scan_bucket call; try "
-            "again later"
+            f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.operation} call; "
+            "try again later"
         )
         raise _retry_error(response, budget, what, reason)
     if hint is not None and wait > _WARN_WAIT:
         cause = "rate limit" if response.status_code == 429 else "busy server"
         budget.announce_wait(
-            f"scan_bucket: Hub {cause} (HTTP {response.status_code}) on a {what} "
-            f"request for the bucket {budget.bucket_id!r}; waiting {wait:.0f} s "
+            f"{budget.operation}: Hub {cause} (HTTP {response.status_code}) on a "
+            f"{what} request for the bucket {budget.bucket_id!r}; waiting {wait:.0f} s "
             "before the next attempt"
         )
     time.sleep(wait)
@@ -361,7 +364,36 @@ def _list_tree(
     uri: str,
     budget: _Budget,
 ) -> list[_Entry]:
-    """All entries of a bucket listing, page by page.
+    """All entries of a bucket listing (every page of :func:`_iter_tree_pages`)."""
+    entries: list[_Entry] = []
+    pages = _iter_tree_pages(
+        endpoint,
+        headers,
+        bucket_id,
+        prefix,
+        recursive=recursive,
+        uri=uri,
+        budget=budget,
+    )
+    for page in pages:
+        entries.extend(page)
+    return entries
+
+
+def _iter_tree_pages(
+    endpoint: str,
+    headers: dict[str, str],
+    bucket_id: str,
+    prefix: str,
+    *,
+    recursive: bool,
+    uri: str,
+    budget: _Budget,
+) -> Iterator[list[_Entry]]:
+    """The entries of a bucket listing, one page per request.
+
+    A page is requested only when the caller asks for it, so a caller that
+    stops after the first page sends one request.
 
     The request is the one of ``HfApi.list_bucket_tree``:
     ``GET /api/buckets/{id}/tree/{prefix}?recursive=...``, with the prefix as
@@ -384,14 +416,14 @@ def _list_tree(
     url = f"{url}?{urlencode(query)}"
     hub_origin = _origin(endpoint)
 
-    entries: list[_Entry] = []
+    listed = 0
     requested: set[str] = set()
     while url is not None:
         if time.monotonic() > budget.deadline:
             raise TimeoutError(
                 f"the listing of {uri!r} did not finish within the "
-                f"{_SCAN_DEADLINE:.0f} s allowed for one scan_bucket call "
-                f"({len(entries)} entries were listed)"
+                f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.operation} call "
+                f"({listed} entries were listed)"
             )
         requested.add(url)
         response = _request("GET", url, headers, budget, "listing")
@@ -412,7 +444,8 @@ def _list_tree(
                 f"unexpected answer of the Hub listing endpoint {url!r} "
                 f"(HTTP {response.status_code})"
             )
-        entries.extend(_entries_of_page(response, url))
+        page = _entries_of_page(response, url)
+        listed += len(page)
 
         # The link of the next page already holds the query parameters.
         next_url = _next_page_url(response, url)
@@ -434,8 +467,8 @@ def _list_tree(
                     f"the Hub listing of {uri!r} links back to a page that was "
                     f"already read: {next_url!r}"
                 )
+        yield page
         url = next_url
-    return entries
 
 
 def _files(entries: list) -> list:

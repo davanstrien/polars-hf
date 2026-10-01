@@ -661,26 +661,6 @@ def test_append_names_are_the_same_with_both_backends(
 
 
 @both_sinks
-def test_append_refuses_a_generated_name_that_exists(
-    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Two calls with the same run id cannot happen by chance (48 random
-    # bits); if a name exists all the same, it is an error, not a replace.
-    _run_ids(monkeypatch, "cccccccccccc", "cccccccccccc")
-    base = _uri(fake_bucket, "parts")
-    df = pl.DataFrame({"g": ["a", "b"], "n": [1, 2]})
-    sink(df, base, partition_by="g", mode="append")
-    before = _snapshot(fake_hub, fake_bucket)
-    fake_hub.batch_calls.clear()
-
-    with pytest.raises(FileExistsError, match="generated file name"):
-        sink(df, base, partition_by="g", mode="append")
-
-    assert _snapshot(fake_hub, fake_bucket) == before
-    assert fake_hub.batch_calls == []
-
-
-@both_sinks
 def test_append_with_an_empty_result_adds_one_empty_file(
     fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -869,7 +849,7 @@ def test_error_mode_raises_if_the_prefix_holds_a_file(
     before = _snapshot(fake_hub, fake_bucket)
     df = pl.DataFrame({"g": ["a"], "n": [1]})
 
-    with pytest.raises(FileExistsError, match="already holds 1 file"):
+    with pytest.raises(FileExistsError, match="already holds files"):
         sink(df, _uri(fake_bucket, "parts"), partition_by="g", mode="error")
 
     assert _snapshot(fake_hub, fake_bucket) == before
@@ -882,7 +862,7 @@ def test_error_mode_writes_to_a_free_destination(
     fake_hub: FakeHub, fake_bucket: str, sink
 ) -> None:
     # Siblings that share the string prefix do not count as "existing".
-    for path in ["out.parquet.bak", "out.parquet/child.txt", "parts2/x", "parts.txt"]:
+    for path in ["out.parquet.bak", "out.parquetX/child.txt", "parts2/x", "parts.txt"]:
         fake_hub.put(fake_bucket, path, b"sibling")
     df = pl.DataFrame({"g": ["a"], "n": [1]})
 
@@ -1166,7 +1146,7 @@ def test_error_mode_raises_if_a_file_is_at_the_prefix(
     fake_hub.put(fake_bucket, "parts", b"a file, not a directory")
     df = pl.DataFrame({"g": ["a"], "n": [1]})
 
-    with pytest.raises(FileExistsError, match="already exists as a file"):
+    with pytest.raises(FileExistsError, match="'parts' is a file in the bucket"):
         sink(df, _uri(fake_bucket, "parts"), partition_by="g", mode="error")
 
     assert fake_hub.files(fake_bucket) == ["parts"]
@@ -1211,14 +1191,28 @@ def test_write_error_is_raised_even_if_the_sink_swallows_it(
 def test_missing_bucket_raises_the_registration_error(fake_hub: FakeHub, sink) -> None:
     df = pl.DataFrame({"a": [1]})
 
-    # mode="overwrite": no listing before the write, so the first request to
-    # the missing bucket is the upload or the registration.
-    with pytest.raises(BucketRegistrationError) as error:
-        sink(df, "hf://buckets/fake-user/no-such-bucket/a.parquet", mode="overwrite")
+    # The existence check is the first request to the missing bucket.
+    for mode in ("error", "overwrite"):
+        with pytest.raises(FileNotFoundError, match="fake-user/no-such-bucket"):
+            sink(df, "hf://buckets/fake-user/no-such-bucket/a.parquet", mode=mode)
 
-    assert isinstance(error.value.__cause__, HfHubHTTPError)
-    assert error.value.__cause__.response.status_code == 404
-    assert error.value.failures == []
+    assert fake_hub.batch_calls == []
+    assert fake_hub.commits == []
+
+
+def test_registration_in_a_missing_bucket_raises_the_registration_error(
+    fake_hub: FakeHub,
+) -> None:
+    # The backends themselves: without the checks of sink_bucket in front.
+    for backend_class in (_sinks.StreamBackend, _sinks.StagedBackend):
+        backend = backend_class("fake-user/no-such-bucket", token=None)
+
+        with pytest.raises(BucketRegistrationError) as error:
+            backend.delete(["a.parquet"])
+
+        assert isinstance(error.value.__cause__, HfHubHTTPError)
+        assert error.value.__cause__.response.status_code == 404
+        assert error.value.failures == []
 
 
 def test_registration_reply_that_is_not_json_is_an_error(
@@ -1467,7 +1461,7 @@ def _assert_unknown_state(error: pytest.ExceptionInfo, cause: type) -> None:
     assert isinstance(error.value.__cause__, cause)
     message = str(error.value)
     assert "state of the destination is unknown" in message
-    assert "list_bucket_tree" in message
+    assert "hf buckets ls" in message
 
 
 def test_network_error_of_the_registration_request_is_wrapped(
@@ -1581,3 +1575,206 @@ def test_changed_http_helper_is_not_reported_as_an_xet_problem(
         sink_staged(
             df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite"
         )
+
+
+# ---- review round 4 --------------------------------------------------------
+
+
+def _checks(fake_hub: FakeHub) -> list[tuple[str, str]]:
+    """``(method, kind)`` of the requests sent before the upload."""
+    kinds = []
+    for request in fake_hub.requests:
+        if "/resolve/" in request.path:
+            kinds.append((request.method, "resolve"))
+        elif "/tree" in request.path:
+            kinds.append((request.method, "tree"))
+    return kinds
+
+
+@both_sinks
+def test_existence_checks_cost_a_bounded_number_of_requests(
+    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Many siblings that share the string prefix "out", a large destination
+    # "big/", and a listing that returns 100 entries per page.
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: True)
+    fake_hub.tree_page_size = 100
+    for number in range(1500):
+        fake_hub.put(fake_bucket, f"out2/{number:04}.txt", b"x")
+        fake_hub.put(fake_bucket, f"out.parquet.{number:04}", b"x")
+        fake_hub.put(fake_bucket, f"big/{number:04}.txt", b"x")
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    # Directory, mode="error", free: one HEAD and one listing page.
+    fake_hub.reset_log()
+    sink(df, _uri(fake_bucket, "out"), partition_by="g")
+    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+
+    # Directory, mode="error", 1,500 files there: the same two requests.
+    fake_hub.reset_log()
+    with pytest.raises(FileExistsError):
+        sink(df, _uri(fake_bucket, "big"), partition_by="g")
+    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+
+    # Directory, mode="append": one HEAD, no listing, whatever is there.
+    fake_hub.reset_log()
+    sink(df, _uri(fake_bucket, "big"), partition_by="g", mode="append")
+    assert _checks(fake_hub) == [("HEAD", "resolve")]
+
+    # Bucket root, mode="error": one listing page.
+    fake_hub.reset_log()
+    with pytest.raises(FileExistsError):
+        sink(df, f"hf://buckets/{fake_bucket}", partition_by="g")
+    assert _checks(fake_hub) == [("GET", "tree")]
+
+    # Single file, mode="error": one HEAD and one listing page of "path/".
+    fake_hub.reset_log()
+    sink(df, _uri(fake_bucket, "out.parquet"))
+    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+
+    # Single file, mode="overwrite": one listing page of "path/".
+    fake_hub.reset_log()
+    sink(df, _uri(fake_bucket, "out.parquet"), mode="overwrite")
+    assert _checks(fake_hub) == [("GET", "tree")]
+
+
+@both_sinks
+def test_overwrite_lists_every_page_of_the_destination(
+    fake_hub: FakeHub, fake_bucket: str, sink
+) -> None:
+    fake_hub.tree_page_size = 100
+    for number in range(250):
+        fake_hub.put(fake_bucket, f"out/{number:04}.txt", b"stale")
+    df = pl.DataFrame({"n": [1]})
+
+    sink(df, _uri(fake_bucket, "out"), max_rows_per_file=10, mode="overwrite")
+
+    assert fake_hub.files(fake_bucket) == ["out/00000000.parquet"]
+
+
+@both_sinks
+@pytest.mark.parametrize("mode", ["error", "overwrite"])
+def test_file_write_over_a_directory_is_refused(
+    fake_hub: FakeHub, fake_bucket: str, sink, mode: str
+) -> None:
+    fake_hub.put(fake_bucket, "out.parquet/child.txt", b"in a directory")
+    before = _snapshot(fake_hub, fake_bucket)
+
+    with pytest.raises(FileExistsError) as error:
+        sink(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "out.parquet"), mode=mode)
+
+    message = str(error.value)
+    assert "cannot write the file 'out.parquet'" in message
+    assert "'out.parquet/' is a directory" in message
+    assert "'out.parquet/child.txt'" in message
+    assert _snapshot(fake_hub, fake_bucket) == before
+    assert fake_hub.batch_calls == []
+    assert fake_hub.commits == []
+
+
+@both_sinks
+@pytest.mark.parametrize("mode", ["error", "append", "overwrite"])
+def test_directory_write_below_a_file_is_refused(
+    fake_hub: FakeHub, fake_bucket: str, sink, mode: str
+) -> None:
+    fake_hub.put(fake_bucket, "out", b"a file")
+    before = _snapshot(fake_hub, fake_bucket)
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    with pytest.raises(FileExistsError) as error:
+        sink(df, _uri(fake_bucket, "out"), partition_by="g", mode=mode)
+
+    message = str(error.value)
+    assert "cannot write below 'out/'" in message
+    assert "'out' is a file in the bucket" in message
+    assert _snapshot(fake_hub, fake_bucket) == before
+    assert fake_hub.batch_calls == []
+    assert fake_hub.commits == []
+
+
+def test_append_does_not_list_the_destination(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: True)
+    base = _uri(fake_bucket, "parts")
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    for sink in ALL_SINKS:
+        sink(df, base, partition_by="g", mode="append")
+
+    assert fake_hub.matching(origin=HUB, method="GET", path_contains="/tree") == []
+    assert len(fake_hub.files(fake_bucket)) == 2
+
+
+def test_messages_of_a_write_name_sink_bucket(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # The listing and its retry limits are shared with scan_bucket.
+    headers = {"Retry-After": "99999"}
+    fake_hub.add_fault(HUB, "GET", r"/tree", 429, headers=headers)
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    with pytest.raises(HfHubHTTPError) as error:
+        plhf.sink_bucket(df, f"hf://buckets/{fake_bucket}", partition_by="g")
+
+    assert "allowed for one sink_bucket call" in str(error.value)
+    assert "scan_bucket" not in str(error.value)
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_failed_verification_listing_is_an_unknown_state(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    # huggingface_hub 1.x: the staged backend lists the destination after the
+    # upload. If that listing fails, the files may be registered.
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: False)
+    fake_hub.add_fault(HUB, "GET", r"/tree", status, times=20)
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    with pytest.raises(BucketRegistrationError) as error:
+        # mode="append": no listing before the write.
+        sink_staged(df, _uri(fake_bucket, "parts"), partition_by="g", mode="append")
+
+    expected = PermissionError if status == 403 else HfHubHTTPError
+    assert isinstance(error.value.__cause__, expected)
+    assert "The files may be registered" in str(error.value)
+    assert "state of the destination is unknown" in str(error.value)
+    assert len(fake_hub.files(fake_bucket, "parts/")) == 1
+
+
+@pytest.mark.parametrize(
+    "local_error", [PermissionError("staged file"), OSError(28, "No space left")]
+)
+def test_local_error_of_the_staged_upload_is_not_a_network_error(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    monkeypatch: pytest.MonkeyPatch,
+    local_error: OSError,
+) -> None:
+    from huggingface_hub import HfApi
+
+    def fails(self: HfApi, bucket_id: str, **kwargs: object) -> None:
+        raise local_error
+
+    monkeypatch.setattr(HfApi, "batch_bucket_files", fails)
+
+    with pytest.raises(OSError) as error:
+        sink_staged(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
+
+    assert error.value is local_error
+
+
+def test_timeout_of_the_staged_upload_is_wrapped(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from huggingface_hub import HfApi
+
+    def fails(self: HfApi, bucket_id: str, **kwargs: object) -> None:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(HfApi, "batch_bucket_files", fails)
+
+    with pytest.raises(BucketRegistrationError) as error:
+        sink_staged(pl.DataFrame({"a": [1]}), _uri(fake_bucket, "a.parquet"))
+
+    _assert_unknown_state(error, TimeoutError)
