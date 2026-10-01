@@ -17,8 +17,6 @@ import os
 import tempfile
 import threading
 
-import httpx
-import huggingface_hub
 import polars as pl
 import pytest
 from fakehub import HUB, SIGNATURE, FakeHub, ScriptedUploadError
@@ -29,8 +27,6 @@ import polars_hf as plhf
 
 # pytest.raises reports a missing exception with this type.
 DidNotRaise = pytest.fail.Exception
-
-HUB_MAJOR = int(huggingface_hub.__version__.split(".")[0])
 
 
 def _uri(bucket_id: str, path: str) -> str:
@@ -286,13 +282,9 @@ def test_overwrite_mode_removes_stale_files(
 
 # ---- URI parsing -----------------------------------------------------------
 
+# Bug f is fixed: its test has no marker and stays as a regression test.
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="bug f: any '@' in the URI is treated as a revision, including one "
-    "in the file path",
-)
+
 def test_at_sign_in_file_path_is_not_a_revision() -> None:
     bp = plhf.parse_bucket_uri("hf://buckets/ns/name/exports/user@example.com.parquet")
 
@@ -302,14 +294,10 @@ def test_at_sign_in_file_path_is_not_a_revision() -> None:
 
 # ---- read path -------------------------------------------------------------
 
+# Bugs g to l and p are fixed: their tests have no marker and stay as
+# regression tests. Bug m is open.
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug g: a path with '[' and ']' is globbed, so 'data[1].parquet' is "
-    "read as the character class and matches 'data1.parquet'. Intended fix: "
-    "try the literal path first, then fall back to glob",
-)
+
 def test_literal_bracket_file_name_reads_that_file(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -323,12 +311,6 @@ def test_literal_bracket_file_name_reads_that_file(
     assert_frame_equal(got, bracket)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=httpx.HTTPStatusError,
-    reason="bug h: a path that ends in .parquet is always treated as one file, "
-    "so a directory named 'out.parquet/' is resolved as a file and fails",
-)
 def test_directory_with_parquet_suffix_scans_as_directory(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -341,12 +323,6 @@ def test_directory_with_parquet_suffix_scans_as_directory(
     assert_frame_equal(got.sort("x"), pl.concat(parts))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=httpx.HTTPStatusError,
-    reason="bug i: every glob match is passed to the parquet scan, including "
-    "sub-directories",
-)
 def test_star_glob_does_not_scan_sub_directories(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -359,12 +335,6 @@ def test_star_glob_does_not_scan_sub_directories(
     assert sorted(got["x"].to_list()) == [1, 2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug j: a directory expands to '**/*.parquet' only, which skips "
-    "'.pq' and upper-case '.PARQUET' files",
-)
 def test_directory_scan_includes_pq_and_upper_case_parquet(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -377,12 +347,6 @@ def test_directory_scan_includes_pq_and_upper_case_parquet(
     assert sorted(got["x"].to_list()) == [1, 2, 3]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=httpx.HTTPStatusError,
-    reason="bug k: a missing single file surfaces the raw 404 "
-    "httpx.HTTPStatusError of the resolve request",
-)
 def test_missing_single_file_raises_file_not_found(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -391,12 +355,6 @@ def test_missing_single_file_raises_file_not_found(
         plhf.scan_bucket(_uri(fake_bucket, "nope.parquet")).collect()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=httpx.HTTPStatusError,
-    reason="bug l: the resolve request is not retried, so one 429 or 503 fails "
-    "the whole scan",
-)
 @pytest.mark.parametrize("status", [429, 503])
 def test_transient_resolve_error_is_retried(
     fake_hub: FakeHub, fake_bucket: str, status: int
@@ -434,14 +392,6 @@ def test_presigned_url_not_in_plan(fake_hub: FakeHub, fake_bucket: str) -> None:
     assert SIGNATURE not in lf.serialize(format="json")
 
 
-@pytest.mark.xfail(
-    condition=HUB_MAJOR < 2,
-    strict=True,
-    raises=FileNotFoundError,
-    reason="bug p: with huggingface_hub < 2.0 the recursive listing of 'data' "
-    "also returns the sibling 'data.parquet' (string-prefix match), and the "
-    "directory scan then raises FileNotFoundError",
-)
 def test_directory_scan_with_prefix_sibling(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:

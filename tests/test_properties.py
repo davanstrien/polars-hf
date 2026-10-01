@@ -12,9 +12,9 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
 import polars as pl
 import pytest
+from conftest import hub_httpx, hub_session
 from fakehub import FakeHub
 from hypothesis import HealthCheck, Phase, given, settings
 from hypothesis import strategies as st
@@ -24,26 +24,28 @@ from sinks import sink_default, sink_streamed
 
 import polars_hf as plhf
 from polars_hf._uri import BucketPath, parse_bucket_uri
-from polars_hf.read import _MAX_REDIRECT_HOPS, _signed_url
+from polars_hf.read import _MAX_REDIRECT_HOPS, _Budget, _signed_url
 
 # ---- URI parsing -----------------------------------------------------------
 
-# A strict xfail property fails on its first example; shrinking that failure
-# only costs time.
-_no_shrink = settings(phases=[Phase.explicit, Phase.generate])
-
 _ID_ALPHABET = string.ascii_letters + string.digits + "-_."
-# Characters that end the segment ("/") or that the parser treats as a
-# revision marker today ("@", see bug f) are generated separately.
-_plain_text = st.text(
+# One path segment: any text without "/" (which ends the segment). "@" is a
+# normal character below the bucket name. ".." is a rejected segment and is
+# generated separately.
+_segment = st.text(
     alphabet=st.characters(
-        exclude_characters="/@", exclude_categories=("Cs",), max_codepoint=0x2FFF
+        exclude_characters="/", exclude_categories=("Cs",), max_codepoint=0x2FFF
     ),
     min_size=1,
     max_size=12,
-)
+).filter(lambda segment: segment != "..")
 _id_part = st.text(alphabet=_ID_ALPHABET, min_size=1, max_size=12)
-_path = st.lists(_plain_text, min_size=0, max_size=4).map("/".join)
+# The parser rejects a URI that ends with whitespace, so a valid path does not.
+_path = (
+    st.lists(_segment, min_size=0, max_size=4)
+    .map("/".join)
+    .filter(lambda path: path == path.rstrip())
+)
 
 
 @given(namespace=_id_part, name=_id_part, path=_path)
@@ -56,16 +58,19 @@ def test_valid_uri_round_trips(namespace: str, name: str, path: str) -> None:
 
     assert bp == BucketPath(bucket_id=f"{namespace}/{name}", path=path)
     assert f"hf://{bp.fs_path}" == uri
-    assert bp.is_glob == any(c in path for c in "*?[]")
+    assert bp.is_glob == any(c in path for c in "*?[")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="bug f: an '@' in the file path is rejected as a revision",
-)
-@_no_shrink
-@given(namespace=_id_part, name=_id_part, before=_path, stem=_plain_text)
+@given(namespace=_id_part, name=_id_part, path=_path.filter(lambda path: path != ""))
+def test_trailing_slash_names_the_same_path(
+    namespace: str, name: str, path: str
+) -> None:
+    bp = parse_bucket_uri(f"hf://buckets/{namespace}/{name}/{path}/")
+
+    assert bp == BucketPath(bucket_id=f"{namespace}/{name}", path=f"{path}/")
+
+
+@given(namespace=_id_part, name=_id_part, before=_path, stem=_segment)
 def test_uri_with_at_sign_in_path_round_trips(
     namespace: str, name: str, before: str, stem: str
 ) -> None:
@@ -75,6 +80,71 @@ def test_uri_with_at_sign_in_path_round_trips(
     bp = parse_bucket_uri(f"hf://buckets/{namespace}/{name}/{path}")
 
     assert bp == BucketPath(bucket_id=f"{namespace}/{name}", path=path)
+
+
+@given(
+    namespace=_id_part,
+    name=_id_part,
+    revision=_id_part,
+    path=_path,
+    in_namespace=st.booleans(),
+)
+def test_at_sign_in_the_bucket_id_is_rejected(
+    namespace: str, name: str, revision: str, path: str, in_namespace: bool
+) -> None:
+    if in_namespace:
+        uri = f"hf://buckets/{namespace}@{revision}/{name}/{path}"
+    else:
+        uri = f"hf://buckets/{namespace}/{name}@{revision}/{path}"
+
+    with pytest.raises(ValueError, match="do not support @revision"):
+        parse_bucket_uri(uri)
+
+
+# A path that the parser must reject: (segments, text at the end of the URI).
+_bad_segment = st.sampled_from(["", ".."])
+_trailing_whitespace = st.text(alphabet=" \t\n\r\u00a0\u2003", min_size=1, max_size=3)
+
+
+@given(
+    namespace=_id_part,
+    name=_id_part,
+    before=st.lists(_segment, max_size=2),
+    bad=_bad_segment,
+    after=st.lists(_segment, min_size=1, max_size=2),
+)
+def test_empty_and_dot_dot_segments_are_rejected(
+    namespace: str, name: str, before: list[str], bad: str, after: list[str]
+) -> None:
+    # The bad segment is never the last one: a trailing "" is the allowed
+    # trailing slash. A trailing ".." is covered below.
+    path = "/".join([*before, bad, *after])
+
+    with pytest.raises(ValueError, match="path segment"):
+        parse_bucket_uri(f"hf://buckets/{namespace}/{name}/{path}".rstrip())
+
+
+@given(namespace=_id_part, name=_id_part, before=st.lists(_segment, max_size=2))
+def test_dot_dot_as_last_segment_is_rejected(
+    namespace: str, name: str, before: list[str]
+) -> None:
+    path = "/".join([*before, ".."])
+
+    for suffix in ("", "/"):
+        with pytest.raises(ValueError, match="path segment"):
+            parse_bucket_uri(f"hf://buckets/{namespace}/{name}/{path}{suffix}")
+
+
+@given(namespace=_id_part, name=_id_part, path=_path, whitespace=_trailing_whitespace)
+def test_trailing_whitespace_is_rejected(
+    namespace: str, name: str, path: str, whitespace: str
+) -> None:
+    uri = f"hf://buckets/{namespace}/{name}"
+    if path:
+        uri = f"{uri}/{path}"
+
+    with pytest.raises(ValueError, match="ends with whitespace"):
+        parse_bucket_uri(uri + whitespace)
 
 
 @given(
@@ -89,10 +159,17 @@ def test_arbitrary_text_only_raises_value_error(text: str, prefix: str) -> None:
     # Accepted: the result is self-consistent.
     namespace, _, name = bp.bucket_id.partition("/")
     assert namespace and name and "/" not in name
+    assert "@" not in bp.bucket_id
     expected = (
         f"buckets/{bp.bucket_id}/{bp.path}" if bp.path else f"buckets/{bp.bucket_id}"
     )
     assert bp.fs_path == expected
+    # No empty or ".." segment; at most one trailing slash.
+    segments = bp.path.split("/") if bp.path else []
+    if segments and segments[-1] == "":
+        segments = segments[:-1]
+    assert "" not in segments and ".." not in segments
+    assert (prefix + text) == (prefix + text).rstrip()
 
 
 # ---- redirect resolver -----------------------------------------------------
@@ -110,17 +187,16 @@ _same_origin_hops = st.sampled_from(
         ("same", f"{HUB_ORIGIN}/buckets/ns/renamed/resolve/data.parquet"),
         ("same", "https://HuggingFace.co/buckets/ns/name/resolve3/data.parquet"),
         ("same", "//huggingface.co/protocol-relative/data.parquet"),
+        ("same", "https://huggingface.co:443/default-port/data.parquet"),
     ]
 )
 _other_origin_hops = st.sampled_from(
     [
-        (
-            "other",
-            "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc?X-Amz-Signature=s",
-        ),
-        ("other", "//cas-bridge.xethub.hf.co/xet-bridge-us/abc"),
+        ("other", "https://us.aws.cdn.hf.co/xet-bridge-us/abc?Expires=1&Signature=s"),
+        ("other", "//us.aws.cdn.hf.co/xet-bridge-us/abc"),
         ("other", "http://huggingface.co/buckets/ns/name/resolve/data.parquet"),
         ("other", "https://huggingface.co:8443/buckets/ns/name/resolve/data.parquet"),
+        ("other", "https://huggingface.co:80/buckets/ns/name/resolve/data.parquet"),
         ("other", "https://huggingface.co.evil.example/steal"),
         ("other", "https://evil.example/huggingface.co/steal"),
     ]
@@ -131,28 +207,37 @@ _redirect_codes = st.sampled_from([301, 302, 303, 307, 308])
 
 def _origin(url: str) -> tuple[str, str | None, int | None]:
     parsed = urlparse(url)
-    return (parsed.scheme, parsed.hostname, parsed.port)
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parsed.scheme)
+    return (parsed.scheme, parsed.hostname, port)
 
 
 @given(hops=_hops, code=_redirect_codes)
 def test_signed_url_never_sends_auth_off_origin(
     hops: list[tuple[str, str]], code: int
 ) -> None:
-    seen: list[httpx.Request] = []
+    seen = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request):
         seen.append(request)
         if len(seen) <= len(hops):
-            return httpx.Response(code, headers={"location": hops[len(seen) - 1][1]})
-        return httpx.Response(200)
+            return hub_httpx.Response(
+                code, headers={"location": hops[len(seen) - 1][1]}
+            )
+        return hub_httpx.Response(200, headers={"content-length": "512"})
 
-    transport = httpx.MockTransport(handler)
     result: str | None = None
-    with httpx.Client(transport=transport, follow_redirects=False) as client:
+    error: RuntimeError | None = None
+    # The mock session follows redirects by default, like the real one: a
+    # request to another origin shows up in ``seen``.
+    with hub_session(handler):
         try:
-            result = _signed_url(client, AUTH, RESOLVE)
-        except RuntimeError as error:
-            assert "too many redirects" in str(error)
+            result = _signed_url(
+                RESOLVE, AUTH, uri="hf://buckets/ns/name/x", budget=_Budget("ns/name")
+            )
+        except RuntimeError as raised:
+            error = raised
 
     # Terminates within the hop limit.
     assert 1 <= len(seen) <= _MAX_REDIRECT_HOPS
@@ -171,12 +256,13 @@ def test_signed_url_never_sends_auth_off_origin(
         assert _origin(result) != _origin(RESOLVE)
         assert len(seen) == first_other + 1
     elif len(hops) < _MAX_REDIRECT_HOPS:
-        # Only same-origin hops, then a 200: the last Hub URL is the result.
-        # (httpx.URL lower-cases the host, like the origin comparison.)
-        assert result is not None
-        assert httpx.URL(result) == seen[-1].url
+        # Only same-origin hops, then a 200 from the Hub itself: that URL
+        # needs the token, so it is never returned.
+        assert result is None
+        assert error is not None and "did not redirect" in str(error)
     else:
         assert result is None
+        assert error is not None and "too many redirects" in str(error)
 
 
 # ---- offline round trips ---------------------------------------------------
@@ -235,12 +321,12 @@ def _clear(fake_hub: FakeHub, bucket_id: str, prefix: str) -> None:
         HfApi().batch_bucket_files(bucket_id, delete=stale)
 
 
-# Characters that need care in a URL or a file name. Glob characters, "@",
-# "/" and "\\" are left out: they are a glob, a rejected revision (bug f) or a
-# path the Hub rejects.
+# Characters that need care in a URL or a file name. Glob characters are
+# generated by the property below; "/" and "\\" are left out: they make a path
+# the Hub rejects.
 _risky_fragments = st.sampled_from(
     ["a", "Z", "0", " ", "#", "%20", "%", "+", ";", "&", "=", ":", ",", "'", "~"]
-    + ["!", "$", "(", ")", "é", "ü", "日本", "\u2603", ".", "-", "_"]
+    + ["!", "$", "(", ")", "é", "ü", "日本", "\u2603", ".", "-", "_", "@"]
 )
 _risky_stems = (
     st.lists(_risky_fragments, min_size=1, max_size=8)
@@ -263,9 +349,40 @@ def test_risky_file_names_round_trip(
 
     assert fake_hub.files(fake_bucket) == [path]
     assert_frame_equal(plhf.scan_bucket(uri).collect(), df)
-    # The directory scan finds the same file through the listing.
-    directory_uri = f"hf://buckets/{fake_bucket}/{directory}"
+    # The directory scan finds the same file through the listing. The
+    # trailing slash keeps a directory name that ends with a space valid.
+    directory_uri = f"hf://buckets/{fake_bucket}/{directory}/"
     assert_frame_equal(plhf.scan_bucket(directory_uri).collect(), df)
+
+
+# File names made of glob characters and plain ones: when the file exists, the
+# URI reads that file, not the files its name matches as a pattern.
+_glob_fragments = st.sampled_from(["[", "]", "*", "?", "[1]", "[!a]", "a", "1", "-"])
+_glob_stems = (
+    st.lists(_glob_fragments, min_size=1, max_size=5)
+    .map("".join)
+    .filter(lambda stem: any(c in stem for c in "*?["))
+)
+
+
+@_round_trip_settings
+@given(stem=_glob_stems, others=st.lists(st.sampled_from("a1-]x"), max_size=3))
+def test_file_names_with_glob_characters_read_literally(
+    fake_hub: FakeHub, fake_bucket: str, stem: str, others: list[str]
+) -> None:
+    _clear(fake_hub, fake_bucket, "")
+    df = pl.DataFrame({"name": [stem]})
+    fake_hub.put_parquet(fake_bucket, f"globby/{stem}.parquet", df)
+    # Neighbours that the name can match when it is read as a pattern.
+    for other in others:
+        if other == stem:
+            continue
+        neighbour = pl.DataFrame({"name": [f"neighbour {other}"]})
+        fake_hub.put_parquet(fake_bucket, f"globby/{other}.parquet", neighbour)
+
+    got = plhf.scan_bucket(f"hf://buckets/{fake_bucket}/globby/{stem}.parquet")
+
+    assert_frame_equal(got.collect(), df)
 
 
 _safe_keys = st.text(

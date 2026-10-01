@@ -48,9 +48,11 @@ for _name in ("NO_PROXY", "no_proxy"):
 import time  # noqa: E402
 import uuid  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 from typing import TypeVar  # noqa: E402
 
 import httpx  # noqa: E402
+import huggingface_hub  # noqa: E402
 import polars as pl  # noqa: E402
 import pytest  # noqa: E402
 from fakehub import FakeHub  # noqa: E402
@@ -80,6 +82,15 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "polars-hf"))
 
 T = TypeVar("T")
 
+HUB_MAJOR = int(huggingface_hub.__version__.split(".")[0])
+# The HTTP library behind the huggingface_hub session: httpx2 for
+# huggingface_hub 2.x, httpx for 1.x. Mock transports, requests and responses
+# of that session come from this module.
+if HUB_MAJOR >= 2:
+    import httpx2 as hub_httpx
+else:
+    hub_httpx = httpx
+
 # Transient staging errors only: HTTP 409/502/503/504 and timeouts. Anything
 # else (a missing file, a read error) can be a real read-after-write bug and
 # must fail the test.
@@ -106,6 +117,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 # ---- offline fake ----------------------------------------------------------
 
 FAKE_BUCKET = "fake-user/fake-bucket"
+# Module constants of polars_hf.read that set the backoff without server hint.
+RETRY_BACKOFF_CONSTANTS = ("_RETRY_BASE_WAIT", "_RETRY_MAX_BACKOFF")
+# On staging the CI account shares its rate limits with other projects: a
+# rate-limited test must fail within seconds, not sleep until the reset. A
+# wait is made only if it ends before this deadline.
+STAGING_SCAN_DEADLINE = 30.0
 
 
 @pytest.fixture
@@ -122,6 +139,7 @@ def fake_hub(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeHub]:
         hub.create_bucket(FAKE_BUCKET)
         monkeypatch.setattr(constants, "ENDPOINT", hub.endpoint)
         hub.patch_uploads(monkeypatch)
+        fast_resolve_retries(monkeypatch)
         HfFileSystem.clear_instance_cache()
         yield hub
         HfFileSystem.clear_instance_cache()
@@ -133,17 +151,91 @@ def fake_bucket(fake_hub: FakeHub) -> str:
     return FAKE_BUCKET
 
 
+def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the backoff between two attempts of a Hub request negligible.
+
+    The number of attempts is unchanged, and a wait that the server asks for
+    (rate-limit reset, ``Retry-After``) is not shortened.
+    """
+    from polars_hf import read
+
+    # raising=False: a renamed constant must not break every test that uses
+    # the fake Hub. test_retry.py checks that these names exist.
+    for name in RETRY_BACKOFF_CONSTANTS:
+        monkeypatch.setattr(read, name, 0.001, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline tests: a retry wait of the read path must not sleep for real.
+
+    Waits of the shortened backoff pass; a longer one (a server hint, or a
+    backoff that is not shortened) fails the test at once. Tests of the wait
+    policy replace the clock (``test_retry.py``).
+    """
+    if request.node.get_closest_marker("staging") is not None:
+        return
+    import types
+
+    from polars_hf import read
+
+    def sleep(seconds: float) -> None:
+        if seconds > 0.01:
+            raise AssertionError(f"an offline test would sleep for {seconds} s")
+        time.sleep(seconds)
+
+    clock = types.SimpleNamespace(monotonic=time.monotonic, sleep=sleep)
+    monkeypatch.setattr(read, "time", clock)
+
+
+@contextmanager
+def hub_session(handler: Callable) -> Iterator[None]:
+    """Answer every request of the ``huggingface_hub`` session with ``handler``.
+
+    ``handler`` receives the request (``hub_httpx.Request``) and returns a
+    ``hub_httpx.Response``. The client follows redirects by default, like the
+    real session, so a test sees it when the code under test forgets to turn
+    that off. The default session is restored on exit.
+    """
+    # default_client_factory is private; set_client_factory and close_session
+    # are public. Verified on huggingface_hub 1.12.0, 1.17.0 and 2.0.0.
+    from huggingface_hub.utils._http import default_client_factory
+
+    def factory():
+        transport = hub_httpx.MockTransport(handler)
+        return hub_httpx.Client(transport=transport, follow_redirects=True)
+
+    huggingface_hub.set_client_factory(factory)
+    try:
+        yield
+    finally:
+        huggingface_hub.set_client_factory(default_client_factory)
+
+
 # ---- staging ---------------------------------------------------------------
 
 
-# huggingface_hub 2.x sends its requests with httpx2; 1.x uses httpx.
-_TIMEOUT_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException,)
-try:
-    import httpx2
-except ImportError:
-    pass
-else:
-    _TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException)
+@pytest.fixture(autouse=True)
+def _short_staging_waits(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Staging tests: a short limit on the retry waits of one ``scan_bucket``."""
+    if request.node.get_closest_marker("staging") is None:
+        return
+    from polars_hf import read
+
+    monkeypatch.setattr(read, "_SCAN_DEADLINE", STAGING_SCAN_DEADLINE, raising=False)
+
+
+# Collected with getattr: the exception must not be required of every httpx
+# release that a resolver can pick for the dev group.
+_TIMEOUT_ERRORS: tuple[type[Exception], ...] = ()
+for _module in (httpx, hub_httpx):
+    _timeout_error = getattr(_module, "TimeoutException", None)
+    if _timeout_error is not None and _timeout_error not in _TIMEOUT_ERRORS:
+        _TIMEOUT_ERRORS = (*_TIMEOUT_ERRORS, _timeout_error)
 
 
 def _is_transient_staging_error(error: Exception) -> bool:

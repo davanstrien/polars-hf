@@ -13,10 +13,11 @@ Stock Polars already reads `hf://datasets/...` and `hf://spaces/...` natively. I
 read `hf://buckets/...`. `polars-hf` fills that gap from the outside.
 
 It returns a **native** `pl.scan_parquet` LazyFrame: bucket files are XET-backed, so `scan_bucket`
-follows the authenticated Hub `resolve` redirect to a presigned `cas-bridge.xethub.hf.co` URL and
-hands that to Polars. Polars' own Rust object store then does async, concurrent, **range-read**
-scans — so **projection, predicate, and slice pushdown**, streaming, and multi-file concurrency all
-work natively and only the column chunks actually needed are transferred. (This is the same read
+follows the authenticated Hub `resolve` redirect to a presigned CDN URL
+(`us.aws.cdn.hf.co/xet-bridge-*`) and hands that to Polars. Polars' own Rust object store then does
+async, concurrent, **range-read** scans — so **projection, predicate, and slice pushdown**,
+streaming, and multi-file concurrency all work natively and only the column chunks actually needed
+are transferred. (This is the same read
 mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Python because stock
 Polars can't attach a bearer token to a generic `https://` URL.)
 
@@ -35,7 +36,7 @@ uv add "polars-hf @ git+https://github.com/davanstrien/polars-hf"
 # or: pip install "git+https://github.com/davanstrien/polars-hf"
 ```
 
-Requires `polars>=1.40,<3`, `huggingface_hub>=1.12,<3` and `httpx>=0.27,<1`.
+Requires `polars>=1.40,<3` and `huggingface_hub>=1.12,<3`.
 
 ### On Hugging Face Jobs
 
@@ -65,7 +66,7 @@ See [`examples/run_on_hf_jobs.py`](examples/run_on_hf_jobs.py) for a runnable ex
 import polars as pl
 import polars_hf as plhf
 
-# A single file, a glob, or a whole bucket/directory (expanded to **/*.parquet):
+# A single file, a glob, or a whole bucket/directory (every .parquet / .pq file below it):
 lf = plhf.scan_bucket("hf://buckets/my-namespace/my-bucket/data/*.parquet")
 
 df = (
@@ -111,14 +112,94 @@ plhf.scan_bucket("hf://buckets/ns/name/data.parquet", token="hf_...")
 hf://buckets/{namespace}/{name}/{path}
 ```
 
-- `{path}` may be a single `.parquet` file, a glob (`data/*.parquet`), or a directory / the whole
-  bucket (expanded to `**/*.parquet`).
-- Buckets have **no** revision concept, so `@revision` is rejected (matching the Hub).
+`scan_bucket` reads `{path}` as:
+
+1. **A glob**, if it has a glob character (`*`, `?` or `[`), for example `data/*.parquet` or
+   `data/**/part-*.parquet`: every *file* that matches. `*`, `?` and `[...]` match inside one path
+   segment; `**` must be a whole segment and matches any number of directories. Braces (`{a,b}`)
+   are not expanded. A glob never passes a sub-directory to the scan, and it does not filter by
+   extension: `data/*` also selects `data/notes.txt`, and Polars then fails at `collect()` because
+   that file is not parquet. Use `data/*.parquet`, or `data` for the directory reading. A file
+   whose name is exactly the pattern wins over the matches (`data[1].parquet` reads that file,
+   not `data1.parquet`). A *directory* name with glob characters is not read literally: escape
+   them with a character class — `[[]` for `[`, `[*]` for `*`, `[?]` for `?`. The files of the
+   directory `run[1]/` are `run[[]1]/*.parquet`.
+2. Else **a single file**, if a file with exactly this name exists — whatever its extension.
+3. Else **a directory, or the whole bucket** when `{path}` is empty: every `.parquet` / `.pq` file
+   below it, at any depth; the extension is matched case-insensitively. A trailing `/` forces
+   this reading. A directory named `out.parquet/` is scanned as a directory. Only the files of
+   that directory are listed: a sibling such as `train_full/` costs nothing when you scan `train`.
+
+A glob selects files, so it cannot end with `/`: `data/*/` raises `ValueError`. Use
+`data/*/*.parquet` or `data/**/*.parquet`.
+
+Rules for the URI itself:
+
+- Buckets have **no** revision concept, so `@revision` after the bucket name is rejected (matching
+  the Hub). Below the bucket, `@` is a normal character: `.../exports/user@example.com.parquet`.
+- An empty path segment (`a//b`), a `..` segment and whitespace at the end of the URI raise
+  `ValueError`. These rules are part of the URI parser, so they apply to `sink_bucket` too.
 - `hf://datasets/...` and `hf://spaces/...` are read natively by Polars — use
   `pl.scan_parquet(...)` for those.
 
-Signed URLs are resolved when `scan_bucket` is called and are valid for ~1 hour. Collect within that
-window; for long-lived query plans, call `scan_bucket` again to refresh.
+Signed URLs are resolved when `scan_bucket` is called and are valid for ~1 hour (the URL carries
+its own expiry time). Collect within that window; for long-lived query plans, call `scan_bucket`
+again to refresh.
+
+### Hub requests
+
+`scan_bucket` reads no file data. It makes these requests to the Hub:
+
+| `{path}` | Requests |
+| --- | --- |
+| one file, any extension | 1 `resolve` (HEAD) |
+| a directory of N parquet files (`data`) | 1 `resolve` (answered "not found") + 1 listing per page of results + N `resolve` |
+| the same with a trailing slash (`data/`), or the whole bucket | 1 listing per page + N `resolve` |
+| a glob that selects N files | 1 listing per page + N `resolve` |
+| a path that does not exist | 1 `resolve` + 1 listing |
+
+A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. Other
+globs list the subtree below the text before their first glob character. An invalid glob raises
+before any request.
+
+`resolve` requests count in the Hub's "resolvers" rate limit, so a scan of N files uses N of them.
+
+**Retries.** A `408`, `429` or `5xx` answer to a `resolve` request or to a listing page is retried
+up to 5 times; only the failed request is sent again. `scan_bucket` sends the listing requests
+itself (it does not call `HfApi.list_bucket_tree`), so the same limits apply to every page and on
+every supported `huggingface_hub` version. The wait before a retry is the
+one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. When the Hub
+asks for more than 5 s, one warning per `scan_bucket` call announces the wait, so a paused scan is
+not silent. If your warning filter turns warnings into errors, the message is logged (logger
+`polars_hf.read`) instead, and the scan continues.
+
+One `scan_bucket` call waits only while the wait ends within 10 minutes of its start. A rate-limit
+reset in 300 s is waited for; a wait that would pass the 10 minutes raises `HfHubHTTPError` at
+once. The message says how long the Hub asked to wait and how much time was left; for a rate
+limit it also names the bucket, the quota and how many files were already resolved. That limit
+bounds the waits, not the requests: a request already in flight can still run to its 30 s timeout
+after it. A `Retry-After` that is an HTTP date (or not a finite number) is ignored and the backoff
+is used. Timeouts and connection errors are not retried.
+
+All requests use the shared HTTP session of `huggingface_hub`, so `HF_HUB_OFFLINE=1` and a custom
+client factory (`huggingface_hub.set_client_factory`) apply.
+
+### Errors
+
+| Situation | Exception |
+| --- | --- |
+| The bucket does not exist, or nothing matches the URI | `FileNotFoundError` (the URI is in the message) |
+| The Hub answers `401` / `403` | `PermissionError` naming the bucket; the `HfHubHTTPError` is its `__cause__` |
+| A matched file is empty (0 bytes) | `ValueError` naming the file |
+| A glob ends with `/`, or uses `**` inside a segment (`data/**.parquet`) | `ValueError` |
+| The Hub serves a file itself instead of redirecting to a presigned URL (a file that is not Xet-backed) | `RuntimeError`; Polars cannot read a URL that needs the token |
+| Any other HTTP error, or a `408` / `429` / `5xx` that the retries did not clear | `huggingface_hub.errors.HfHubHTTPError` |
+| A listing answer is not what the Hub API documents (not a JSON list, a next link that leaves the Hub or repeats a page) | `RuntimeError` |
+| A listing with many pages does not finish within 10 minutes | `TimeoutError` |
+| A timeout or a connection error | the exception of the HTTP library (`httpx` / `httpx2`), not retried |
+
+A private bucket that the token cannot see is reported by the Hub as "not found", so it raises
+`FileNotFoundError`, not `PermissionError`.
 
 ## Performance
 
@@ -141,7 +222,9 @@ work as-is — e.g. heterogeneous schemas across globbed files:
 plhf.scan_bucket(uri, missing_columns="insert", extra_columns="ignore")
 ```
 
-or `retries=5` for flaky connections. Options that derive meaning from the file *path*
+or `storage_options={"max_retries": 5}` for flaky connections (this replaces the deprecated
+`retries=` option of Polars; it applies to the data requests Polars makes, not to the Hub requests
+above). Options that derive meaning from the file *path*
 (`hive_partitioning=`, `include_file_paths=`) see the presigned CDN URLs, not the bucket paths,
 so they are not useful here.
 
