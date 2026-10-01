@@ -8,12 +8,10 @@ from polars_hf._uri import BucketPath, parse_bucket_uri
 
 
 def test_single_file() -> None:
-    bp = parse_bucket_uri("hf://buckets/davanstrien/polars-hf-wheels/a/b/file.parquet")
-    assert bp == BucketPath(
-        bucket_id="davanstrien/polars-hf-wheels", path="a/b/file.parquet"
-    )
+    bp = parse_bucket_uri("hf://buckets/some-user/some-bucket/a/b/file.parquet")
+    assert bp == BucketPath(bucket_id="some-user/some-bucket", path="a/b/file.parquet")
     assert not bp.is_glob
-    assert bp.fs_path == "buckets/davanstrien/polars-hf-wheels/a/b/file.parquet"
+    assert bp.fs_path == "buckets/some-user/some-bucket/a/b/file.parquet"
 
 
 def test_glob_path() -> None:
