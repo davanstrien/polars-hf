@@ -48,6 +48,8 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import build_hf_headers, hf_raise_for_status, http_backoff
 
+from polars_hf.read import _Budget, _list_tree
+
 if TYPE_CHECKING:
     import polars as pl
 
@@ -142,15 +144,17 @@ _API_SHAPE_ERRORS = (TypeError, AttributeError)
 
 def _network_errors() -> tuple[type[BaseException], ...]:
     """Timeouts and connection errors of the HTTP clients huggingface_hub uses."""
-    import httpx
+    import importlib
 
-    errors: list[type[BaseException]] = [OSError, httpx.HTTPError]
-    try:
-        import httpx2  # huggingface_hub 2.x
-    except ImportError:
-        pass
-    else:
-        errors.append(httpx2.HTTPError)
+    errors: list[type[BaseException]] = [OSError]
+    # huggingface_hub 1.x sends its requests with httpx, 2.x with httpx2.
+    # Neither is a dependency of this package.
+    for name in ("httpx", "httpx2"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        errors.append(module.HTTPError)
     return tuple(errors)
 
 
@@ -191,7 +195,10 @@ def validate_destination(path: str) -> None:
     """Raise ``ValueError`` for a bucket path that the Hub refuses.
 
     The Hub rejects a backslash, an empty segment (a leading or trailing
-    slash, ``//``) and the segments ``.`` and ``..``. Control characters and
+    slash, ``//``) and the segments ``.`` and ``..``. ``parse_bucket_uri``
+    already refuses an empty or ``..`` segment in the URI; the checks are
+    repeated here because a partition column name can produce them, and this
+    function sees every path that Polars asks for. Control characters and
     segments of more than 255 bytes are refused here as well: the staged backend
     cannot stage such a name on a local file system, and both backends must
     accept the same destinations. For a partitioned write the offending
@@ -387,6 +394,32 @@ class SinkBackend(ABC):
         The list is empty when the query produced no file.
         """
 
+    def list_files(self, prefix: str) -> dict[str, int | None]:
+        """``{path: size}`` of the files whose path starts with ``prefix``.
+
+        The Hub matches the prefix as a plain string, so a directory is listed
+        with its trailing slash (``"out/"``; ``"out"`` also lists ``out2/x``).
+        The listing is the one of the read path: sent through the
+        ``huggingface_hub`` session, page by page, with the same bounded
+        retries, and with ``PermissionError`` / ``FileNotFoundError`` for a
+        bucket that cannot be read or does not exist.
+        """
+        uri = f"hf://buckets/{self.bucket_id}/{prefix}"
+        entries = _list_tree(
+            self.api.endpoint,
+            self.headers,
+            self.bucket_id,
+            prefix,
+            recursive=True,
+            uri=uri,
+            budget=_Budget(self.bucket_id),
+        )
+        files = {}
+        for entry in entries:
+            if entry.type == "file" and entry.path.startswith(prefix):
+                files[entry.path] = entry.size
+        return files
+
     def delete(self, paths: list[str]) -> None:
         """Delete objects from the bucket (a missing path is not an error)."""
         operations = []
@@ -492,13 +525,7 @@ class StagedBackend(SinkBackend):
         huggingface_hub 1.x returns normally when the bucket rejects single
         files, so the destination is listed once after the upload.
         """
-        listed = {}
-        items = self.api.list_bucket_tree(
-            self.bucket_id, prefix=listing_prefix or None, recursive=True
-        )
-        for item in items:
-            if getattr(item, "type", None) == "file":
-                listed[item.path] = item.size
+        listed = self.list_files(listing_prefix)
         failures = []
         for path, size in sizes.items():
             if path not in listed:
@@ -548,7 +575,9 @@ class StagedBackend(SinkBackend):
                 local = os.path.join(directory, *relative.split("/"))
                 local_additions.append((local, path))
             if local_additions:
-                self._add(local_additions, listing_prefix=prefix)
+                # The directory, not the string prefix ("out/", not "out").
+                directory_prefix = f"{prefix}/" if prefix else ""
+                self._add(local_additions, listing_prefix=directory_prefix)
         return [path for _, path in local_additions]
 
 

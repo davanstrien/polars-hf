@@ -6,8 +6,10 @@ Two local HTTP servers run on different ports, so they are different origins:
   ``/buckets/{id}/resolve/{path}`` redirect, and answers 401 unless the
   ``Authorization`` header carries an accepted token, like the real Hub does
   for private buckets;
-* the **cdn** server stands in for ``cas-bridge.xethub.hf.co``: it serves the
-  "presigned" URLs with HTTP range support and no authentication.
+* the **cdn** server stands in for the host of the presigned URLs
+  (``us.aws.cdn.hf.co`` on huggingface.co, ``cas-bridge.xethub-ci.hf.co`` on
+  the Hub CI instance): it serves the "presigned" URLs with HTTP range support
+  and no authentication.
 
 Every request is recorded (:attr:`FakeHub.requests`) and faults can be scripted
 per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
@@ -57,7 +59,9 @@ The listing semantics were copied from the Hub CI instance
   directory whose path starts with the prefix;
 * an unknown prefix returns ``[]`` with status 200;
 * ``HEAD /buckets/{id}/resolve/{path}`` answers 302 for a file and 404
-  ``EntryNotFound`` for a directory or a missing path;
+  ``EntryNotFound`` for a directory or a missing path; an empty file is
+  redirected too, with ``X-Linked-Size: 0`` (huggingface.co answers it with a
+  direct 200 instead: script that with :meth:`FakeHub.add_fault`);
 * ``HEAD /buckets/{id}/tree/{path}`` (the directory web page) answers 401 to a
   token;
 * a batch on a missing bucket answers 404 ``RepoNotFound``;
@@ -272,6 +276,9 @@ class FakeHub:
     before_batch
         Optional callable run at the start of every batch, before the files
         are read. Tests use it to measure local staging.
+    tree_page_size
+        If set, a listing returns at most this many entries per request and
+        links to the next page. ``None`` (the default) returns everything.
     """
 
     def __init__(self, token: str) -> None:
@@ -287,6 +294,7 @@ class FakeHub:
         self.fail_stream_finish_on_call: int | None = None
         self.before_batch = None
         self._counters: dict[str, int] = {}
+        self.tree_page_size: int | None = None
         self._buckets: dict[str, dict[str, bytes]] = {}
         # sha256 -> content, for every object ever stored (the "CAS").
         self._blobs: dict[str, bytes] = {}
@@ -664,6 +672,26 @@ class FakeHub:
                 entries[child_path] = self._file_entry(path, files[path])
         return list(entries.values())
 
+    def _tree_page(self, entries: list, path: str, query: str) -> _Reply:
+        """One page of a listing, with the ``Link`` header of the real Hub.
+
+        The Hub paginates with ``Link: <url>; rel="next"`` (the GitHub
+        format that ``huggingface_hub.utils.paginate`` follows) and a
+        ``cursor`` query parameter. Here the cursor is the index of the first
+        entry of the page.
+        """
+        if self.tree_page_size is None:
+            return _json_reply(entries)
+        params = parse_qs(query)
+        start = int(params.get("cursor", ["0"])[0])
+        end = start + self.tree_page_size
+        reply = _json_reply(entries[start:end])
+        if end < len(entries):
+            recursive = params.get("recursive", ["false"])[0]
+            next_url = f"{self.endpoint}{path}?recursive={recursive}&cursor={end}"
+            reply.headers["Link"] = f'<{next_url}>; rel="next"'
+        return reply
+
     def _hub_reply(self, method: str, path: str, query: str, body: bytes) -> _Reply:
         parts = path.strip("/").split("/")
 
@@ -694,7 +722,8 @@ class FakeHub:
                 prefix = unquote("/".join(parts[5:]))
                 flag = parse_qs(query).get("recursive", ["false"])[0]
                 recursive = flag.lower() in ("true", "1")
-                return _json_reply(self._list_tree(files, prefix, recursive))
+                entries = self._list_tree(files, prefix, recursive)
+                return self._tree_page(entries, path, query)
 
         if parts[:1] == ["buckets"] and len(parts) >= 5 and parts[3] == "resolve":
             bucket_id = f"{parts[1]}/{parts[2]}"

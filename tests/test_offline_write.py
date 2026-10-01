@@ -1077,11 +1077,13 @@ def test_overwrite_of_the_bucket_root_names_the_reason(fake_bucket: str) -> None
 @pytest.mark.parametrize(
     ("path", "message"),
     [
-        ("/", "slashes only"),
-        ("//", "slashes only"),
+        # Refused by parse_bucket_uri, for reads and writes alike.
+        ("/", "an empty path segment"),
+        ("//", "an empty path segment"),
         ("a//b", "an empty path segment"),
         ("/a", "an empty path segment"),
-        ("a/../b", "the path segment '..'"),
+        ("a/../b", "a '..' path segment"),
+        # Refused by the write path.
         ("./a", "the path segment '.'"),
         ("a\\b", "a backslash"),
     ],
@@ -1104,7 +1106,9 @@ def test_invalid_prefix_is_rejected_before_any_request(
 def test_invalid_file_path_is_rejected_before_any_request(
     fake_hub: FakeHub, fake_bucket: str, sink, path: str
 ) -> None:
-    with pytest.raises(ValueError, match="invalid bucket path"):
+    # '//' and '..' are refused by parse_bucket_uri, the backslash by the
+    # write path.
+    with pytest.raises(ValueError, match="path segment"):
         sink(pl.DataFrame({"a": [1]}), f"hf://buckets/{fake_bucket}/{path}")
 
     assert fake_hub.requests == []
@@ -1231,13 +1235,20 @@ def test_registration_reply_that_is_not_json_is_an_error(
 
 @pytest.mark.parametrize("status", [429, 503])
 def test_transient_registration_error_is_retried(
-    fake_hub: FakeHub, fake_bucket: str, status: int
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
+    import huggingface_hub.utils._http
+
     df = pl.DataFrame({"a": [1, 2, 3]})
     uri = _uri(fake_bucket, "a.parquet")
     fake_hub.add_fault(HUB, "POST", r"/batch$", status, headers={"Retry-After": "0"})
+    # http_backoff waits between two attempts: record the wait, do not sleep.
+    waits: list[float] = []
+    monkeypatch.setattr(huggingface_hub.utils._http.time, "sleep", waits.append)
 
     sink_streamed(df, uri)
+
+    assert len(waits) == 1
 
     posts = fake_hub.matching(origin=HUB, method="POST", path_contains="/batch")
     assert [request.status for request in posts] == [status, 200]

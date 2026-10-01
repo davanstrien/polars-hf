@@ -16,7 +16,6 @@ requests. A failure between two requests leaves the earlier ones applied.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from polars_hf import _sinks
@@ -88,25 +87,12 @@ def _make_run_sink(lf: pl.LazyFrame, fmt: str, sink_kwargs: dict[str, Any]) -> A
     return run_sink
 
 
-def _files_with_prefix(backend: _sinks.SinkBackend, prefix: str) -> Iterator[str]:
-    """Paths of the files whose path starts with the string ``prefix``."""
-    items = backend.api.list_bucket_tree(
-        backend.bucket_id, prefix=prefix or None, recursive=True
-    )
-    for item in items:
-        if getattr(item, "type", None) == "file":
-            yield item.path
-
-
 def _files_below(backend: _sinks.SinkBackend, prefix: str) -> list[str]:
     """Paths of the files in the directory ``prefix`` (``""`` is the bucket)."""
-    paths = []
-    for path in _files_with_prefix(backend, prefix):
-        # The listing matches a string prefix: drop siblings such as "out2/x"
-        # for the prefix "out".
-        if prefix == "" or path.startswith(prefix + "/"):
-            paths.append(path)
-    return paths
+    # With the trailing slash the listing holds the files of this directory
+    # only, not siblings such as "out2/x" for the prefix "out".
+    directory_prefix = f"{prefix}/" if prefix else ""
+    return list(backend.list_files(directory_prefix))
 
 
 _SINGLE_FILE_MODES = "Pass mode='overwrite' to replace it."
@@ -117,17 +103,19 @@ _PREFIX_MODES = (
 
 
 def _raise_if_file_exists(backend: _sinks.SinkBackend, path: str, uri: str) -> None:
-    for existing in _files_with_prefix(backend, path):
-        if existing == path:
-            raise FileExistsError(
-                f"the destination {uri!r} already exists. {_SINGLE_FILE_MODES}"
-            )
+    # The listing matches a string prefix: only the exact path counts.
+    if path in backend.list_files(path):
+        raise FileExistsError(
+            f"the destination {uri!r} already exists. {_SINGLE_FILE_MODES}"
+        )
 
 
 def _raise_if_prefix_exists(backend: _sinks.SinkBackend, prefix: str, uri: str) -> None:
     """Raise if a file is at ``prefix`` itself or anywhere below it."""
+    # One listing by string prefix finds a file at the prefix itself and the
+    # files below it; siblings such as "out2/x" are skipped.
     below = []
-    for path in _files_with_prefix(backend, prefix):
+    for path in backend.list_files(prefix):
         if prefix != "" and path == prefix:
             raise FileExistsError(
                 f"the destination {uri!r} already exists as a file. {_PREFIX_MODES}"
@@ -143,10 +131,7 @@ def _raise_if_prefix_exists(backend: _sinks.SinkBackend, prefix: str, uri: str) 
 
 def _partition_prefix(path: str, uri: str, mode: str) -> str:
     """The base prefix of a partitioned write (``""`` is the bucket root)."""
-    if path != "" and path.strip("/") == "":
-        raise ValueError(
-            f"invalid destination {uri!r}: the path consists of slashes only"
-        )
+    # parse_bucket_uri allows one trailing slash and refuses '//' and '..'.
     prefix = path[:-1] if path.endswith("/") else path
     if prefix == "":
         if mode == "overwrite":
