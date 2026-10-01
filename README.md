@@ -119,15 +119,21 @@ hf://buckets/{namespace}/{name}/{path}
    it, at any depth; the extension is matched case-insensitively. A trailing `/` forces this
    reading. A directory named `out.parquet/` is scanned as a directory.
 3. **A glob** (`data/*.parquet`, `data/**/part-*.parquet`): every *file* that matches. `*`, `?` and
-   `[...]` match inside one path segment; `**` matches any number of directories. A glob never
-   passes a sub-directory to the scan, and it does not filter by extension.
+   `[...]` match inside one path segment; `**` must be a whole segment and matches any number of
+   directories. Braces (`{a,b}`) are not expanded. A glob never passes a sub-directory to the
+   scan, and it does not filter by extension: `data/*` also selects `data/notes.txt`, and Polars
+   then fails at `collect()` because that file is not parquet. Use `data/*.parquet`, or `data` for
+   the directory reading.
+
+A glob selects files, so it cannot end with `/`: `data/*/` raises `ValueError`. Use
+`data/*/*.parquet` or `data/**/*.parquet`.
 
 Rules for the URI itself:
 
 - Buckets have **no** revision concept, so `@revision` after the bucket name is rejected (matching
   the Hub). Below the bucket, `@` is a normal character: `.../exports/user@example.com.parquet`.
 - An empty path segment (`a//b`), a `..` segment and whitespace at the end of the URI raise
-  `ValueError`.
+  `ValueError`. These rules are part of the URI parser, so they apply to `sink_bucket` too.
 - `hf://datasets/...` and `hf://spaces/...` are read natively by Polars — use
   `pl.scan_parquet(...)` for those.
 
@@ -145,9 +151,22 @@ again to refresh.
 | a directory or a glob that selects N files | 1 listing per page of results + N `resolve` |
 | one file with another extension | 1 listing + 1 `resolve` |
 
+A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. A
+directory scan and a glob with `**` list the whole subtree.
+
 `resolve` requests count in the Hub's "resolvers" rate limit, so a scan of N files uses N of them.
-A `429` or `5xx` answer is retried up to 5 times with the backoff of `huggingface_hub`, which waits
-for the rate-limit reset that the Hub announces. Timeouts and connection errors are not retried.
+
+**Retries.** A `408`, `429` or `5xx` answer to a `resolve` request is retried up to 5 times. The
+same applies to the listing, which is then started again from its first page (inside one listing,
+`huggingface_hub` itself retries the requests for the later pages). The wait before a retry is the
+one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. `scan_bucket`
+does not sleep longer than that: if one wait would be longer than 60 s, or would end more than
+10 minutes after the call started, it raises `HfHubHTTPError`. For a rate limit the message names
+the bucket, the quota and how many files were already resolved. Timeouts and connection errors
+are not retried.
+
+All requests use the shared HTTP session of `huggingface_hub`, so `HF_HUB_OFFLINE=1` and a custom
+client factory (`huggingface_hub.set_client_factory`) apply.
 
 ### Errors
 
@@ -156,7 +175,10 @@ for the rate-limit reset that the Hub announces. Timeouts and connection errors 
 | The bucket does not exist, or nothing matches the URI | `FileNotFoundError` (the URI is in the message) |
 | The Hub answers `401` / `403` | `PermissionError` naming the bucket; the `HfHubHTTPError` is its `__cause__` |
 | A matched file is empty (0 bytes) | `ValueError` naming the file |
-| Any other HTTP error, or a `429` / `5xx` that persists | `huggingface_hub.errors.HfHubHTTPError` |
+| A glob ends with `/`, or uses `**` inside a segment (`data/**.parquet`) | `ValueError` |
+| The Hub serves a file itself instead of redirecting to a presigned URL (a file that is not Xet-backed) | `RuntimeError`; Polars cannot read a URL that needs the token |
+| Any other HTTP error, or a `408` / `429` / `5xx` that the retries did not clear | `huggingface_hub.errors.HfHubHTTPError` |
+| A timeout or a connection error | the exception of the HTTP library (`httpx` / `httpx2`), not retried |
 
 A private bucket that the token cannot see is reported by the Hub as "not found", so it raises
 `FileNotFoundError`, not `PermissionError`.

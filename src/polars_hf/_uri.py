@@ -1,11 +1,10 @@
 """Parsing for ``hf://buckets/...`` URIs.
 
-Mirrors the bucket semantics implemented in the polars fork
-(``crates/polars-io/src/path_utils/hugging_face.rs``):
-
 * ``hf://buckets/{namespace}/{name}/{path from root}``
 * Buckets have **no** revision concept, so ``@revision`` after the bucket name
   is rejected. An ``@`` in the path below the bucket is a normal character.
+* An empty path segment, a ``..`` segment and whitespace at the end of the URI
+  are rejected; one trailing ``/`` names a directory.
 
 Datasets and Spaces are intentionally *not* handled here: stock polars already
 reads ``hf://datasets/...`` / ``hf://spaces/...`` natively via ``pl.scan_parquet``.
@@ -43,7 +42,10 @@ class BucketPath:
 
     @property
     def fs_path(self) -> str:
-        """The path as understood by ``HfFileSystem`` (``buckets/...``)."""
+        """The URI without its ``hf://`` scheme (``buckets/{bucket_id}/{path}``).
+
+        This is the form ``HfFileSystem`` takes; the write path uses it.
+        """
         root = f"buckets/{self.bucket_id}"
         return f"{root}/{self.path}" if self.path else root
 
@@ -111,8 +113,8 @@ def parse_bucket_uri(uri: str) -> BucketPath:
             "(expected 'hf://buckets/{namespace}/{name}/{path}')"
         )
 
-    # Buckets have no revision concept. Match the fork's explicit rejection,
-    # but only where a revision would be: after the bucket name. Below the
+    # Buckets have no revision concept: reject one explicitly, but only where
+    # a revision would be, after the bucket name. Below the
     # bucket, '@' is a normal character of a file or directory name.
     if "@" in parts[0] or "@" in parts[1]:
         raise ValueError(f"Hugging Face bucket URIs do not support @revision: {uri!r}")
