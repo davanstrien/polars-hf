@@ -24,13 +24,15 @@ not bounded and differ between huggingface_hub versions.
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import polars as pl
 from huggingface_hub import constants
@@ -44,6 +46,8 @@ from huggingface_hub.utils import (
 
 from polars_hf._glob import glob_to_regex, has_glob, literal_prefix
 from polars_hf._uri import BucketPath, parse_bucket_uri
+
+logger = logging.getLogger(__name__)
 
 # The signed URL carries its own expiry (an ``Expires`` query parameter, about
 # one hour after the resolve request), so URLs are resolved at scan time.
@@ -115,11 +119,29 @@ class _Budget:
         self.deadline = time.monotonic() + _SCAN_DEADLINE
         self.files_total = 0
         self._files_resolved = 0
+        self._wait_announced = False
         self._lock = threading.Lock()
 
     def file_resolved(self) -> None:
         with self._lock:
             self._files_resolved += 1
+
+    def announce_wait(self, message: str) -> None:
+        """Warn about a long wait, once per ``scan_bucket`` call.
+
+        All resolve threads usually wait for the same rate-limit reset: one
+        warning is enough. Under a warnings-as-errors filter ``warnings.warn``
+        raises; the message is then logged instead, so that the filter cannot
+        abort the scan from inside a retry.
+        """
+        with self._lock:
+            if self._wait_announced:
+                return
+            self._wait_announced = True
+        try:
+            warnings.warn(message, stacklevel=4)
+        except Warning:
+            logger.warning(message)
 
     def progress(self) -> str:
         """``"; 3 of 20 files were resolved"``, or ``""`` before the resolves."""
@@ -199,11 +221,10 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
         raise _retry_error(response, budget, what, reason)
     if hint is not None and wait > _WARN_WAIT:
         cause = "rate limit" if response.status_code == 429 else "busy server"
-        warnings.warn(
+        budget.announce_wait(
             f"scan_bucket: Hub {cause} (HTTP {response.status_code}) on a {what} "
             f"request for the bucket {budget.bucket_id!r}; waiting {wait:.0f} s "
-            "before the next attempt",
-            stacklevel=2,
+            "before the next attempt"
         )
     time.sleep(wait)
 
@@ -231,7 +252,6 @@ def _request(
     headers: dict[str, str],
     budget: _Budget,
     what: str,
-    params: dict[str, str] | None = None,
 ):
     """One request with auth that does not follow redirects.
 
@@ -246,7 +266,6 @@ def _request(
         response = get_session().request(
             method,
             url,
-            params=params,
             headers=headers,
             follow_redirects=False,
             timeout=_REQUEST_TIMEOUT,
@@ -270,6 +289,68 @@ class _Entry:
     xet_hash: str | None = None
 
 
+# One value of a Link header: <target> followed by its ;name=value parameters.
+# A quoted parameter value can hold commas and semicolons.
+_LINK_VALUE = re.compile(r'<([^>]*)>((?:\s*;\s*[^=;,\s]+\s*=\s*(?:"[^"]*"|[^;,]*))*)')
+_LINK_REL = re.compile(r';\s*rel\s*=\s*(?:"([^"]*)"|([^;,\s]*))', re.IGNORECASE)
+
+
+def _next_page_url(response, page_url: str) -> str | None:
+    """The target of the ``rel="next"`` link of a listing page, if any.
+
+    The ``Link`` header is parsed here: ``rel`` is matched case-insensitively
+    and can hold several relation types (``rel="prev next"``). A relative
+    target is resolved against the URL of the page.
+    """
+    header = response.headers.get("link")
+    if header is None:
+        return None
+    for value in _LINK_VALUE.finditer(header):
+        rel = _LINK_REL.search(value.group(2))
+        if rel is None:
+            continue
+        relations = (rel.group(1) or rel.group(2) or "").lower().split()
+        if "next" in relations:
+            return urljoin(page_url, value.group(1).strip())
+    return None
+
+
+def _entries_of_page(response, page_url: str) -> list[_Entry]:
+    """The entries of one listing page; ``RuntimeError`` for another shape."""
+    problem = None
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+        problem = "the body is not JSON"
+    if problem is None and not isinstance(body, list):
+        problem = "the body is not a JSON list"
+
+    entries = []
+    if problem is None:
+        for item in body:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("type"), str)
+                or not isinstance(item.get("path"), str)
+            ):
+                problem = "an entry has no 'type' or no 'path'"
+                break
+            entries.append(
+                _Entry(
+                    type=item["type"],
+                    path=item["path"],
+                    size=item.get("size"),
+                    xet_hash=item.get("xetHash"),
+                )
+            )
+    if problem is not None:
+        raise RuntimeError(
+            f"unexpected answer of the Hub listing endpoint {page_url!r}: {problem}"
+        )
+    return entries
+
+
 def _list_tree(
     endpoint: str,
     headers: dict[str, str],
@@ -287,18 +368,33 @@ def _list_tree(
     one percent-encoded segment. The answer is a JSON list; a
     ``Link: <url>; rel="next"`` header names the next page. Every page is
     requested with the retry limits of ``budget``.
+
+    Raises ``RuntimeError`` when the next link leaves the Hub origin (the
+    token is sent with every page), repeats a page, or when a page has an
+    unexpected shape; ``TimeoutError`` when the deadline of ``budget`` passes
+    between two pages.
     """
     url = f"{endpoint}/api/buckets/{bucket_id}/tree"
     if prefix:
         url = f"{url}/{quote(prefix, safe='')}"
-    params: dict[str, str] | None = {"recursive": "true" if recursive else "false"}
+    query = {"recursive": "true" if recursive else "false"}
     if _LIST_PAGE_LIMIT is not None:
-        params["limit"] = str(_LIST_PAGE_LIMIT)
+        query["limit"] = str(_LIST_PAGE_LIMIT)
+    # The complete URL of every page is kept, to detect a link that repeats.
+    url = f"{url}?{urlencode(query)}"
     hub_origin = _origin(endpoint)
 
-    entries = []
+    entries: list[_Entry] = []
+    requested: set[str] = set()
     while url is not None:
-        response = _request("GET", url, headers, budget, "listing", params)
+        if time.monotonic() > budget.deadline:
+            raise TimeoutError(
+                f"the listing of {uri!r} did not finish within the "
+                f"{_SCAN_DEADLINE:.0f} s allowed for one scan_bucket call "
+                f"({len(entries)} entries were listed)"
+            )
+        requested.add(url)
+        response = _request("GET", url, headers, budget, "listing")
         try:
             hf_raise_for_status(response)
         except HfHubHTTPError as error:
@@ -313,27 +409,32 @@ def _list_tree(
             raise
         if response.status_code != 200:
             raise RuntimeError(
-                f"unexpected answer of the Hub to the listing of {uri!r} "
+                f"unexpected answer of the Hub listing endpoint {url!r} "
                 f"(HTTP {response.status_code})"
             )
-        for item in response.json():
-            entries.append(
-                _Entry(
-                    type=item["type"],
-                    path=item["path"],
-                    size=item.get("size"),
-                    xet_hash=item.get("xetHash"),
-                )
-            )
+        entries.extend(_entries_of_page(response, url))
 
         # The link of the next page already holds the query parameters.
-        url = response.links.get("next", {}).get("url")
-        params = None
-        if url is not None and _origin(url) != hub_origin:
-            # The token is sent with every page: never to another origin.
-            raise RuntimeError(
-                f"the Hub listing of {uri!r} links to another origin: {url!r}"
-            )
+        next_url = _next_page_url(response, url)
+        if next_url is not None:
+            try:
+                same_origin = _origin(next_url) == hub_origin
+            except ValueError:
+                # urlparse refuses the port of the link.
+                raise RuntimeError(
+                    f"the Hub listing of {uri!r} has an invalid next link: {next_url!r}"
+                ) from None
+            if not same_origin:
+                # The token is sent with every page: never to another origin.
+                raise RuntimeError(
+                    f"the Hub listing of {uri!r} links to another origin: {next_url!r}"
+                )
+            if next_url in requested:
+                raise RuntimeError(
+                    f"the Hub listing of {uri!r} links back to a page that was "
+                    f"already read: {next_url!r}"
+                )
+        url = next_url
     return entries
 
 
@@ -453,7 +554,13 @@ def _list_files(
     else:
         selected = _directory_files(endpoint, headers, bp, path, uri, budget)
     if not selected:
-        raise FileNotFoundError(f"no parquet files matched: {uri!r}")
+        hint = ""
+        if bp.is_glob:
+            hint = (
+                " (the path is read as a glob; to match a literal '[', '*' or "
+                "'?' of a file or directory name, write '[[]', '[*]' or '[?]')"
+            )
+        raise FileNotFoundError(f"no parquet files matched: {uri!r}{hint}")
 
     for file in selected:
         if file.size == 0:
@@ -506,7 +613,14 @@ def _signed_url(
             # urljoin resolves relative *and* protocol-relative (//host/..)
             # locations; compare origins rather than sniffing the scheme prefix.
             location = urljoin(url, response.headers["location"])
-            if _origin(location) != hub_origin:
+            try:
+                same_origin = _origin(location) == hub_origin
+            except ValueError:
+                # urlparse refuses the port of the location.
+                raise RuntimeError(
+                    f"the Hub redirected {uri!r} to an invalid URL: {location!r}"
+                ) from None
+            if not same_origin:
                 if response.headers.get("x-linked-size") == "0":
                     raise _empty_file_error(uri)
                 return location
@@ -616,7 +730,10 @@ def scan_bucket(
         the bucket. The original ``HfHubHTTPError`` is the ``__cause__``.
     RuntimeError
         The Hub serves a file itself instead of redirecting to a presigned
-        URL (a file that is not Xet-backed).
+        URL (a file that is not Xet-backed), or a listing answer is not what
+        the Hub API documents.
+    TimeoutError
+        A listing with many pages did not finish within 10 minutes.
     huggingface_hub.errors.HfHubHTTPError
         Any other HTTP error of the Hub, and a rate-limit (429), timeout
         (408) or server (5xx) answer that the retries did not clear. The
@@ -646,7 +763,8 @@ def scan_bucket(
     A 408, 429 or 5xx answer to any of these requests (every listing page,
     every ``resolve``) is retried up to 5 times. The wait is the one the Hub
     asks for (rate-limit reset, ``Retry-After``), else 1 s doubling up to 8 s;
-    a wait of more than 5 s that the Hub asks for is announced with a warning.
+    a wait of more than 5 s that the Hub asks for is announced with one
+    warning per call (logged instead if warnings are turned into errors).
     ``scan_bucket`` raises instead of waiting when the wait would end more
     than 10 minutes after the call started. Timeouts and connection errors
     are not retried.

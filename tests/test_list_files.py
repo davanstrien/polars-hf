@@ -270,6 +270,16 @@ def test_no_matches_raises_file_not_found(path: str) -> None:
     with pytest.raises(FileNotFoundError, match="no parquet files matched") as error:
         _list(api, path)
     assert "hf://buckets/ns/name" in str(error.value)
+    # Only a glob gets the hint about escaping glob characters.
+    assert ("'[[]'" in str(error.value)) == ("*" in path)
+
+
+def test_directory_with_glob_characters_is_read_with_an_escaped_bracket() -> None:
+    api = _StubApi(_files("run[1]/a.parquet", "run1/b.parquet"))
+
+    with pytest.raises(FileNotFoundError, match=r"write '\[\[\]'"):
+        _list(api, "run[1]/*.parquet".replace("run[1]", "run[2]"))
+    assert _list(api, "run[[]1]/*.parquet") == ["run[1]/a.parquet"]
 
 
 @pytest.mark.parametrize("path", ["d", "d/", "d/*.parquet", "d/empty.parq*"])

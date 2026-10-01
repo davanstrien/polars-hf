@@ -395,6 +395,240 @@ def test_next_page_on_another_origin_is_not_requested(clock: FakeClock) -> None:
     assert len(seen) == 1
 
 
+def _linked_pages(links: list[str | None]):
+    """A handler whose page ``i`` holds one file and the Link header ``links[i]``."""
+    seen = []
+
+    def handler(request):
+        index = len(seen)
+        seen.append(request)
+        headers = {}
+        if links[index] is not None:
+            headers["link"] = links[index]
+        item = {"type": "file", "path": f"data/p{index}", "size": 1, "xetHash": "a"}
+        return Response(200, json=[item], headers=headers)
+
+    return handler, seen
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        '<{next}>; rel="next"',
+        "<{next}>; rel=next",
+        '<{next}>; REL="NEXT"',
+        '<{next}>; rel="prev next"',
+        '<{next}>; rel="Next last"',
+        '<{next}>; title="a, b; c"; rel="next"',
+        '<https://huggingface.co/first>; rel="first", <{next}>; rel="next"',
+        '<https://huggingface.co/x,y>; rel="prev",<{next}>;rel="next"',
+    ],
+)
+def test_next_link_forms_are_followed(clock: FakeClock, link: str) -> None:
+    second = f"{TREE}?recursive=true&cursor=abc"
+    handler, seen = _linked_pages([link.replace("{next}", second), None])
+
+    with hub_session(handler):
+        entries = _list()
+
+    assert [entry.path for entry in entries] == ["data/p0", "data/p1"]
+    assert str(seen[1].url) == second
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        '<{next}>; rel="prev"',
+        '<{next}>; rel="nextpage"',
+        '<{next}>; title="next"',
+        "<{next}>",
+        "",
+    ],
+)
+def test_other_links_end_the_listing(clock: FakeClock, link: str) -> None:
+    second = f"{TREE}?recursive=true&cursor=abc"
+    handler, seen = _linked_pages([link.replace("{next}", second), None])
+
+    with hub_session(handler):
+        entries = _list()
+
+    assert [entry.path for entry in entries] == ["data/p0"]
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    ("target", "resolved"),
+    [
+        ("/api/buckets/ns/name/tree/data%2F?cursor=2", f"{TREE}?cursor=2"),
+        ("?recursive=true&cursor=2", f"{TREE}?recursive=true&cursor=2"),
+        ("data%2F?cursor=2", f"{TREE}?cursor=2"),
+        ("//huggingface.co/api/next?cursor=2", f"{ENDPOINT}/api/next?cursor=2"),
+    ],
+)
+def test_relative_next_link_is_resolved_and_followed(
+    clock: FakeClock, target: str, resolved: str
+) -> None:
+    handler, seen = _linked_pages([f'<{target}>; rel="next"', None])
+
+    with hub_session(handler):
+        entries = _list()
+
+    assert len(entries) == 2
+    assert str(seen[1].url) == resolved
+    assert seen[1].headers["authorization"] == "Bearer token"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://huggingface.co:port/api/next",
+        "https://huggingface.co:99999999/api/next",
+        "//huggingface.co:x/api/next",
+    ],
+)
+def test_next_link_with_invalid_port_raises_a_clear_error(
+    clock: FakeClock, target: str
+) -> None:
+    handler, seen = _linked_pages([f'<{target}>; rel="next"', None])
+
+    with hub_session(handler):
+        with pytest.raises(RuntimeError, match="invalid next link"):
+            _list()
+
+    assert len(seen) == 1
+
+
+def test_self_referencing_next_link_raises(clock: FakeClock) -> None:
+    first = f"{TREE}?recursive=true"
+    handler, seen = _linked_pages([f'<{first}>; rel="next"'] * 5)
+
+    with hub_session(handler):
+        with pytest.raises(RuntimeError, match="links back to a page"):
+            _list()
+
+    assert len(seen) == 1
+
+
+def test_two_page_cycle_raises(clock: FakeClock) -> None:
+    page_a = f"{TREE}?recursive=true&cursor=a"
+    page_b = f"{TREE}?recursive=true&cursor=b"
+    links = [f'<{page_a}>; rel="next"', f'<{page_b}>; rel="next"'] + [
+        f'<{page_a}>; rel="next"'
+    ] * 5
+    handler, seen = _linked_pages(links)
+
+    with hub_session(handler):
+        with pytest.raises(RuntimeError, match="links back to a page"):
+            _list()
+
+    assert [str(r.url) for r in seen] == [f"{TREE}?recursive=true", page_a, page_b]
+
+
+def test_endless_listing_stops_at_the_deadline(clock: FakeClock) -> None:
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        # Each page takes a minute and links to a new one.
+        clock.now += 60
+        link = f'<{TREE}?cursor={len(seen)}>; rel="next"'
+        item = {"type": "file", "path": f"data/p{len(seen)}", "size": 1}
+        return Response(200, json=[item], headers={"link": link})
+
+    with hub_session(handler):
+        with pytest.raises(TimeoutError) as error:
+            _list()
+
+    assert len(seen) == 11
+    assert "600 s allowed for one scan_bucket call" in str(error.value)
+    assert "11 entries were listed" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "problem"),
+    [
+        (b"<html>not json</html>", "not JSON"),
+        (b'{"error": "nope"}', "not a JSON list"),
+        (b'"text"', "not a JSON list"),
+        (b'[{"path": "data/a"}]', "no 'type' or no 'path'"),
+        (b'[{"type": "file"}]', "no 'type' or no 'path'"),
+        (b'[{"type": "file", "path": null}]', "no 'type' or no 'path'"),
+        (b'["data/a"]', "no 'type' or no 'path'"),
+    ],
+)
+def test_unexpected_listing_body_raises_a_clear_error(
+    clock: FakeClock, body: bytes, problem: str
+) -> None:
+    def handler(request):
+        return Response(200, content=body)
+
+    with hub_session(handler):
+        with pytest.raises(RuntimeError) as error:
+            _list()
+
+    assert problem in str(error.value)
+    assert f"{TREE}?recursive=true" in str(error.value)
+
+
+# ---- the warning about a long wait -----------------------------------------
+
+
+def test_long_wait_is_announced_once_per_call(clock: FakeClock) -> None:
+    import warnings
+
+    budget = _Budget("ns/name")
+    handler, _ = _answers(*[Response(429, headers=_rate_limited(20))] * 3)
+
+    with hub_session(handler):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _signed_url(RESOLVE, {}, uri=URI, budget=budget)
+
+    assert clock.waits == [21.0, 21.0, 21.0]
+    assert len(caught) == 1
+    assert "waiting 21 s" in str(caught[0].message)
+
+
+def test_warnings_as_errors_do_not_abort_the_scan(
+    clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    import warnings
+
+    handler, seen = _answers(Response(429, headers=_rate_limited(20)))
+
+    with hub_session(handler):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with caplog.at_level("WARNING", logger="polars_hf.read"):
+                assert _resolve() == SIGNED
+
+    assert clock.waits == [21.0]
+    assert len(seen) == 2
+    # The message is logged instead.
+    assert any("waiting 21 s" in record.message for record in caplog.records)
+
+
+def test_threads_of_one_scan_warn_once(
+    fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
+) -> None:
+    import warnings
+
+    n_files = 6
+    for i in range(n_files):
+        _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
+    fake_hub.add_fault(
+        HUB, "HEAD", r"/resolve/data/p", 429, times=n_files, headers=_rate_limited(20)
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        plhf.scan_bucket(_uri(fake_bucket, "data/"))
+
+    assert len(clock.waits) == n_files
+    ours = [w for w in caught if "scan_bucket: Hub rate limit" in str(w.message)]
+    assert len(ours) == 1
+
+
 # ---- through scan_bucket, on the fake Hub ----------------------------------
 
 

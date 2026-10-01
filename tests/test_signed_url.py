@@ -166,6 +166,21 @@ def test_other_port_or_scheme_is_another_origin(location: str) -> None:
     assert len(seen) == 1
 
 
+def test_redirect_with_invalid_port_is_not_followed() -> None:
+    # httpx refuses such a Location itself (RemoteProtocolError, not retried);
+    # if the session returns the response, _signed_url raises RuntimeError.
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return Response(302, headers={"location": "https://huggingface.co:port/x"})
+
+    with hub_session(handler):
+        with pytest.raises((RuntimeError, hub_httpx.RemoteProtocolError)):
+            _resolve({"authorization": "Bearer hf_test"})
+    assert len(seen) == 1
+
+
 def test_protocol_relative_redirect_is_terminal() -> None:
     # "//host/path" is off-host: return it resolved, and never send the auth
     # header to that host.
