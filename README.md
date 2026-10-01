@@ -95,6 +95,8 @@ plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year", mode="
 
 `sink_bucket` accepts a `LazyFrame` (streaming) or a `DataFrame` and runs the query before it
 returns (`lazy=True` is rejected). Partitioned writes split by key, by size, or both.
+`max_rows_per_file` is a limit. `max_bytes_per_file` is a target, not a limit: it is Polars'
+`approximate_bytes_per_file`, an estimate made while the rows are written, so a file can be larger.
 
 **Object names.** A partitioned write uses the names Polars writes to a local directory:
 `key=value/` directories and files `00000000.parquet`, `00000001.parquet`, ... (the index is
@@ -115,6 +117,8 @@ can be scanned afterwards.
 `"overwrite"` needs a directory below the bucket root: `hf://buckets/ns/name` and
 `hf://buckets/ns/name/` are refused with a `ValueError`. It lists the prefix before the write and
 deletes only files from that listing, so a file that another writer adds during the write is kept.
+A query that returns no rows still deletes the previous files and leaves one file with the schema
+and no rows.
 A file that another writer *replaces* during the write is still deleted. A file at the prefix itself
 (`out` as a file when the write goes to `out/...`) is neither listed nor deleted. The check of
 `"error"` is also a listing before the write: it does not exclude a concurrent writer.
@@ -132,11 +136,15 @@ segment, and no file of that write is registered.
 | `backend` | How | Local disk | Needs |
 | --- | --- | --- | --- |
 | `"xet"` | each output file is streamed into Xet storage with `hf_xet` while Polars writes it, then all files are registered in the bucket | none for the output | `huggingface_hub>=1.19` and the `hf_xet` that it requires (installed with it on x86_64 and arm64) |
-| `"hub"` | Polars writes the output to a temporary directory; `HfApi.batch_bucket_files` uploads it | the size of the complete output | any supported `huggingface_hub` |
+| `"hub"` | Polars writes the output to a temporary directory; the public `HfApi.batch_bucket_files` uploads and registers it | the size of the complete output | any supported `huggingface_hub` |
 
 The default (`backend=None`) is the environment variable `POLARS_HF_SINK_BACKEND` if set, else
 `"xet"` when the installed packages support it, else `"hub"`. An explicit `"xet"` that cannot run
 raises an error; it does not fall back.
+
+With both backends, the deletes of `mode="overwrite"` are sent to the bucket batch endpoint
+(`/api/buckets/{id}/batch`) directly, not through `HfApi.batch_bucket_files`: `huggingface_hub` 1.x
+does not report a rejected delete, and the direct request lets `sink_bucket` check the answer.
 
 Notes on the `"xet"` backend:
 
@@ -159,19 +167,9 @@ Notes on the `"hub"` backend:
   file's string prefix, or of the base prefix, per write) and raises if a file is missing or has
   another size. `huggingface_hub` 2.x reports rejected files itself, and no listing is made.
 
-**Memory.** Peak RSS of one process, one run each, on one macOS machine, with uncompressed
-incompressible data. "Polars alone" is the same query written to a file object that discards the
-bytes.
-
-| Output | Polars alone | `"hub"` | `"xet"` |
-| --- | --- | --- | --- |
-| 1 file, 2.2 GB | 1.05 GB | 1.58 GB | 1.78 GB |
-| 1 file, 4.5 GB | 1.56 GB | not measured | 2.99 GB |
-| 16 files, 2.2 GB | 1.80 GB | 1.51 GB | 3.56 GB |
-| 2,000 files, 2.2 GB | 3.35 GB | 3.34 GB (13 s) | 4.90 GB (62 s) |
-
-In these runs the `"xet"` backend added roughly 0.5–1.8 GB over the baseline. A bound on its memory
-use is not proven.
+**Memory.** In laptop runs with outputs up to 4.5 GB, the `"xet"` backend used 0.5–1.8 GB more
+memory than Polars alone. A bound on its memory use is not proven. See
+[Measurements](#measurements).
 
 **What a failure leaves behind.** With both backends, no file is registered in the bucket before the
 Polars sink has finished without an error. If the query fails or is interrupted, the destination is
@@ -198,6 +196,20 @@ The write is **not transactional**, because the bucket API has no transactions:
   deletion, the prefix holds the new files and the remaining stale files, and (for a failed
   request) the error is raised.
 - A reader can see a part of the new files while the requests are in progress.
+
+#### Measurements
+
+Peak RSS of one process, one run each, on one macOS laptop, with uncompressed incompressible data.
+"Polars alone" is the same query written to a file object that discards the bytes.
+
+| Output | Polars alone | `"hub"` | `"xet"` |
+| --- | --- | --- | --- |
+| 1 file, 2.2 GB | 1.05 GB | 1.58 GB | 1.78 GB |
+| 1 file, 4.5 GB | 1.56 GB | not measured | 2.99 GB |
+| 16 files, 2.2 GB | 1.80 GB | 1.51 GB | 3.56 GB |
+| 2,000 files, 2.2 GB | 3.35 GB | 3.34 GB (13 s) | 4.90 GB (62 s) |
+
+These numbers describe these runs only; they are not a bound.
 
 ### Authentication
 
@@ -288,7 +300,10 @@ creates a uniquely named bucket and deletes it afterwards. `tests/test_staging_s
 same write scenarios for both sink backends; the `xet` cases are skipped when the installed
 `huggingface_hub` is older than 1.19. `test_local_disk_use` measures the growth of the temporary
 directory during a write (16 MB by default; `POLARS_HF_DISK_TEST_MB=300 uv run pytest -m staging -k
-test_local_disk_use -s` prints a larger measurement). Staging can answer
+test_local_disk_use -s` prints a larger measurement).
+`test_big_write_is_identical_with_both_backends` uploads about 300 MB with each backend and compares
+the sizes and Xet hashes of all objects; it runs only with `POLARS_HF_BIG_STAGING=1`, which the weekly
+CI run sets. Staging can answer
 `409`/`502`/`503`/`504` or time out; a test that fails with one of these is rerun automatically
 (`pytest-rerunfailures`). Other failures are not rerun.
 
