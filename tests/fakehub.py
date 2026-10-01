@@ -109,6 +109,8 @@ class RecordedRequest:
     authorization: str | None
     status: int
     body_bytes: int
+    # The path as the client sent it (percent-encoded); ``path`` is decoded.
+    raw_path: str = ""
 
     @property
     def has_authorization(self) -> bool:
@@ -828,6 +830,7 @@ class FakeHub:
             authorization=authorization,
             status=reply.status,
             body_bytes=sent,
+            raw_path=split.path,
         )
         with self._lock:
             self.requests.append(record)

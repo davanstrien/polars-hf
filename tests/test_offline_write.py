@@ -1581,45 +1581,64 @@ def test_changed_http_helper_is_not_reported_as_an_xet_problem(
 
 
 def _checks(fake_hub: FakeHub) -> list[tuple[str, str]]:
-    """``(method, kind)`` of the requests sent before the upload."""
-    kinds = []
+    """``(method, target)`` of the resolve and listing requests, as sent.
+
+    The target is the percent-encoded end of the request path:
+    ``"resolve/<path>"`` or ``"tree/<prefix>"`` (``"tree"`` for the bucket
+    root).
+    """
+    targets = []
     for request in fake_hub.requests:
-        if "/resolve/" in request.path:
-            kinds.append((request.method, "resolve"))
-        elif "/tree" in request.path:
-            kinds.append((request.method, "tree"))
-    return kinds
+        if "/resolve/" in request.raw_path:
+            path = request.raw_path.split("/resolve/", 1)[1]
+            targets.append((request.method, f"resolve/{path}"))
+        elif "/tree" in request.raw_path:
+            prefix = request.raw_path.split("/tree", 1)[1]
+            targets.append((request.method, f"tree{prefix}"))
+    return targets
 
 
 @both_sinks
 def test_existence_checks_cost_a_bounded_number_of_requests(
     fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Many siblings that share the string prefix "out", a large destination
-    # "big/", and a listing that returns 100 entries per page.
+    # Many siblings that share the string prefix "out" ("out2/...",
+    # "out.parquet.NNNN"), a large destination "big/", and a listing that
+    # returns 100 entries per page. The listing must name the directory with
+    # its trailing slash ("out%2F" as the client encodes it) and the HEAD the
+    # exact path: without the slash, the siblings would count as existing.
     monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: True)
     fake_hub.tree_page_size = 100
     for number in range(1500):
         fake_hub.put(fake_bucket, f"out2/{number:04}.txt", b"x")
         fake_hub.put(fake_bucket, f"out.parquet.{number:04}", b"x")
         fake_hub.put(fake_bucket, f"big/{number:04}.txt", b"x")
+    fake_hub.put(fake_bucket, "out.parquet2/x.txt", b"x")
     df = pl.DataFrame({"g": ["a"], "n": [1]})
 
     # Directory, mode="error", free: one HEAD and one listing page.
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "out"), partition_by="g")
-    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+    assert _checks(fake_hub) == [("HEAD", "resolve/out"), ("GET", "tree/out%2F")]
 
     # Directory, mode="error", 1,500 files there: the same two requests.
     fake_hub.reset_log()
     with pytest.raises(FileExistsError):
         sink(df, _uri(fake_bucket, "big"), partition_by="g")
-    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+    assert _checks(fake_hub) == [("HEAD", "resolve/big"), ("GET", "tree/big%2F")]
 
     # Directory, mode="append": one HEAD, no listing, whatever is there.
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "big"), partition_by="g", mode="append")
-    assert _checks(fake_hub) == [("HEAD", "resolve")]
+    assert _checks(fake_hub) == [("HEAD", "resolve/big")]
+
+    # A nested directory: the whole prefix is one encoded segment.
+    fake_hub.reset_log()
+    sink(df, _uri(fake_bucket, "deep/er/out"), partition_by="g")
+    assert _checks(fake_hub) == [
+        ("HEAD", "resolve/deep%2Fer%2Fout"),
+        ("GET", "tree/deep%2Fer%2Fout%2F"),
+    ]
 
     # Bucket root, mode="error": one listing page.
     fake_hub.reset_log()
@@ -1630,12 +1649,15 @@ def test_existence_checks_cost_a_bounded_number_of_requests(
     # Single file, mode="error": one HEAD and one listing page of "path/".
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "out.parquet"))
-    assert _checks(fake_hub) == [("HEAD", "resolve"), ("GET", "tree")]
+    assert _checks(fake_hub) == [
+        ("HEAD", "resolve/out.parquet"),
+        ("GET", "tree/out.parquet%2F"),
+    ]
 
     # Single file, mode="overwrite": one listing page of "path/".
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "out.parquet"), mode="overwrite")
-    assert _checks(fake_hub) == [("GET", "tree")]
+    assert _checks(fake_hub) == [("GET", "tree/out.parquet%2F")]
 
 
 @both_sinks

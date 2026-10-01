@@ -500,3 +500,69 @@ def test_file_and_directory_of_one_name_are_refused(
             sink(df, _uri(staging_bucket, "as-dir.parquet"), mode=mode)
 
     assert _files(staging_api, staging_bucket) == files_before
+
+    # A bucket that already holds both a file "x" and objects below "x/"
+    # (made with the Hub client; sink_bucket does not create such a pair).
+    staging_api.batch_bucket_files(
+        staging_bucket, add=[(b"a file", "x"), (b"in a directory", "x/child.txt")]
+    )
+    files_before = _files(staging_api, staging_bucket)
+    assert {"x", "x/child.txt"} <= set(files_before)
+
+    # Single file, default mode: the file exists (and "x/" exists).
+    with pytest.raises(FileExistsError):
+        sink(df, _uri(staging_bucket, "x"), format="parquet")
+    with pytest.raises(FileExistsError, match="'x/' is a directory"):
+        sink(df, _uri(staging_bucket, "x"), format="parquet", mode="overwrite")
+    for mode in ("error", "append", "overwrite"):
+        with pytest.raises(FileExistsError, match="'x' is a file"):
+            sink(df, _uri(staging_bucket, "x"), partition_by="g", mode=mode)
+
+    assert _files(staging_api, staging_bucket) == files_before
+
+
+@both_sinks
+def test_existence_checks_on_the_real_hub(
+    staging_api: HfApi, staging_bucket: str, sink
+) -> None:
+    """What the existence checks rely on from the Hub.
+
+    A zero-length object counts as existing, a file is seen as existing
+    right after it was written, and a file and a directory of one name are
+    told apart.
+    """
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+    empty = pl.DataFrame({"a": []}, schema={"a": pl.Int64})
+
+    # (a) a zero-length object written by sink_bucket, (b) one uploaded with
+    # the Hub client.
+    sink(empty, _uri(staging_bucket, "empty-sink.jsonl"))
+    staging_api.batch_bucket_files(staging_bucket, add=[(b"", "empty-client.jsonl")])
+    files_before = _files(staging_api, staging_bucket)
+    assert files_before["empty-sink.jsonl"][0] == 0
+    assert files_before["empty-client.jsonl"][0] == 0
+    for name in ("empty-sink.jsonl", "empty-client.jsonl"):
+        with pytest.raises(FileExistsError, match="already exists"):
+            sink(df, _uri(staging_bucket, name))
+        # (d) a directory write whose prefix is that zero-length file.
+        with pytest.raises(FileExistsError, match="is a file in the bucket"):
+            sink(df, _uri(staging_bucket, name), partition_by="g", mode="append")
+    assert _files(staging_api, staging_bucket) == files_before
+
+    # (c) a new file is seen at once by the next default-mode write.
+    for number in range(5):
+        uri = _uri(staging_bucket, f"fresh/{number}.parquet")
+        sink(df, uri)
+        with pytest.raises(FileExistsError, match="already exists"):
+            sink(df, uri)
+
+    # (e) a new directory is seen at once, by a directory write and by a
+    # single-file write to its name.
+    base = _uri(staging_bucket, "parts")
+    sink(df, base, partition_by="g")
+    files_before = _files(staging_api, staging_bucket)
+    with pytest.raises(FileExistsError, match="already holds files"):
+        sink(df, base, partition_by="g")
+    with pytest.raises(FileExistsError, match="'parts/' is a directory"):
+        sink(df, base, format="parquet", mode="overwrite")
+    assert _files(staging_api, staging_bucket) == files_before
