@@ -162,9 +162,10 @@ before any request.
 
 `resolve` requests count in the Hub's "resolvers" rate limit, so a scan of N files uses N of them.
 
-**Retries.** A `408`, `429` or `5xx` answer to a `resolve` request is retried up to 5 times. The
-same applies to the listing, which is then started again from its first page (inside one listing,
-`huggingface_hub` itself retries the requests for the later pages). The wait before a retry is the
+**Retries.** A `408`, `429` or `5xx` answer to a `resolve` request or to a listing page is retried
+up to 5 times; only the failed request is sent again. `scan_bucket` sends the listing requests
+itself (it does not call `HfApi.list_bucket_tree`), so the same limits apply to every page and on
+every supported `huggingface_hub` version. The wait before a retry is the
 one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. When the Hub
 asks for more than 5 s, a warning announces the wait, so a paused scan is not silent.
 

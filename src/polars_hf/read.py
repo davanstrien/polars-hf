@@ -13,11 +13,13 @@ Stock polars cannot authenticate a generic ``https://`` URL itself (bearer-token
 injection is gated behind the ``hf://`` scheme), which is why we resolve the
 signed URL here rather than passing the ``resolve`` URL directly.
 
-All Hub requests go through ``huggingface_hub``: the listing through
-``HfApi.list_bucket_tree`` and the ``resolve`` request through the shared Hub
-session (``huggingface_hub.utils.get_session``: proxies, offline mode, custom
-client factory). Retries of 408, 429 and 5xx answers are done here, with a
-limit on every wait and on the total time of one ``scan_bucket`` call.
+All Hub requests (the bucket listing and the ``resolve`` requests) are sent
+with the shared ``huggingface_hub`` session
+(``huggingface_hub.utils.get_session``: proxies, offline mode, custom client
+factory). Retries of 408, 429 and 5xx answers are done here, for every request
+and every listing page, and no wait ends after the deadline of the
+``scan_bucket`` call. ``HfApi.list_bucket_tree`` is not used: its retries are
+not bounded and differ between huggingface_hub versions.
 """
 
 from __future__ import annotations
@@ -27,10 +29,11 @@ import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlparse
 
 import polars as pl
-from huggingface_hub import HfApi
+from huggingface_hub import constants
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import (
     build_hf_headers,
@@ -47,6 +50,9 @@ from polars_hf._uri import BucketPath, parse_bucket_uri
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 _MAX_RESOLVE_WORKERS = 16
 _MAX_REDIRECT_HOPS = 5
+# Entries per listing page (the ``limit`` query parameter). ``None`` leaves
+# the page size to the Hub; the staging tests set it to force several pages.
+_LIST_PAGE_LIMIT: int | None = None
 
 # Keep in sync with the parquet extensions accepted by sink_bucket
 # (write._EXT_FORMAT, which matches case-insensitively).
@@ -202,32 +208,99 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
     time.sleep(wait)
 
 
+# ---- requests --------------------------------------------------------------
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    """Scheme, host and port of ``url``; the default port is made explicit.
+
+    ``urlparse`` lower-cases the scheme and the host, so their case is ignored.
+    """
+    parsed = urlparse(url)
+    port = parsed.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(parsed.scheme)
+    return (parsed.scheme, parsed.hostname, port)
+
+
+def _request(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    budget: _Budget,
+    what: str,
+    params: dict[str, str] | None = None,
+):
+    """One request with auth that does not follow redirects.
+
+    The request is sent with the shared ``huggingface_hub`` session. A 408 /
+    429 / 5xx answer is retried within the limits of ``budget``; when they are
+    reached, ``HfHubHTTPError`` is raised. Any other answer is returned.
+
+    Timeouts and connection errors are not retried and keep their type.
+    """
+    attempt = 0
+    while True:
+        response = get_session().request(
+            method,
+            url,
+            params=params,
+            headers=headers,
+            follow_redirects=False,
+            timeout=_REQUEST_TIMEOUT,
+        )
+        if response.status_code not in _RETRY_STATUS_CODES:
+            return response
+        _wait_before_retry(response, attempt, budget, what)
+        attempt += 1
+
+
 # ---- listing ---------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _Entry:
+    """One entry of a bucket listing (the fields of the Hub's JSON we use)."""
+
+    type: str
+    path: str
+    size: int | None = None
+    xet_hash: str | None = None
+
+
 def _list_tree(
-    api: HfApi,
+    endpoint: str,
+    headers: dict[str, str],
     bucket_id: str,
     prefix: str,
     *,
     recursive: bool,
     uri: str,
     budget: _Budget,
-) -> list:
-    """All entries of one ``list_bucket_tree`` call (paginated by the client).
+) -> list[_Entry]:
+    """All entries of a bucket listing, page by page.
 
-    A 408 / 429 / 5xx answer restarts the whole listing, within the limits of
-    ``budget``. (Inside one listing, ``huggingface_hub`` itself retries the
-    requests for the pages after the first one.)
+    The request is the one of ``HfApi.list_bucket_tree``:
+    ``GET /api/buckets/{id}/tree/{prefix}?recursive=...``, with the prefix as
+    one percent-encoded segment. The answer is a JSON list; a
+    ``Link: <url>; rel="next"`` header names the next page. Every page is
+    requested with the retry limits of ``budget``.
     """
-    attempt = 0
-    while True:
+    url = f"{endpoint}/api/buckets/{bucket_id}/tree"
+    if prefix:
+        url = f"{url}/{quote(prefix, safe='')}"
+    params: dict[str, str] | None = {"recursive": "true" if recursive else "false"}
+    if _LIST_PAGE_LIMIT is not None:
+        params["limit"] = str(_LIST_PAGE_LIMIT)
+    hub_origin = _origin(endpoint)
+
+    entries = []
+    while url is not None:
+        response = _request("GET", url, headers, budget, "listing", params)
         try:
-            return list(
-                api.list_bucket_tree(
-                    bucket_id, prefix=prefix or None, recursive=recursive
-                )
-            )
+            hf_raise_for_status(response)
         except HfHubHTTPError as error:
             status = _status_code(error)
             if status in (401, 403):
@@ -237,10 +310,31 @@ def _list_tree(
                     f"bucket {bucket_id!r} not found (or the token has no access "
                     f"to it): {uri!r}"
                 ) from error
-            if status not in _RETRY_STATUS_CODES:
-                raise
-            _wait_before_retry(error.response, attempt, budget, "listing")
-            attempt += 1
+            raise
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"unexpected answer of the Hub to the listing of {uri!r} "
+                f"(HTTP {response.status_code})"
+            )
+        for item in response.json():
+            entries.append(
+                _Entry(
+                    type=item["type"],
+                    path=item["path"],
+                    size=item.get("size"),
+                    xet_hash=item.get("xetHash"),
+                )
+            )
+
+        # The link of the next page already holds the query parameters.
+        url = response.links.get("next", {}).get("url")
+        params = None
+        if url is not None and _origin(url) != hub_origin:
+            # The token is sent with every page: never to another origin.
+            raise RuntimeError(
+                f"the Hub listing of {uri!r} links to another origin: {url!r}"
+            )
+    return entries
 
 
 def _files(entries: list) -> list:
@@ -268,15 +362,20 @@ def _glob_is_in_one_directory(pattern: str) -> bool:
 
 
 def _directory_files(
-    api: HfApi, bp: BucketPath, directory: str, uri: str, budget: _Budget
-) -> list:
+    endpoint: str,
+    headers: dict[str, str],
+    bp: BucketPath,
+    directory: str,
+    uri: str,
+    budget: _Budget,
+) -> list[_Entry]:
     """The parquet files below ``directory`` (``""`` is the whole bucket)."""
     # The Hub matches a listing prefix as a plain string: 'train' would also
     # list 'train_full/...'. With the trailing slash the listing holds the
     # files of this directory only.
     prefix = f"{directory}/" if directory else ""
     entries = _list_tree(
-        api, bp.bucket_id, prefix, recursive=True, uri=uri, budget=budget
+        endpoint, headers, bp.bucket_id, prefix, recursive=True, uri=uri, budget=budget
     )
     selected = []
     for file in _files(entries):
@@ -286,8 +385,13 @@ def _directory_files(
 
 
 def _glob_files(
-    api: HfApi, bp: BucketPath, pattern: str, uri: str, budget: _Budget
-) -> list:
+    endpoint: str,
+    headers: dict[str, str],
+    bp: BucketPath,
+    pattern: str,
+    uri: str,
+    budget: _Budget,
+) -> list[_Entry]:
     """The files that ``pattern`` names: an exact file name, else the matches.
 
     A file whose name is exactly ``pattern`` (``data[1].parquet``) is read
@@ -298,12 +402,19 @@ def _glob_files(
         # A glob in the last segment only: list its directory, not the subtree.
         parent = pattern.rpartition("/")[0]
         entries = _list_tree(
-            api, bp.bucket_id, parent, recursive=False, uri=uri, budget=budget
+            endpoint,
+            headers,
+            bp.bucket_id,
+            parent,
+            recursive=False,
+            uri=uri,
+            budget=budget,
         )
     else:
         # Every match starts with the text before the first glob character.
         entries = _list_tree(
-            api,
+            endpoint,
+            headers,
             bp.bucket_id,
             literal_prefix(pattern),
             recursive=True,
@@ -321,12 +432,13 @@ def _glob_files(
     return selected
 
 
-def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list:
+def _list_files(
+    endpoint: str, headers: dict[str, str], bp: BucketPath, uri: str, budget: _Budget
+) -> list[_Entry]:
     """List the bucket and return the files that ``bp`` names, sorted by path.
 
     A path with a glob character is a glob (see ``_glob_files``); any other
-    path is a directory. The entries are those of ``HfApi.list_bucket_tree``
-    (``path``, ``size``, ``xet_hash``).
+    path is a directory. The entries hold ``path``, ``size`` and ``xet_hash``.
     """
     path = bp.path.rstrip("/")
     if bp.is_glob and bp.path.endswith("/"):
@@ -337,9 +449,9 @@ def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list:
         )
 
     if bp.is_glob:
-        selected = _glob_files(api, bp, path, uri, budget)
+        selected = _glob_files(endpoint, headers, bp, path, uri, budget)
     else:
-        selected = _directory_files(api, bp, path, uri, budget)
+        selected = _directory_files(endpoint, headers, bp, path, uri, budget)
     if not selected:
         raise FileNotFoundError(f"no parquet files matched: {uri!r}")
 
@@ -355,45 +467,6 @@ def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list:
 def _resolve_url(endpoint: str, bucket_id: str, path: str) -> str:
     """The Hub ``resolve`` URL of a bucket file (the one ``HfApi`` requests)."""
     return f"{endpoint}/buckets/{bucket_id}/resolve/{quote(path, safe='')}"
-
-
-_DEFAULT_PORTS = {"http": 80, "https": 443}
-
-
-def _origin(url: str) -> tuple[str, str | None, int | None]:
-    """Scheme, host and port of ``url``; the default port is made explicit.
-
-    ``urlparse`` lower-cases the scheme and the host, so their case is ignored.
-    """
-    parsed = urlparse(url)
-    port = parsed.port
-    if port is None:
-        port = _DEFAULT_PORTS.get(parsed.scheme)
-    return (parsed.scheme, parsed.hostname, port)
-
-
-def _head(url: str, headers: dict[str, str], budget: _Budget):
-    """One HEAD request with auth that does not follow redirects.
-
-    The request is sent with the shared ``huggingface_hub`` session. A 408 /
-    429 / 5xx answer is retried within the limits of ``budget``; when they are
-    reached, ``HfHubHTTPError`` is raised. Any other answer is returned.
-
-    Timeouts and connection errors are not retried and keep their type.
-    """
-    attempt = 0
-    while True:
-        response = get_session().request(
-            "HEAD",
-            url,
-            headers=headers,
-            follow_redirects=False,
-            timeout=_REQUEST_TIMEOUT,
-        )
-        if response.status_code not in _RETRY_STATUS_CODES:
-            return response
-        _wait_before_retry(response, attempt, budget, "resolve")
-        attempt += 1
 
 
 def _signed_url(
@@ -428,7 +501,7 @@ def _signed_url(
     hub_origin = _origin(resolve_url)
     url = resolve_url
     for _ in range(_MAX_REDIRECT_HOPS):
-        response = _head(url, headers, budget)
+        response = _request("HEAD", url, headers, budget, "resolve")
         if response.status_code in _REDIRECT_CODES and "location" in response.headers:
             # urljoin resolves relative *and* protocol-relative (//host/..)
             # locations; compare origins rather than sniffing the scheme prefix.
@@ -570,12 +643,13 @@ def scan_bucket(
     ``HF_HUB_OFFLINE=1`` and a custom client factory
     (``huggingface_hub.set_client_factory``) apply to them.
 
-    A 408, 429 or 5xx answer to a listing or a ``resolve`` request is retried
-    up to 5 times. The wait is the one the Hub asks for (rate-limit reset,
-    ``Retry-After``), else 1 s doubling up to 8 s; a wait of more than 5 s
-    that the Hub asks for is announced with a warning. ``scan_bucket`` raises
-    instead of waiting when the wait would end more than 10 minutes after the
-    call started. Timeouts and connection errors are not retried.
+    A 408, 429 or 5xx answer to any of these requests (every listing page,
+    every ``resolve``) is retried up to 5 times. The wait is the one the Hub
+    asks for (rate-limit reset, ``Retry-After``), else 1 s doubling up to 8 s;
+    a wait of more than 5 s that the Hub asks for is announced with a warning.
+    ``scan_bucket`` raises instead of waiting when the wait would end more
+    than 10 minutes after the call started. Timeouts and connection errors
+    are not retried.
 
     Signed URLs are resolved when ``scan_bucket`` is called and are valid for
     ~1 hour. Collect within that window; for long-lived plans, call
@@ -588,7 +662,8 @@ def scan_bucket(
     >>> lf.filter(pl.col("label") == 1).head(5).collect()  # doctest: +SKIP
     """
     bp = parse_bucket_uri(uri)
-    api = HfApi(token=token)
+    # Read at call time, like HfApi does when it is created.
+    endpoint = constants.ENDPOINT
     headers = build_hf_headers(token=token)
     budget = _Budget(bp.bucket_id)
 
@@ -596,13 +671,13 @@ def scan_bucket(
         # A file needs no listing: ask for its signed URL directly. When the
         # Hub answers "not found", the path can still be a directory.
         try:
-            urls = _signed_urls(api.endpoint, headers, [bp.path], budget)
+            urls = _signed_urls(endpoint, headers, [bp.path], budget)
         except FileNotFoundError:
             pass
         else:
             return pl.scan_parquet(urls, **scan_kwargs)
 
-    files = _list_files(api, bp, uri, budget)
+    files = _list_files(endpoint, headers, bp, uri, budget)
     paths = [file.path for file in files]
-    urls = _signed_urls(api.endpoint, headers, paths, budget)
+    urls = _signed_urls(endpoint, headers, paths, budget)
     return pl.scan_parquet(urls, **scan_kwargs)

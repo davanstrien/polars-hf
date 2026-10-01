@@ -267,6 +267,134 @@ def test_deadline_is_shared_by_the_requests_of_one_call(clock: FakeClock) -> Non
     assert len(seen) == 1
 
 
+# ---- listing pages ---------------------------------------------------------
+
+ENDPOINT = "https://huggingface.co"
+TREE = f"{ENDPOINT}/api/buckets/ns/name/tree/data%2F"
+
+
+def _page(paths: list[str], next_url: str | None = None):
+    items = [
+        {"type": "file", "path": path, "size": 10, "xetHash": "a" * 64}
+        for path in paths
+    ]
+    headers = {}
+    if next_url is not None:
+        headers["link"] = f'<{next_url}>; rel="next"'
+    return Response(200, json=items, headers=headers)
+
+
+def _list(recursive: bool = True) -> list:
+    return read._list_tree(
+        ENDPOINT,
+        {"authorization": "Bearer token"},
+        "ns/name",
+        "data/",
+        recursive=recursive,
+        uri="hf://buckets/ns/name/data/",
+        budget=_Budget("ns/name"),
+    )
+
+
+def test_listing_request_and_pages(clock: FakeClock) -> None:
+    seen = []
+    second = f"{TREE}?recursive=true&cursor=abc"
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return _page(["data/a.parquet", "data/b.parquet"], second)
+        return _page(["data/c.parquet"])
+
+    with hub_session(handler):
+        entries = _list()
+
+    assert [entry.path for entry in entries] == [
+        "data/a.parquet",
+        "data/b.parquet",
+        "data/c.parquet",
+    ]
+    assert entries[0] == read._Entry("file", "data/a.parquet", 10, "a" * 64)
+    # The prefix is one percent-encoded segment; the next link is used as is.
+    assert [str(request.url) for request in seen] == [
+        f"{TREE}?recursive=true",
+        second,
+    ]
+    assert all(r.method == "GET" for r in seen)
+    assert all(r.headers["authorization"] == "Bearer token" for r in seen)
+    assert clock.waits == []
+
+
+def test_non_recursive_listing_parameter(clock: FakeClock) -> None:
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return _page([])
+
+    with hub_session(handler):
+        assert _list(recursive=False) == []
+
+    assert str(seen[0].url) == f"{TREE}?recursive=false"
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_every_listing_page_is_retried(clock: FakeClock, status: int) -> None:
+    seen = []
+    second = f"{TREE}?recursive=true&cursor=abc"
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return _page(["data/a.parquet"], second)
+        if len(seen) in (2, 3):
+            return Response(status)
+        return _page(["data/b.parquet"])
+
+    with hub_session(handler):
+        entries = _list()
+
+    assert [entry.path for entry in entries] == ["data/a.parquet", "data/b.parquet"]
+    # Only the failed page is requested again.
+    assert [str(r.url) for r in seen] == [f"{TREE}?recursive=true"] + [second] * 3
+    assert clock.waits == [1.0, 2.0]
+
+
+def test_later_listing_page_wait_is_bounded(clock: FakeClock) -> None:
+    # huggingface_hub's own paginate sleeps for the full announced time here.
+    seen = []
+    second = f"{TREE}?recursive=true&cursor=abc"
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return _page(["data/a.parquet"], second)
+        return Response(429, headers=_rate_limited(900))
+
+    with hub_session(handler):
+        with pytest.raises(HfHubHTTPError) as error:
+            _list()
+
+    assert clock.waits == []
+    assert len(seen) == 2
+    assert "rate limit for listing requests was reached" in str(error.value)
+    assert "the Hub asks to wait 901 s" in str(error.value)
+
+
+def test_next_page_on_another_origin_is_not_requested(clock: FakeClock) -> None:
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return _page(["data/a.parquet"], "https://evil.example/api/next?cursor=1")
+
+    with hub_session(handler):
+        with pytest.raises(RuntimeError, match="links to another origin"):
+            _list()
+
+    assert len(seen) == 1
+
+
 # ---- through scan_bucket, on the fake Hub ----------------------------------
 
 

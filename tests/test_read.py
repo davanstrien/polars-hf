@@ -265,3 +265,118 @@ def test_invalid_token_raises_permission_error(edge_bucket: str, path: str) -> N
     assert "lacks access" in str(error.value)
     assert isinstance(error.value.__cause__, HfHubHTTPError)
     assert error.value.__cause__.response.status_code == 401
+
+
+# ---- the listing of polars-hf against HfApi.list_bucket_tree ---------------
+
+_ODD_NAMES = [
+    "odd/with space/a b.parquet",
+    "odd/ünï/日本.parquet",
+    "odd/100%/50%25.parquet",
+    "odd/#hash/q?.parquet",
+    "odd/plus+and&/x=1;y.parquet",
+]
+
+
+@pytest.fixture(scope="module")
+def odd_bucket(staging_api: HfApi) -> Iterator[str]:
+    bucket_id = _create_staging_bucket(staging_api)
+    try:
+        add = [(b"x", path) for path in _ODD_NAMES]
+        add += [(b"x", f"many/f{i:02d}.bin") for i in range(7)]
+        add += [(b"x", "many/sub/g.bin"), (b"x", "many2/h.bin")]
+        _staging_retry(lambda: staging_api.batch_bucket_files(bucket_id, add=add))
+        yield bucket_id
+    finally:
+        _delete_staging_bucket(staging_api, bucket_id)
+
+
+def _own_listing(bucket_id: str, prefix: str, recursive: bool) -> list:
+    from huggingface_hub import constants
+    from huggingface_hub.utils import build_hf_headers
+
+    from polars_hf import read
+
+    entries = read._list_tree(
+        constants.ENDPOINT,
+        build_hf_headers(),
+        bucket_id,
+        prefix,
+        recursive=recursive,
+        uri=f"hf://buckets/{bucket_id}/{prefix}",
+        budget=read._Budget(bucket_id),
+    )
+    return [(e.type, e.path, e.size, e.xet_hash) for e in entries]
+
+
+def _client_listing(api: HfApi, bucket_id: str, prefix: str, recursive: bool) -> list:
+    listed = api.list_bucket_tree(bucket_id, prefix=prefix or None, recursive=recursive)
+    return [
+        (e.type, e.path, getattr(e, "size", None), getattr(e, "xet_hash", None))
+        for e in listed
+    ]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "recursive"),
+    [
+        ("", True),
+        ("", False),
+        ("many/", True),
+        ("many", False),
+        ("many/f0", False),
+        ("odd/", True),
+        ("odd/with space/", True),
+        ("odd/100%/", True),
+        ("odd/#hash/", True),
+        ("odd/#hash", False),
+        ("odd/ünï/", True),
+        ("nope/", True),
+    ],
+)
+def test_listing_equals_list_bucket_tree(
+    odd_bucket: str, staging_api: HfApi, prefix: str, recursive: bool
+) -> None:
+    own = _own_listing(odd_bucket, prefix, recursive)
+
+    assert own == _client_listing(staging_api, odd_bucket, prefix, recursive)
+    if prefix == "many/" and recursive:
+        assert len(own) == 8
+
+
+@pytest.mark.parametrize("recursive", [True, False])
+def test_multi_page_listing_equals_one_page(
+    odd_bucket: str, monkeypatch: pytest.MonkeyPatch, recursive: bool
+) -> None:
+    from polars_hf import read
+
+    one_page = _own_listing(odd_bucket, "many/", recursive)
+    monkeypatch.setattr(read, "_LIST_PAGE_LIMIT", 3)
+
+    assert _own_listing(odd_bucket, "many/", recursive) == one_page
+    assert len(one_page) == 8
+
+
+def test_odd_names_are_listed_and_resolved(
+    odd_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The files are one byte each, not parquet: capture the signed URLs
+    # instead of scanning them.
+    from polars_hf import read
+
+    resolved: list[str] = []
+    monkeypatch.setattr(
+        read.pl, "scan_parquet", lambda urls, **kw: resolved.extend(urls)
+    )
+
+    plhf.scan_bucket(f"hf://buckets/{odd_bucket}/odd/")
+
+    assert len(resolved) == len(_ODD_NAMES)
+
+
+def test_missing_bucket_listing_raises_file_not_found(odd_bucket: str) -> None:
+    namespace = odd_bucket.split("/")[0]
+    missing = f"{namespace}/polars-hf-test-no-such-bucket"
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        _own_listing(missing, "", True)

@@ -7,8 +7,10 @@ asks the Hub for an exact file first (see ``test_offline_read.py``).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 import pytest
+from conftest import hub_httpx, hub_session
 
 from polars_hf._uri import parse_bucket_uri
 from polars_hf.read import _Budget, _list_files
@@ -22,7 +24,10 @@ class _Entry:
 
 
 class _StubApi:
-    """Stand-in for ``HfApi``: one bucket that lists like the Hub.
+    """Stand-in for the Hub listing API: one bucket that lists like the Hub.
+
+    ``handler`` answers the listing requests of the ``huggingface_hub``
+    session (see ``conftest.hub_session``) from ``list_bucket_tree``.
 
     Recursive: every file whose path starts with the prefix (a string prefix).
     Not recursive: the direct children (files and directories) of the prefix
@@ -33,6 +38,25 @@ class _StubApi:
     def __init__(self, entries: list[_Entry]) -> None:
         self.entries = entries
         self.calls: list[tuple[str, str | None, bool]] = []
+
+    def handler(self, request):
+        assert request.method == "GET"
+        # /api/buckets/{namespace}/{name}/tree[/{prefix as one segment}]
+        parts = request.url.raw_path.decode().split("?")[0].split("/")
+        assert parts[1:3] == ["api", "buckets"] and parts[5] == "tree"
+        prefix = unquote(parts[6]) if len(parts) > 6 else None
+        recursive = request.url.params["recursive"] == "true"
+        entries = self.list_bucket_tree(
+            f"{parts[3]}/{parts[4]}", prefix, recursive=recursive
+        )
+        items = []
+        for entry in entries:
+            item = {"type": entry.type, "path": entry.path}
+            if entry.type == "file":
+                item["size"] = entry.size
+                item["xetHash"] = "0" * 64
+            items.append(item)
+        return hub_httpx.Response(200, json=items)
 
     def list_bucket_tree(self, bucket_id, prefix=None, *, recursive=None):
         self.calls.append((bucket_id, prefix, recursive))
@@ -68,8 +92,14 @@ def _files(*paths: str) -> list[_Entry]:
 
 def _list(api: _StubApi, path: str) -> list[str]:
     uri = f"hf://buckets/ns/name/{path}" if path else "hf://buckets/ns/name"
-    files = _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
-    return [file.path for file in files]
+    return [file.path for file in _entries(api, uri)]
+
+
+def _entries(api: _StubApi, uri: str) -> list:
+    with hub_session(api.handler):
+        return _list_files(
+            "https://huggingface.co", {}, parse_bucket_uri(uri), uri, _Budget("ns/name")
+        )
 
 
 def test_one_recursive_listing_with_the_path_as_prefix() -> None:
@@ -168,9 +198,11 @@ def test_entries_keep_size_and_hash() -> None:
     api = _StubApi([_Entry("data/a.parquet", size=123)])
     uri = "hf://buckets/ns/name/data"
 
-    files = _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
+    files = _entries(api, uri)
 
-    assert [(file.path, file.size) for file in files] == [("data/a.parquet", 123)]
+    assert [(file.path, file.size, file.xet_hash) for file in files] == [
+        ("data/a.parquet", 123, "0" * 64)
+    ]
 
 
 @pytest.mark.parametrize("path", ["data", "data/"])
@@ -186,6 +218,7 @@ def test_directory_excludes_string_prefix_siblings() -> None:
 
     assert _list(api, "data") == ["data/a.parquet"]
     # The siblings are not even listed.
+    assert api.calls == [("ns/name", "data/", True)]
     listed = api.list_bucket_tree("ns/name", "data/", recursive=True)
     assert [entry.path for entry in listed] == ["data/a.parquet"]
 

@@ -165,6 +165,31 @@ def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(read, name, 0.001, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sleep(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline tests: a retry wait of the read path must not sleep for real.
+
+    Waits of the shortened backoff pass; a longer one (a server hint, or a
+    backoff that is not shortened) fails the test at once. Tests of the wait
+    policy replace the clock (``test_retry.py``).
+    """
+    if request.node.get_closest_marker("staging") is not None:
+        return
+    import types
+
+    from polars_hf import read
+
+    def sleep(seconds: float) -> None:
+        if seconds > 0.01:
+            raise AssertionError(f"an offline test would sleep for {seconds} s")
+        time.sleep(seconds)
+
+    clock = types.SimpleNamespace(monotonic=time.monotonic, sleep=sleep)
+    monkeypatch.setattr(read, "time", clock)
+
+
 @contextmanager
 def hub_session(handler: Callable) -> Iterator[None]:
     """Answer every request of the ``huggingface_hub`` session with ``handler``.
