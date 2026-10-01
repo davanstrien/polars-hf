@@ -12,14 +12,20 @@ extensions — just install and scan.
 Stock Polars already reads `hf://datasets/...` and `hf://spaces/...` natively. It does **not** yet
 read `hf://buckets/...`. `polars-hf` fills that gap from the outside.
 
-It returns a **native** `pl.scan_parquet` LazyFrame: bucket files are XET-backed, so `scan_bucket`
-follows the authenticated Hub `resolve` redirect to a presigned CDN URL
+The files are read by **native** `pl.scan_parquet` scans: bucket files are XET-backed, so
+`polars-hf` follows the authenticated Hub `resolve` redirect to a presigned CDN URL
 (`us.aws.cdn.hf.co/xet-bridge-*`) and hands that to Polars. Polars' own Rust object store then does
-async, concurrent, **range-read** scans — so **projection, predicate, and slice pushdown**,
-streaming, and multi-file concurrency all work natively and only the column chunks actually needed
+async, concurrent, **range-read** scans — so **projection, predicate, and row-limit pushdown**,
+streaming, and multi-file concurrency work natively and only the column chunks actually needed
 are transferred. (This is the same read
 mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Python because stock
 Polars can't attach a bearer token to a generic `https://` URL.)
+
+A presigned URL holds a signature and is valid for about one hour. `scan_bucket` therefore does not
+put the URLs in the query plan: it returns a LazyFrame over a Polars
+[IO-plugin source](https://docs.pola.rs/user-guide/plugins/io_plugins/) that resolves the URLs when
+the query runs and delegates to the native scan. See
+[When the URLs are resolved](#when-the-urls-are-resolved).
 
 > [!NOTE]
 > **This may be a stopgap.** Native `hf://buckets/...` support is proposed upstream in Polars —
@@ -79,6 +85,52 @@ df = (
 ```
 
 `scan_bucket` returns a lazy `LazyFrame` and works with the streaming engine.
+
+### When the URLs are resolved
+
+`scan_bucket(uri, resolve=...)` has two modes:
+
+| | `resolve="collect"` (default) | `resolve="now"` |
+| --- | --- | --- |
+| LazyFrame | a Polars IO-plugin node that holds the bucket paths | the native `scan_parquet` node over the presigned URLs |
+| `scan_bucket()` does | the listing (see [Hub requests](#hub-requests)) | the listing and one `resolve` request per file |
+| Presigned URLs in `explain()`, `serialize()`, error messages | no | yes, with their signature |
+| Validity | a URL is resolved shortly before it is used, each time the query runs | ~1 hour from the `scan_bucket` call; call it again for a new plan |
+| `head(5)` on N files | resolves 1 file | resolves N files |
+| `include_file_paths="col"` | the `hf://buckets/...` URI of the file | the presigned URL |
+| `select(pl.len())` | reads one column | reads the footers only |
+| `tail(n)`, `slice(offset, n)` | scan all files | read only the files they need |
+
+With `resolve="collect"` a query runs like this:
+
+1. **Schema.** When Polars first needs the schema (`collect()`, `collect_schema()`, `explain()`),
+   the first file is resolved and its footer is read: one `resolve` request and one to three CDN
+   requests (it depends on the Polars version), once per LazyFrame. The schema is the one a native scan of the first file has with
+   your scan options.
+2. **Groups.** The files are scanned in path order in groups of 64. The URLs of a group are
+   resolved when the group before it is exhausted, so later groups get new URLs and a scan can run
+   for longer than one hour. One group is one native multi-file scan that gets the projection, the
+   predicate and the row limit of the query, and its DataFrames are passed on unchanged: the rows
+   and their order are those of one native scan. A group must be scanned within the hour that its
+   URLs are valid.
+3. **Row limits.** A query with a row limit (`head(n)`) uses groups of 1, 4, 16, then 64 files and
+   stops when it has its rows.
+
+All files are one group (all URLs are resolved at the start of the query) with `row_index_name=` or
+`n_rows=`, and for a row limit *before* a predicate (`lf.head(n).filter(...)`).
+
+Every group is scanned with the schema of the first file of the scan (passed to the native scan as
+`schema=`), unless you give `schema=` yourself. `missing_columns=`, `extra_columns=` and
+`cast_options=` then apply to every file as in one native scan; the tests compare both modes on
+files with different columns and types.
+
+`LazyFrame.serialize()` of the default mode needs the `cloudpickle` package (Polars pickles an IO
+source with it). The serialized plan holds the endpoint, the bucket paths and the scan options. It
+does not hold the token or a presigned URL: a deserialized query uses the token of its own
+environment, also if `token=` was given to `scan_bucket`.
+
+Use `resolve="now"` when a query needs the native node: a metadata-only row count, `tail()`, or
+tooling that inspects the scan node. Collect within the hour, and treat the plan as a secret.
 
 ### Writing
 
@@ -288,38 +340,48 @@ Rules for the URI itself:
 - `hf://datasets/...` and `hf://spaces/...` are read natively by Polars — use
   `pl.scan_parquet(...)` for those.
 
-Signed URLs are resolved when `scan_bucket` is called and are valid for ~1 hour (the URL carries
-its own expiry time). Collect within that window; for long-lived query plans, call `scan_bucket`
-again to refresh.
-
 ### Hub requests
 
-`scan_bucket` reads no file data. It makes these requests to the Hub:
+`scan_bucket` reads no file data. The call makes these requests to the Hub:
 
-| `{path}` | Requests |
+| `{path}` | Requests of `scan_bucket()` |
 | --- | --- |
 | one file, any extension | 1 `resolve` (HEAD) |
-| a directory of N parquet files (`data`) | 1 `resolve` (answered "not found") + 1 listing per page of results + N `resolve` |
-| the same with a trailing slash (`data/`), or the whole bucket | 1 listing per page + N `resolve` |
-| a glob that selects N files | 1 listing per page + N `resolve` |
+| a directory of N parquet files (`data`) | 1 `resolve` (answered "not found") + 1 listing per page of results |
+| the same with a trailing slash (`data/`), or the whole bucket | 1 listing per page |
+| a glob that selects N files | 1 listing per page |
 | a path that does not exist | 1 `resolve` + 1 listing |
 
 A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. Other
 globs list the subtree below the text before their first glob character. An invalid glob raises
 before any request.
 
-`resolve` requests count in the Hub's "resolvers" rate limit, so a scan of N files uses N of them.
+With `resolve="now"` the call then sends one `resolve` request for each of the N files. With the
+default `resolve="collect"` these requests are sent when a query runs:
+
+| Query on N files | `resolve` requests |
+| --- | --- |
+| first use of the schema (`collect()`, `collect_schema()`, `explain()`) | 1, for the first file; 0 for a single-file URI |
+| a full scan, a projection, a filter, a row count | N; the URL of the first file is used again if it is less than 5 minutes old, so N - 1 right after the schema |
+| `head(n)` | the files of the groups it reads: 1, then 4, 16, 64 |
+| a second `collect()` of the same LazyFrame | N again (N - 1 within 5 minutes) |
+
+`resolve` requests count in the Hub's "resolvers" rate limit. A scan of N files uses N of them each
+time it runs. A query sends at most 64 at once, and the next 64 only when the group before is
+read (except in the one-group cases of [When the URLs are resolved](#when-the-urls-are-resolved)).
 
 **Retries.** A `408`, `429` or `5xx` answer to a `resolve` request or to a listing page is retried
 up to 5 times; only the failed request is sent again. `scan_bucket` sends the listing requests
 itself (it does not call `HfApi.list_bucket_tree`), so the same limits apply to every page and on
 every supported `huggingface_hub` version. The wait before a retry is the
 one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. When the Hub
-asks for more than 5 s, one warning per `scan_bucket` call announces the wait, so a paused scan is
-not silent. If your warning filter turns warnings into errors, the message is logged (logger
+asks for more than 5 s, one warning per `scan_bucket` call (and per group of a query) announces
+the wait, so a paused scan is not silent. If your warning filter turns warnings into errors, the message is logged (logger
 `polars_hf.read`) instead, and the scan continues.
 
-One `scan_bucket` call waits only while the wait ends within 10 minutes of its start. A rate-limit
+A wait is made only while it ends within 10 minutes. The 10 minutes start with the `scan_bucket`
+call for the requests of the call. For the requests of a query they start again with the schema
+read and with every group of files, so the limit is per group, not per query. A rate-limit
 reset in 300 s is waited for; a wait that would pass the 10 minutes raises `HfHubHTTPError` at
 once. The message says how long the Hub asked to wait and how much time was left; for a rate
 limit it also names the bucket, the quota and how many files were already resolved. That limit
@@ -347,22 +409,59 @@ client factory (`huggingface_hub.set_client_factory`) apply.
 A private bucket that the token cannot see is reported by the Hub as "not found", so it raises
 `FileNotFoundError`, not `PermissionError`.
 
+**Which call raises.** `scan_bucket()` raises the errors of the URI, of the listing and of a
+single-file URI: an invalid URI or glob, a missing bucket or path, nothing matched, an empty file
+found in the listing, no access. With `resolve="now"` it raises all errors of the table.
+
+With the default `resolve="collect"`, the `resolve` requests of the listed files are sent by the
+query, so `collect()` raises their errors: a file that was deleted after the listing
+(`FileNotFoundError`), a `401` / `403` (`PermissionError`), a rate limit or server error that the
+retries did not clear (`HfHubHTTPError`), a file that the Hub does not redirect (`RuntimeError`).
+The messages are the same. How the exception arrives depends on Polars:
+
+- Polars 2 (tested with 2.0.0rc2) raises the exception itself.
+- Polars 1.x wraps every exception of an IO source: `collect()` raises
+  `polars.exceptions.ComputeError`, and its message holds the type name and the message of the
+  original exception (`... FileNotFoundError: no such file: 'hf://buckets/...'`).
+- All Polars versions wrap an error of the schema read (the `resolve` request of the first file)
+  in a `ComputeError` that starts with `schema callable failed`.
+
+A read error of Polars itself (a presigned URL that the CDN refuses, a file that is not parquet)
+keeps its type. In the default mode its message names the `hf://` URI of the file; the presigned
+URL is removed.
+
 ## Performance
 
-Bucket reads fetch many small range requests from the XET CDN. Two things dominate:
+Bucket reads fetch range requests from the XET CDN.
 
-- **Concurrency.** polars' default cloud-IO concurrency (`max(cpu_threads, 10)`) is low for
-  high-latency object stores. `polars-hf` raises `POLARS_CONCURRENCY_BUDGET` to `64` by default
-  (override by setting it yourself). This is a large win on warm/repeated scans and ~15% on cold.
+- **The IO-plugin node.** In the default mode the native scan runs inside an IO source, and whole
+  DataFrames cross into Python. On HF Jobs (`cpu-performance`, Polars 2.0.0rc2, 54 files, 126.7 GB,
+  four columns, CDN-warm, one run each) a prototype of this wrapper took 244 s and the native node
+  301 s, with the same result: no overhead was measured for a full scan. A row count on a 3-file
+  fixture took 2.5 s through the wrapper and 1.8 s on the native node, because Polars asks an IO
+  source for one column to count rows. `tail()` and slices with an offset scan all files in the
+  default mode. `resolve="now"` gives the native node for such queries.
+- **Download, then scan.** In the same run, downloading the files with `hf_xet` in a rolling window
+  and scanning them from local disk took 114 s (7.3 GB peak RSS, 15.1 GB of staging disk).
+  `polars-hf` does not do this; [`benchmarks/read_paths.py`](benchmarks/read_paths.py) has that arm
+  for comparison.
 - **Cold vs warm CDN.** The *first* read of freshly written/copied data pays a cold-CDN penalty
   (the bytes aren't at the edge yet); subsequent reads are much faster. For repeated large-scale
   reads, consider [pre-warming](https://huggingface.co/docs/hub/storage-buckets#pre-warming-and-cdn)
   the bucket.
+- **`POLARS_CONCURRENCY_BUDGET`.** `polars-hf` does not set Polars environment variables. Earlier
+  versions set `POLARS_CONCURRENCY_BUDGET=64` at import, for every cloud scan of the process. On
+  HF Jobs (14 GB) that setting made no difference on Polars 2.0.0rc2 (31.0 and 32.1 s with it,
+  29.1 and 33.6 s without) and about 8% on Polars 1.44.2. On Polars 1.x you can set
+  it yourself, before the first cloud read of the process.
+
+[`benchmarks/`](benchmarks/README.md) has the scripts, what each number means, and the measured
+tables with their job ids.
 
 ## Scan options
 
-Extra keyword arguments to `scan_bucket` are forwarded to `pl.scan_parquet`, so native options
-work as-is — e.g. heterogeneous schemas across globbed files:
+Extra keyword arguments to `scan_bucket` are forwarded to `pl.scan_parquet` (to the native scan of
+every group in the default mode) — e.g. heterogeneous schemas across globbed files:
 
 ```python
 plhf.scan_bucket(uri, missing_columns="insert", extra_columns="ignore")
@@ -370,9 +469,11 @@ plhf.scan_bucket(uri, missing_columns="insert", extra_columns="ignore")
 
 or `storage_options={"max_retries": 5}` for flaky connections (this replaces the deprecated
 `retries=` option of Polars; it applies to the data requests Polars makes, not to the Hub requests
-above). Options that derive meaning from the file *path*
-(`hive_partitioning=`, `include_file_paths=`) see the presigned CDN URLs, not the bucket paths,
-so they are not useful here.
+above).
+
+`include_file_paths="file"` adds the `hf://buckets/...` URI of the file of every row. (With
+`resolve="now"` the column holds the presigned URL, signature included.) `hive_partitioning=` sees
+the presigned CDN URLs, not the bucket paths, so it finds no partition columns in either mode.
 
 ## Limitations
 
@@ -380,6 +481,11 @@ so they are not useful here.
 - Hive-style partition columns are not inferred from paths on read (the presigned CDN URLs don't
   preserve the bucket paths) — but partitioned writes include the key columns in the files by
   default, so round-trips keep the data.
+- The default read mode is a Polars IO-plugin node. Polars pushes a projection, a predicate and
+  `head(n)` into it, nothing else: a row count reads one column, `tail()` and slices with an
+  offset scan all files, and on Polars 1.x an error of a query is a `ComputeError` that quotes
+  the original exception. `resolve="now"` gives the native node, with the presigned URLs in the
+  plan. See [When the URLs are resolved](#when-the-urls-are-resolved) and [Errors](#errors).
 
 ## Development
 
@@ -396,7 +502,8 @@ uv run pytest -m staging      # live tests against the Hub CI staging instance
 **Offline tests** need no network and no token. `tests/fakehub.py` runs a local fake Hub: one HTTP
 server for the bucket API and the `resolve` redirect, and a second one (another origin) that serves
 the "presigned" URLs with range requests. It records every request and the bytes it serves, and can
-be scripted to fail (`429`, `503`, `403`, ...). File uploads do not go over HTTP; the fake has one
+be scripted to fail (`429`, `503`, `403`, ...), and to refuse the presigned URLs it has made so far
+(`expire_signed_urls()`), like the real CDN after an hour. File uploads do not go over HTTP; the fake has one
 seam per sink backend. For the `"staged"` backend, a patched `HfApi._batch_bucket_files` stores the
 files in memory, so the client-side chunking of the public method stays real. For the `"stream"`
 backend, an in-memory object replaces the `hf_xet` upload commit, and the backend's own
@@ -430,7 +537,8 @@ HYPOTHESIS_PROFILE=random uv run pytest tests/test_properties.py
 HYPOTHESIS_PROFILE=random uv run pytest tests/test_properties.py --hypothesis-seed=1234
 ```
 
-**Known bugs** are in `tests/test_known_bugs.py` as `@pytest.mark.xfail(strict=True)` tests. Each one
+**Known bugs** go in `tests/test_known_bugs.py` as `@pytest.mark.xfail(strict=True)` tests (none is
+open at the moment; the tests there are regression tests of fixed bugs). Such a test
 asserts the behaviour we *want* and fails today for the reason in its `reason=`, so it is reported
 as `xfailed`. Because the marker is strict, a test that starts to pass turns the suite red
 (`XPASS(strict)`): the pull request that fixes a bug must remove the marker in the same change. To
