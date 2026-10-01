@@ -111,6 +111,61 @@ def test_same_host_case_insensitive() -> None:
     assert seen[1].headers["authorization"] == "Bearer x"
 
 
+@pytest.mark.parametrize(
+    ("resolve", "location"),
+    [
+        (RESOLVE, "https://huggingface.co:443/buckets/ns/name/resolve2/data.parquet"),
+        (
+            "https://huggingface.co:443/buckets/ns/name/resolve/data.parquet",
+            "https://huggingface.co/buckets/ns/name/resolve2/data.parquet",
+        ),
+        (
+            "http://localhost/buckets/ns/name/resolve/data.parquet",
+            "http://localhost:80/buckets/ns/name/resolve2/data.parquet",
+        ),
+    ],
+)
+def test_default_port_is_the_same_origin(resolve: str, location: str) -> None:
+    # An explicit default port does not make another origin: the hop is
+    # followed with auth, it is not returned as the signed URL.
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return Response(302, headers={"location": location})
+        return Response(302, headers={"location": SIGNED})
+
+    with hub_session(handler):
+        got = _signed_url(
+            resolve, {"authorization": "Bearer x"}, uri=URI, budget=_Budget("ns/name")
+        )
+    assert got == SIGNED
+    assert len(seen) == 2
+    assert seen[1].headers["authorization"] == "Bearer x"
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://huggingface.co:80/buckets/ns/name/resolve/data.parquet",
+        "http://huggingface.co:443/buckets/ns/name/resolve/data.parquet",
+        "https://huggingface.co:8443/buckets/ns/name/resolve/data.parquet",
+    ],
+)
+def test_other_port_or_scheme_is_another_origin(location: str) -> None:
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return Response(302, headers={"location": location})
+
+    with hub_session(handler):
+        got = _resolve({"authorization": "Bearer hf_test"})
+    assert got == location
+    assert len(seen) == 1
+
+
 def test_protocol_relative_redirect_is_terminal() -> None:
     # "//host/path" is off-host: return it resolved, and never send the auth
     # header to that host.

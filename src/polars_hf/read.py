@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urljoin, urlparse
 
@@ -60,11 +61,13 @@ _MAX_RETRIES = 5
 # maximum backoff.
 _RETRY_BASE_WAIT = 1.0
 _RETRY_MAX_BACKOFF = 8.0
-# The server can ask for a longer wait (rate-limit reset, Retry-After). No
-# single wait is longer than this, and no wait ends after the deadline of the
-# scan_bucket call; the scan fails instead of sleeping for minutes or hours.
-_MAX_WAIT_PER_RETRY = 60.0
+# The server can ask for a longer wait (rate-limit reset, Retry-After). A wait
+# is made only if it ends before the deadline of the scan_bucket call; the
+# scan fails instead of sleeping past it.
 _SCAN_DEADLINE = 600.0
+# A wait that the server asks for and that is longer than this is announced
+# with a warning, so that a paused scan is not silent.
+_WARN_WAIT = 5.0
 
 
 def _is_parquet_name(path: str) -> bool:
@@ -175,21 +178,27 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
         reason = f"no success after {_MAX_RETRIES} retries"
         raise _retry_error(response, budget, what, reason)
 
-    wait = _server_wait_hint(response)
+    hint = _server_wait_hint(response)
+    wait = hint
     if wait is None:
         wait = min(_RETRY_MAX_BACKOFF, _RETRY_BASE_WAIT * 2**attempt)
-    if wait > _MAX_WAIT_PER_RETRY:
+    left = max(budget.deadline - time.monotonic(), 0.0)
+    if wait > left:
+        asked = "the Hub asks to wait" if hint is not None else "the next retry is in"
         reason = (
-            f"the Hub asks to wait {wait:.0f} s, more than the limit of "
-            f"{_MAX_WAIT_PER_RETRY:.0f} s per retry; try again later"
+            f"{asked} {wait:.0f} s, but only {left:.0f} s are left of the "
+            f"{_SCAN_DEADLINE:.0f} s allowed for one scan_bucket call; try "
+            "again later"
         )
         raise _retry_error(response, budget, what, reason)
-    if time.monotonic() + wait > budget.deadline:
-        reason = (
-            f"the next retry would pass the limit of {_SCAN_DEADLINE:.0f} s "
-            "for one scan_bucket call; try again later"
+    if hint is not None and wait > _WARN_WAIT:
+        cause = "rate limit" if response.status_code == 429 else "busy server"
+        warnings.warn(
+            f"scan_bucket: Hub {cause} (HTTP {response.status_code}) on a {what} "
+            f"request for the bucket {budget.bucket_id!r}; waiting {wait:.0f} s "
+            "before the next attempt",
+            stacklevel=2,
         )
-        raise _retry_error(response, budget, what, reason)
     time.sleep(wait)
 
 
@@ -249,29 +258,6 @@ def _exact_file(files: list, path: str) -> list:
     return []
 
 
-def _parquet_files_below(files: list, directory: str) -> list:
-    """The parquet files below ``directory`` (``""`` is the whole bucket).
-
-    The Hub matches a listing prefix as a plain string, so ``files`` can hold
-    siblings such as ``data.parquet`` and ``data2/x`` for the prefix ``data``.
-    """
-    directory_prefix = f"{directory}/" if directory else ""
-    selected = []
-    for file in files:
-        if file.path.startswith(directory_prefix) and _is_parquet_name(file.path):
-            selected.append(file)
-    return selected
-
-
-def _glob_matches(files: list, pattern: str) -> list:
-    regex = glob_to_regex(pattern)
-    selected = []
-    for file in files:
-        if regex.fullmatch(file.path):
-            selected.append(file)
-    return selected
-
-
 def _glob_is_in_one_directory(pattern: str) -> bool:
     """Whether only the last segment of ``pattern`` is a glob, without ``**``."""
     segments = pattern.split("/")
@@ -281,62 +267,66 @@ def _glob_is_in_one_directory(pattern: str) -> bool:
     return "**" not in segments[-1]
 
 
-def _select_recursive(
-    api: HfApi, bp: BucketPath, path: str, uri: str, budget: _Budget
+def _directory_files(
+    api: HfApi, bp: BucketPath, directory: str, uri: str, budget: _Budget
 ) -> list:
-    """One recursive listing; ``path`` as a file, a directory, then a glob."""
-    # Every candidate (the literal file, the files below the literal
-    # directory, the glob matches) starts with the text before the first glob
-    # character, so one listing covers all three readings of the path.
-    prefix = literal_prefix(path) if bp.is_glob else path
+    """The parquet files below ``directory`` (``""`` is the whole bucket)."""
+    # The Hub matches a listing prefix as a plain string: 'train' would also
+    # list 'train_full/...'. With the trailing slash the listing holds the
+    # files of this directory only.
+    prefix = f"{directory}/" if directory else ""
     entries = _list_tree(
         api, bp.bucket_id, prefix, recursive=True, uri=uri, budget=budget
     )
-    files = _files(entries)
-
-    if not bp.path.endswith("/"):
-        selected = _exact_file(files, path)
-        if selected:
-            return selected
-    selected = _parquet_files_below(files, path)
-    if selected or not bp.is_glob:
-        return selected
-    return _glob_matches(files, path)
+    selected = []
+    for file in _files(entries):
+        if file.path.startswith(prefix) and _is_parquet_name(file.path):
+            selected.append(file)
+    return selected
 
 
-def _select_in_one_directory(
-    api: HfApi, bp: BucketPath, path: str, uri: str, budget: _Budget
+def _glob_files(
+    api: HfApi, bp: BucketPath, pattern: str, uri: str, budget: _Budget
 ) -> list:
-    """A glob in the last segment only: list its directory, not the subtree."""
-    parent = path.rpartition("/")[0]
-    entries = _list_tree(
-        api, bp.bucket_id, parent, recursive=False, uri=uri, budget=budget
-    )
+    """The files that ``pattern`` names: an exact file name, else the matches.
+
+    A file whose name is exactly ``pattern`` (``data[1].parquet``) is read
+    literally. Raises ``ValueError`` for an invalid pattern before any request.
+    """
+    matcher = glob_to_regex(pattern)
+    if _glob_is_in_one_directory(pattern):
+        # A glob in the last segment only: list its directory, not the subtree.
+        parent = pattern.rpartition("/")[0]
+        entries = _list_tree(
+            api, bp.bucket_id, parent, recursive=False, uri=uri, budget=budget
+        )
+    else:
+        # Every match starts with the text before the first glob character.
+        entries = _list_tree(
+            api,
+            bp.bucket_id,
+            literal_prefix(pattern),
+            recursive=True,
+            uri=uri,
+            budget=budget,
+        )
     files = _files(entries)
 
-    selected = _exact_file(files, path)
+    selected = _exact_file(files, pattern)
     if selected:
         return selected
-    # A directory whose name has glob characters ('run[1]'): read it as a
-    # directory, which needs the listing of its subtree.
-    for entry in entries:
-        if entry.type == "directory" and entry.path == path:
-            below = _list_tree(
-                api, bp.bucket_id, path, recursive=True, uri=uri, budget=budget
-            )
-            selected = _parquet_files_below(_files(below), path)
-            if selected:
-                return selected
-    return _glob_matches(files, path)
+    for file in files:
+        if matcher.fullmatch(file.path):
+            selected.append(file)
+    return selected
 
 
-def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list[str]:
-    """List the bucket and return the sorted paths of the files ``bp`` names.
+def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list:
+    """List the bucket and return the files that ``bp`` names, sorted by path.
 
-    The path is tried, in order, as: the exact name of a file; a directory
-    (all parquet files below it); a glob. A name that contains glob characters
-    (``data[1].parquet``) is therefore read literally when such a file or
-    directory exists.
+    A path with a glob character is a glob (see ``_glob_files``); any other
+    path is a directory. The entries are those of ``HfApi.list_bucket_tree``
+    (``path``, ``size``, ``xet_hash``).
     """
     path = bp.path.rstrip("/")
     if bp.is_glob and bp.path.endswith("/"):
@@ -346,17 +336,17 @@ def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list[s
             f"'{path}/**/*.parquet' for all files below them)"
         )
 
-    if bp.is_glob and _glob_is_in_one_directory(path):
-        selected = _select_in_one_directory(api, bp, path, uri, budget)
+    if bp.is_glob:
+        selected = _glob_files(api, bp, path, uri, budget)
     else:
-        selected = _select_recursive(api, bp, path, uri, budget)
+        selected = _directory_files(api, bp, path, uri, budget)
     if not selected:
         raise FileNotFoundError(f"no parquet files matched: {uri!r}")
 
     for file in selected:
         if file.size == 0:
             raise _empty_file_error(_file_uri(bp.bucket_id, file.path))
-    return sorted(file.path for file in selected)
+    return sorted(selected, key=lambda file: file.path)
 
 
 # ---- resolve ---------------------------------------------------------------
@@ -365,6 +355,21 @@ def _list_files(api: HfApi, bp: BucketPath, uri: str, budget: _Budget) -> list[s
 def _resolve_url(endpoint: str, bucket_id: str, path: str) -> str:
     """The Hub ``resolve`` URL of a bucket file (the one ``HfApi`` requests)."""
     return f"{endpoint}/buckets/{bucket_id}/resolve/{quote(path, safe='')}"
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    """Scheme, host and port of ``url``; the default port is made explicit.
+
+    ``urlparse`` lower-cases the scheme and the host, so their case is ignored.
+    """
+    parsed = urlparse(url)
+    port = parsed.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(parsed.scheme)
+    return (parsed.scheme, parsed.hostname, port)
 
 
 def _head(url: str, headers: dict[str, str], budget: _Budget):
@@ -420,18 +425,15 @@ def _signed_url(
         Any other HTTP error, and a 408 / 429 / 5xx answer that the retries
         allowed by ``budget`` did not clear.
     """
-    hub = urlparse(resolve_url)
-    hub_origin = (hub.scheme, hub.hostname, hub.port)
+    hub_origin = _origin(resolve_url)
     url = resolve_url
     for _ in range(_MAX_REDIRECT_HOPS):
         response = _head(url, headers, budget)
         if response.status_code in _REDIRECT_CODES and "location" in response.headers:
             # urljoin resolves relative *and* protocol-relative (//host/..)
             # locations; compare origins rather than sniffing the scheme prefix.
-            # (.hostname is lower-cased by urlparse, so host case is ignored.)
             location = urljoin(url, response.headers["location"])
-            target = urlparse(location)
-            if (target.scheme, target.hostname, target.port) != hub_origin:
+            if _origin(location) != hub_origin:
                 if response.headers.get("x-linked-size") == "0":
                     raise _empty_file_error(uri)
                 return location
@@ -499,20 +501,20 @@ def scan_bucket(
     Parameters
     ----------
     uri
-        An ``hf://buckets/{namespace}/{name}/{path}`` URI. ``path`` is read as,
-        in this order:
+        An ``hf://buckets/{namespace}/{name}/{path}`` URI. ``path`` is read as:
 
-        * a single file, whatever its extension, if a file with exactly this
-          name exists (also when the name contains glob characters, such as
-          ``data[1].parquet``);
-        * a directory or the whole bucket: every ``.parquet`` / ``.pq`` file
-          below it, at any depth, extension matched case-insensitively. A
-          trailing ``/`` forces this reading;
-        * a glob (e.g. ``data/*.parquet``): every *file* that matches. ``*``,
-          ``?`` and ``[...]`` match inside one path segment; ``**`` must be a
-          whole segment and matches any number of directories. Braces
-          (``{a,b}``) are not expanded. Directories are never passed to the
-          scan.
+        * a glob, if it has a glob character (``*``, ``?`` or ``[``), e.g.
+          ``data/*.parquet``: every *file* that matches. ``*``, ``?`` and
+          ``[...]`` match inside one path segment; ``**`` must be a whole
+          segment and matches any number of directories. Braces (``{a,b}``)
+          are not expanded. Directories are never passed to the scan. A file
+          whose name is exactly the pattern (``data[1].parquet``) is read
+          instead of the matches;
+        * else a single file, whatever its extension, if a file with exactly
+          this name exists;
+        * else a directory, or the whole bucket: every ``.parquet`` / ``.pq``
+          file below it, at any depth, extension matched case-insensitively.
+          A trailing ``/`` forces this reading.
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
         ``HF_TOKEN`` env var or cached login).
@@ -552,14 +554,17 @@ def scan_bucket(
     -----
     ``scan_bucket`` makes these Hub requests and reads no file data:
 
-    * a path that ends in ``.parquet`` / ``.pq`` and has no glob character:
-      one ``resolve`` request (HEAD). If the Hub answers "not found", the path
-      is then handled as a directory;
-    * any other path: one listing request per page of results, then one
-      ``resolve`` request per file. A glob whose only glob segment is the last
-      one (``data/*.parquet``) lists that directory only; a directory scan and
-      a glob with ``**`` list the whole subtree. ``resolve`` requests count in
-      the Hub's "resolvers" rate limit.
+    * a file: one ``resolve`` request (HEAD);
+    * a directory of N parquet files: one ``resolve`` request that the Hub
+      answers "not found", one listing request per page of results, then N
+      ``resolve`` requests. With a trailing ``/`` (and for the whole bucket)
+      the first request is not made;
+    * a glob that selects N files: one listing request per page, then N
+      ``resolve`` requests. A glob whose only glob segment is the last one
+      (``data/*.parquet``) lists that directory only; other globs list the
+      subtree below the text before their first glob character.
+
+    ``resolve`` requests count in the Hub's "resolvers" rate limit.
 
     The requests go through the shared HTTP session of ``huggingface_hub``, so
     ``HF_HUB_OFFLINE=1`` and a custom client factory
@@ -567,10 +572,10 @@ def scan_bucket(
 
     A 408, 429 or 5xx answer to a listing or a ``resolve`` request is retried
     up to 5 times. The wait is the one the Hub asks for (rate-limit reset,
-    ``Retry-After``), else 1 s doubling up to 8 s. ``scan_bucket`` raises
-    instead of waiting when one wait would be longer than 60 s or would end
-    more than 10 minutes after the call started. Timeouts and connection
-    errors are not retried.
+    ``Retry-After``), else 1 s doubling up to 8 s; a wait of more than 5 s
+    that the Hub asks for is announced with a warning. ``scan_bucket`` raises
+    instead of waiting when the wait would end more than 10 minutes after the
+    call started. Timeouts and connection errors are not retried.
 
     Signed URLs are resolved when ``scan_bucket`` is called and are valid for
     ~1 hour. Collect within that window; for long-lived plans, call
@@ -587,10 +592,9 @@ def scan_bucket(
     headers = build_hf_headers(token=token)
     budget = _Budget(bp.bucket_id)
 
-    # The common case, one parquet file, needs no listing: ask for its signed
-    # URL directly. The suffix only chooses which request is tried first; a
-    # "not found" answer falls through to the listing, which decides.
-    if not bp.is_glob and _is_parquet_name(bp.path):
+    if bp.path and not bp.is_glob and not bp.path.endswith("/"):
+        # A file needs no listing: ask for its signed URL directly. When the
+        # Hub answers "not found", the path can still be a directory.
         try:
             urls = _signed_urls(api.endpoint, headers, [bp.path], budget)
         except FileNotFoundError:
@@ -598,6 +602,7 @@ def scan_bucket(
         else:
             return pl.scan_parquet(urls, **scan_kwargs)
 
-    paths = _list_files(api, bp, uri, budget)
+    files = _list_files(api, bp, uri, budget)
+    paths = [file.path for file in files]
     urls = _signed_urls(api.endpoint, headers, paths, budget)
     return pl.scan_parquet(urls, **scan_kwargs)

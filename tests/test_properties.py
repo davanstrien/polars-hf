@@ -58,7 +58,7 @@ def test_valid_uri_round_trips(namespace: str, name: str, path: str) -> None:
 
     assert bp == BucketPath(bucket_id=f"{namespace}/{name}", path=path)
     assert f"hf://{bp.fs_path}" == uri
-    assert bp.is_glob == any(c in path for c in "*?[]")
+    assert bp.is_glob == any(c in path for c in "*?[")
 
 
 @given(namespace=_id_part, name=_id_part, path=_path.filter(lambda path: path != ""))
@@ -187,6 +187,7 @@ _same_origin_hops = st.sampled_from(
         ("same", f"{HUB_ORIGIN}/buckets/ns/renamed/resolve/data.parquet"),
         ("same", "https://HuggingFace.co/buckets/ns/name/resolve3/data.parquet"),
         ("same", "//huggingface.co/protocol-relative/data.parquet"),
+        ("same", "https://huggingface.co:443/default-port/data.parquet"),
     ]
 )
 _other_origin_hops = st.sampled_from(
@@ -195,6 +196,7 @@ _other_origin_hops = st.sampled_from(
         ("other", "//us.aws.cdn.hf.co/xet-bridge-us/abc"),
         ("other", "http://huggingface.co/buckets/ns/name/resolve/data.parquet"),
         ("other", "https://huggingface.co:8443/buckets/ns/name/resolve/data.parquet"),
+        ("other", "https://huggingface.co:80/buckets/ns/name/resolve/data.parquet"),
         ("other", "https://huggingface.co.evil.example/steal"),
         ("other", "https://evil.example/huggingface.co/steal"),
     ]
@@ -205,7 +207,10 @@ _redirect_codes = st.sampled_from([301, 302, 303, 307, 308])
 
 def _origin(url: str) -> tuple[str, str | None, int | None]:
     parsed = urlparse(url)
-    return (parsed.scheme, parsed.hostname, parsed.port)
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parsed.scheme)
+    return (parsed.scheme, parsed.hostname, port)
 
 
 @given(hops=_hops, code=_redirect_codes)
@@ -356,7 +361,7 @@ _glob_fragments = st.sampled_from(["[", "]", "*", "?", "[1]", "[!a]", "a", "1", 
 _glob_stems = (
     st.lists(_glob_fragments, min_size=1, max_size=5)
     .map("".join)
-    .filter(lambda stem: any(c in stem for c in "*?[]"))
+    .filter(lambda stem: any(c in stem for c in "*?["))
 )
 
 

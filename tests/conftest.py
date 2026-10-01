@@ -120,8 +120,8 @@ FAKE_BUCKET = "fake-user/fake-bucket"
 # Module constants of polars_hf.read that set the backoff without server hint.
 RETRY_BACKOFF_CONSTANTS = ("_RETRY_BASE_WAIT", "_RETRY_MAX_BACKOFF")
 # On staging the CI account shares its rate limits with other projects: a
-# rate-limited test must fail within seconds, not sleep until the reset.
-STAGING_MAX_WAIT_PER_RETRY = 5.0
+# rate-limited test must fail within seconds, not sleep until the reset. A
+# wait is made only if it ends before this deadline.
 STAGING_SCAN_DEADLINE = 30.0
 
 
@@ -196,14 +196,11 @@ def hub_session(handler: Callable) -> Iterator[None]:
 def _short_staging_waits(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Staging tests: a short limit per wait and per ``scan_bucket`` call."""
+    """Staging tests: a short limit on the retry waits of one ``scan_bucket``."""
     if request.node.get_closest_marker("staging") is None:
         return
     from polars_hf import read
 
-    monkeypatch.setattr(
-        read, "_MAX_WAIT_PER_RETRY", STAGING_MAX_WAIT_PER_RETRY, raising=False
-    )
     monkeypatch.setattr(read, "_SCAN_DEADLINE", STAGING_SCAN_DEADLINE, raising=False)
 
 

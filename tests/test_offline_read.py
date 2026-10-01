@@ -305,13 +305,14 @@ def test_directory_of_n_files_is_one_listing_and_n_resolves(
 
     lf = plhf.scan_bucket(_uri(fake_bucket, "data"))
 
+    # The path is tried as a file first; the listing then names the files.
     calls = _hub_calls(fake_hub)
-    assert calls[0] == ("GET", "tree", 200)
-    assert calls[1:] == [("HEAD", "resolve", 302)] * n_files
+    assert calls[:2] == [("HEAD", "resolve", 404), ("GET", "tree", 200)]
+    assert calls[2:] == [("HEAD", "resolve", 302)] * n_files
     # No file data, and no request to the cdn, before collect().
     assert fake_hub.matching(origin=CDN) == []
     resolved = fake_hub.matching(origin=HUB, method="HEAD")
-    assert len({request.path for request in resolved}) == n_files
+    assert len({request.path for request in resolved}) == n_files + 1
 
     assert lf.collect().height == n_files * 10
 
@@ -346,7 +347,8 @@ def test_directory_and_recursive_glob_list_the_subtree(
 
     listings = fake_hub.matching(origin=HUB, method="GET")
     assert [request.query for request in listings] == ["recursive=true"]
-    assert len(fake_hub.matching(origin=HUB, method="HEAD")) == 2
+    resolved = fake_hub.matching(origin=HUB, method="HEAD")
+    assert [r.status for r in resolved if r.status == 302] == [302, 302]
 
 
 def test_one_directory_glob_does_not_read_sub_directories(
@@ -381,7 +383,8 @@ def test_paginated_listing_is_read_to_the_end(
     listings = fake_hub.matching(origin=HUB, method="GET")
     assert len(listings) == 3
     assert all(request.has_authorization for request in listings)
-    assert len(fake_hub.matching(origin=HUB, method="HEAD")) == n_files
+    resolved = fake_hub.matching(origin=HUB, method="HEAD")
+    assert len([r for r in resolved if r.status == 302]) == n_files
 
 
 def test_glob_with_trailing_slash_is_rejected(
@@ -408,14 +411,72 @@ def test_explicit_glob_that_selects_a_non_parquet_file_fails_at_collect(
         lf.collect()
 
 
-def test_file_without_parquet_extension_is_one_listing_and_one_resolve(
+def test_file_without_parquet_extension_is_one_request(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
     fake_hub.put_parquet(fake_bucket, "data/table", _numbered_frame(0, 5))
 
     plhf.scan_bucket(_uri(fake_bucket, "data/table"))
 
-    assert _hub_calls(fake_hub) == [("GET", "tree", 200), ("HEAD", "resolve", 302)]
+    assert _hub_calls(fake_hub) == [("HEAD", "resolve", 302)]
+
+
+@pytest.mark.parametrize("path", ["data/", ""])
+def test_trailing_slash_and_whole_bucket_skip_the_file_request(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+    fake_hub.put_parquet(fake_bucket, "data/b.parquet", _numbered_frame(5, 5))
+
+    plhf.scan_bucket(_uri(fake_bucket, path))
+
+    assert (
+        _hub_calls(fake_hub) == [("GET", "tree", 200)] + [("HEAD", "resolve", 302)] * 2
+    )
+
+
+@pytest.mark.parametrize("path", ["nope", "nope.parquet", "data/nope.bin"])
+def test_missing_path_is_one_resolve_and_one_listing(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+
+    with pytest.raises(FileNotFoundError):
+        plhf.scan_bucket(_uri(fake_bucket, path))
+
+    assert _hub_calls(fake_hub) == [("HEAD", "resolve", 404), ("GET", "tree", 200)]
+
+
+@pytest.mark.parametrize("path", ["train", "train/"])
+def test_string_prefix_sibling_adds_no_listing_pages(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    # 'train_full/' and 'train.parquet' start with the string 'train'. They
+    # are not part of the directory 'train/' and must not be listed with it.
+    fake_hub.put_parquet(fake_bucket, "train/a.parquet", _numbered_frame(0, 5))
+    fake_hub.put_parquet(fake_bucket, "train/b.parquet", _numbered_frame(5, 5))
+    fake_hub.put_parquet(fake_bucket, "train.parquet", _numbered_frame(90, 1))
+    for i in range(40):
+        frame = _numbered_frame(100 + i, 1)
+        fake_hub.put_parquet(fake_bucket, f"train_full/{i}.parquet", frame)
+    fake_hub.tree_page_size = 10
+
+    got = plhf.scan_bucket(_uri(fake_bucket, path)).collect()
+
+    assert_frame_equal(got.sort("id"), _numbered_frame(0, 10))
+    listings = fake_hub.matching(origin=HUB, method="GET")
+    assert len(listings) == 1
+    assert listings[0].path.endswith("/tree/train/")
+    assert listings[0].query == "recursive=true"
+
+
+def test_invalid_glob_makes_no_request(fake_hub: FakeHub, fake_bucket: str) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+
+    with pytest.raises(ValueError, match="must be a whole path segment"):
+        plhf.scan_bucket(_uri(fake_bucket, "data/**.parquet"))
+
+    assert fake_hub.matching(origin=HUB) == []
 
 
 def test_directory_named_like_a_file_costs_one_extra_resolve(
@@ -601,8 +662,10 @@ def test_empty_file_in_directory_is_rejected(
         plhf.scan_bucket(_uri(fake_bucket, "data"))
 
     assert _uri(fake_bucket, "data/empty.parquet") in str(error.value)
-    # Found in the listing: no resolve request was spent on it.
-    assert fake_hub.matching(origin=HUB, method="HEAD") == []
+    # Found in the listing: no resolve request was spent on a file. (The one
+    # HEAD is the try of "data" as a file.)
+    heads = fake_hub.matching(origin=HUB, method="HEAD")
+    assert [request.status for request in heads] == [404]
 
 
 def test_file_served_without_redirect_is_rejected(

@@ -1,4 +1,8 @@
-"""Unit tests for ``_list_files``: which listed files a path names (no network)."""
+"""Unit tests for ``_list_files``: the files a directory or a glob names (no network).
+
+A path without glob characters is listed as a directory here; ``scan_bucket``
+asks the Hub for an exact file first (see ``test_offline_read.py``).
+"""
 
 from __future__ import annotations
 
@@ -64,14 +68,16 @@ def _files(*paths: str) -> list[_Entry]:
 
 def _list(api: _StubApi, path: str) -> list[str]:
     uri = f"hf://buckets/ns/name/{path}" if path else "hf://buckets/ns/name"
-    return _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
+    files = _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
+    return [file.path for file in files]
 
 
 def test_one_recursive_listing_with_the_path_as_prefix() -> None:
     api = _StubApi(_files("data/a.parquet", "data/sub/b.parquet"))
 
     assert _list(api, "data") == ["data/a.parquet", "data/sub/b.parquet"]
-    assert api.calls == [("ns/name", "data", True)]
+    # The trailing slash keeps string-prefix siblings out of the listing.
+    assert api.calls == [("ns/name", "data/", True)]
 
 
 def test_whole_bucket_lists_without_prefix() -> None:
@@ -147,6 +153,8 @@ def test_double_star_inside_a_segment_is_rejected(pattern: str) -> None:
 
     with pytest.raises(ValueError, match="must be a whole path segment"):
         _list(api, pattern)
+    # The pattern is checked before any request.
+    assert api.calls == []
 
 
 def test_directory_entries_are_never_selected() -> None:
@@ -156,22 +164,30 @@ def test_directory_entries_are_never_selected() -> None:
     assert _list(api, "i/*") == ["i/a.parquet"]
 
 
-def test_exact_file_wins_whatever_its_extension() -> None:
+def test_entries_keep_size_and_hash() -> None:
+    api = _StubApi([_Entry("data/a.parquet", size=123)])
+    uri = "hf://buckets/ns/name/data"
+
+    files = _list_files(api, parse_bucket_uri(uri), uri, _Budget("ns/name"))
+
+    assert [(file.path, file.size) for file in files] == [("data/a.parquet", 123)]
+
+
+@pytest.mark.parametrize("path", ["data", "data/"])
+def test_directory_reading_ignores_a_file_of_the_same_name(path: str) -> None:
     api = _StubApi(_files("data", "data/a.parquet", "data.parquet"))
 
-    assert _list(api, "data") == ["data"]
-
-
-def test_trailing_slash_forces_the_directory_reading() -> None:
-    api = _StubApi(_files("data", "data/a.parquet", "data.parquet"))
-
-    assert _list(api, "data/") == ["data/a.parquet"]
+    assert _list(api, path) == ["data/a.parquet"]
+    assert api.calls == [("ns/name", "data/", True)]
 
 
 def test_directory_excludes_string_prefix_siblings() -> None:
     api = _StubApi(_files("data/a.parquet", "data.parquet", "data2/b.parquet"))
 
     assert _list(api, "data") == ["data/a.parquet"]
+    # The siblings are not even listed.
+    listed = api.list_bucket_tree("ns/name", "data/", recursive=True)
+    assert [entry.path for entry in listed] == ["data/a.parquet"]
 
 
 @pytest.mark.parametrize("name", ["b.pq", "c.PARQUET", "d.Pq", "e.parquet"])
@@ -193,15 +209,16 @@ def test_literal_file_with_glob_characters_wins_over_the_glob() -> None:
     assert _list(api, "g/data[1].parquet") == ["g/data[1].parquet"]
 
 
-def test_literal_directory_with_glob_characters_wins_over_the_glob() -> None:
-    api = _StubApi(_files("run[1]/a.parquet", "run[1]/sub/c.pq", "run1/b.parquet"))
+def test_glob_path_is_never_read_as_a_directory() -> None:
+    # 'run[1]' is a glob: it does not select the files of a directory with
+    # that literal name.
+    api = _StubApi(_files("run[1]/a.parquet", "run1"))
 
-    assert _list(api, "run[1]") == ["run[1]/a.parquet", "run[1]/sub/c.pq"]
-    # The directory is found in the listing of its parent, then listed.
-    assert api.calls == [("ns/name", None, False), ("ns/name", "run[1]", True)]
+    assert _list(api, "run[1]") == ["run1"]
+    assert api.calls == [("ns/name", None, False)]
 
 
-def test_glob_is_used_when_no_literal_file_or_directory_exists() -> None:
+def test_glob_is_used_when_no_literal_file_exists() -> None:
     api = _StubApi(_files("g/data1.parquet", "g/data2.parquet"))
 
     assert _list(api, "g/data[1].parquet") == ["g/data1.parquet"]
@@ -222,7 +239,7 @@ def test_no_matches_raises_file_not_found(path: str) -> None:
     assert "hf://buckets/ns/name" in str(error.value)
 
 
-@pytest.mark.parametrize("path", ["d", "d/*.parquet", "d/empty.parquet"])
+@pytest.mark.parametrize("path", ["d", "d/", "d/*.parquet", "d/empty.parq*"])
 def test_empty_file_is_rejected_by_name(path: str) -> None:
     api = _StubApi([_Entry("d/a.parquet"), _Entry("d/empty.parquet", size=0)])
 

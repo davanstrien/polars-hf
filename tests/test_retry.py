@@ -71,9 +71,9 @@ def _answers(*responses):
 
 def test_constants_patched_by_the_test_fixtures_exist() -> None:
     # conftest patches these names with raising=False.
-    for name in (*RETRY_BACKOFF_CONSTANTS, "_MAX_WAIT_PER_RETRY", "_SCAN_DEADLINE"):
+    for name in (*RETRY_BACKOFF_CONSTANTS, "_SCAN_DEADLINE"):
         assert isinstance(getattr(read, name), float), name
-    assert read._RETRY_MAX_BACKOFF <= read._MAX_WAIT_PER_RETRY < read._SCAN_DEADLINE
+    assert read._RETRY_MAX_BACKOFF < read._SCAN_DEADLINE
 
 
 def test_backoff_without_server_hint_doubles_to_the_maximum(clock: FakeClock) -> None:
@@ -97,6 +97,7 @@ def test_retry_after_is_honoured(clock: FakeClock, status: int) -> None:
     assert len(seen) == 2
 
 
+@pytest.mark.filterwarnings("ignore:scan_bucket. Hub rate limit:UserWarning")
 def test_rate_limit_reset_is_honoured(clock: FakeClock) -> None:
     handler, seen = _answers(Response(429, headers=_rate_limited(7)))
 
@@ -140,26 +141,56 @@ def test_negative_retry_after_is_no_wait(clock: FakeClock) -> None:
     assert clock.waits == [0.0]
 
 
-def test_rate_limit_reset_above_the_cap_raises_without_waiting(
-    clock: FakeClock,
-) -> None:
+def test_long_rate_limit_reset_is_waited_for_with_a_warning(clock: FakeClock) -> None:
+    # "Reset in 300 s" fits in the 600 s of one call: wait, and say so.
+    handler, seen = _answers(Response(429, headers=_rate_limited(300)))
+
+    with hub_session(handler):
+        with pytest.warns(UserWarning, match="waiting 301 s") as caught:
+            assert _resolve() == SIGNED
+
+    assert clock.waits == [301.0]
+    assert len(seen) == 2
+    assert "rate limit" in str(caught[0].message)
+    assert "'ns/name'" in str(caught[0].message)
+
+
+def test_short_wait_gives_no_warning(clock: FakeClock) -> None:
+    import warnings
+
+    handler, _ = _answers(Response(429, headers=_rate_limited(3)))
+
+    with hub_session(handler):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert _resolve() == SIGNED
+
+    assert clock.waits == [4.0]
+
+
+def test_second_long_reset_passes_the_deadline_and_raises(clock: FakeClock) -> None:
     handler, seen = _answers(*[Response(429, headers=_rate_limited(300))] * 10)
 
     with hub_session(handler):
-        with pytest.raises(HfHubHTTPError) as error:
-            _resolve()
+        with pytest.warns(UserWarning, match="waiting 301 s"):
+            with pytest.raises(HfHubHTTPError) as error:
+                _resolve()
 
-    assert clock.waits == []
-    assert len(seen) == 1
+    # One wait of 301 s fits in 600 s; the second one does not.
+    assert clock.waits == [301.0]
+    assert len(seen) == 2
     message = str(error.value)
     assert "rate limit for resolve requests was reached" in message
     assert "5000 requests per 300 s" in message
     assert "'ns/name'" in message
-    assert "wait 301 s" in message and "60 s per retry" in message
+    assert "the Hub asks to wait 301 s" in message
+    assert "only 299 s are left of the 600 s" in message
     assert error.value.response.status_code == 429
 
 
-def test_retry_after_above_the_cap_raises_without_waiting(clock: FakeClock) -> None:
+def test_wait_longer_than_the_deadline_raises_without_waiting(
+    clock: FakeClock,
+) -> None:
     # huggingface_hub 2.0 sleeps for the full Retry-After of any status.
     handler, seen = _answers(Response(503, headers={"retry-after": "86400"}))
 
@@ -169,18 +200,12 @@ def test_retry_after_above_the_cap_raises_without_waiting(clock: FakeClock) -> N
 
     assert clock.waits == []
     assert len(seen) == 1
-    assert "HTTP 503 to a resolve request" in str(error.value)
-    assert "'ns/name'" in str(error.value)
+    message = str(error.value)
+    assert "HTTP 503 to a resolve request" in message
+    assert "'ns/name'" in message
+    assert "the Hub asks to wait 86400 s" in message
+    assert "600 s allowed for one scan_bucket call" in message
     assert error.value.response.status_code == 503
-
-
-def test_wait_at_the_cap_is_allowed(clock: FakeClock) -> None:
-    handler, _ = _answers(Response(429, headers=_rate_limited(59)))
-
-    with hub_session(handler):
-        assert _resolve() == SIGNED
-
-    assert clock.waits == [60.0]
 
 
 def test_waits_stop_at_the_deadline_of_the_call(
@@ -190,18 +215,33 @@ def test_waits_stop_at_the_deadline_of_the_call(
     handler, seen = _answers(*[Response(429, headers=_rate_limited(39))] * 10)
 
     with hub_session(handler):
-        with pytest.raises(HfHubHTTPError) as error:
-            _resolve()
+        with pytest.warns(UserWarning, match="waiting 40 s"):
+            with pytest.raises(HfHubHTTPError) as error:
+                _resolve()
 
     # Two waits of 40 s fit in 100 s; a third one does not.
     assert clock.waits == [40.0, 40.0]
     assert len(seen) == 3
-    assert "limit of 100 s for one scan_bucket call" in str(error.value)
+    assert "only 20 s are left of the 100 s" in str(error.value)
     assert "rate limit for resolve requests was reached" in str(error.value)
 
 
+def test_backoff_stops_at_the_deadline_of_the_call(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(read, "_SCAN_DEADLINE", 5.0)
+    handler, seen = _answers(*[Response(503)] * 10)
+
+    with hub_session(handler):
+        with pytest.raises(HfHubHTTPError) as error:
+            _resolve()
+
+    assert clock.waits == [1.0, 2.0]
+    assert "the next retry is in 4 s, but only 2 s are left" in str(error.value)
+
+
+@pytest.mark.filterwarnings("ignore:scan_bucket. Hub rate limit:UserWarning")
 def test_total_wait_of_one_call_is_bounded(clock: FakeClock) -> None:
-    # Every answer asks for the longest wait that is allowed.
     handler, seen = _answers(*[Response(429, headers=_rate_limited(59))] * 100)
 
     with hub_session(handler):
@@ -214,15 +254,15 @@ def test_total_wait_of_one_call_is_bounded(clock: FakeClock) -> None:
 
 def test_deadline_is_shared_by_the_requests_of_one_call(clock: FakeClock) -> None:
     budget = _Budget("ns/name")
-    handler, _ = _answers(Response(503, headers={"retry-after": "50"}))
+    handler, _ = _answers(Response(503, headers={"retry-after": "5"}))
     with hub_session(handler):
         _signed_url(RESOLVE, {}, uri=URI, budget=budget)
     # Time passes in the same call (other files, the listing).
     clock.now += read._SCAN_DEADLINE - 60
 
-    handler, seen = _answers(Response(503, headers={"retry-after": "50"}))
+    handler, seen = _answers(Response(503, headers={"retry-after": "58"}))
     with hub_session(handler):
-        with pytest.raises(HfHubHTTPError, match="for one scan_bucket call"):
+        with pytest.raises(HfHubHTTPError, match="only 55 s are left"):
             _signed_url(RESOLVE, {}, uri=URI, budget=budget)
     assert len(seen) == 1
 
@@ -247,11 +287,11 @@ def test_rate_limited_scan_reports_the_files_resolved(
     for i in range(n_files):
         _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
     fake_hub.add_fault(
-        HUB, "HEAD", r"/resolve/data/p3\.parquet$", 429, headers=_rate_limited(300)
+        HUB, "HEAD", r"/resolve/data/p3\.parquet$", 429, headers=_rate_limited(900)
     )
 
     with pytest.raises(HfHubHTTPError) as error:
-        plhf.scan_bucket(_uri(fake_bucket, "data"))
+        plhf.scan_bucket(_uri(fake_bucket, "data/"))
 
     message = str(error.value)
     assert "rate limit for resolve requests was reached" in message
@@ -266,9 +306,9 @@ def test_listing_is_retried(
     fake_hub: FakeHub, fake_bucket: str, clock: FakeClock, status: int
 ) -> None:
     _put(fake_hub, fake_bucket, "data/a.parquet")
-    fake_hub.add_fault(HUB, "GET", r"/tree/data$", status, times=2)
+    fake_hub.add_fault(HUB, "GET", r"/tree/data/$", status, times=2)
 
-    plhf.scan_bucket(_uri(fake_bucket, "data"))
+    plhf.scan_bucket(_uri(fake_bucket, "data/"))
 
     listings = fake_hub.matching(origin=HUB, method="GET")
     assert [request.status for request in listings] == [status, status, 200]
@@ -280,10 +320,10 @@ def test_rate_limited_listing_raises_without_waiting(
     fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
 ) -> None:
     _put(fake_hub, fake_bucket, "data/a.parquet")
-    fake_hub.add_fault(HUB, "GET", r"/tree/data$", 429, headers=_rate_limited(300))
+    fake_hub.add_fault(HUB, "GET", r"/tree/data/$", 429, headers=_rate_limited(900))
 
     with pytest.raises(HfHubHTTPError) as error:
-        plhf.scan_bucket(_uri(fake_bucket, "data"))
+        plhf.scan_bucket(_uri(fake_bucket, "data/"))
 
     assert "rate limit for listing requests was reached" in str(error.value)
     assert f"'{fake_bucket}'" in str(error.value)
@@ -295,10 +335,10 @@ def test_listing_retries_are_bounded(
     fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
 ) -> None:
     _put(fake_hub, fake_bucket, "data/a.parquet")
-    fake_hub.add_fault(HUB, "GET", r"/tree/data$", 503, times=100)
+    fake_hub.add_fault(HUB, "GET", r"/tree/data/$", 503, times=100)
 
     with pytest.raises(HfHubHTTPError) as error:
-        plhf.scan_bucket(_uri(fake_bucket, "data"))
+        plhf.scan_bucket(_uri(fake_bucket, "data/"))
 
     assert error.value.response.status_code == 503
     assert len(fake_hub.matching(origin=HUB)) == read._MAX_RETRIES + 1

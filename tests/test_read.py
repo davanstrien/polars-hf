@@ -182,11 +182,29 @@ def test_literal_bracket_file_name(edge_bucket: str) -> None:
     ]
 
 
-def test_literal_bracket_directory_name(edge_bucket: str) -> None:
-    # Found as a directory entry in the (non-recursive) listing of "edge".
-    assert _paths_read(edge_bucket, "edge/run[1]") == ["edge/run[1]/sub/x.parquet"]
+def test_glob_over_directory_names(edge_bucket: str) -> None:
+    # "run[0-9]" matches the directory "run1", not the one named "run[1]".
     assert _paths_read(edge_bucket, "edge/run[0-9]/*.parquet") == [
         "edge/run1/y.parquet"
+    ]
+    assert _paths_read(edge_bucket, "edge/run[[]1]/**/*.parquet") == [
+        "edge/run[1]/sub/x.parquet"
+    ]
+
+
+def test_directory_listing_has_no_prefix_siblings(
+    edge_bucket: str, staging_api: HfApi
+) -> None:
+    # What scan_bucket relies on: a listing with a trailing-slash prefix
+    # returns the files of that directory only.
+    listed = staging_api.list_bucket_tree(
+        edge_bucket, prefix="edge/data/", recursive=True
+    )
+    assert sorted(entry.path for entry in listed) == [
+        "edge/data/C.PARQUET",
+        "edge/data/a.parquet",
+        "edge/data/notes.txt",
+        "edge/data/sub/b.pq",
     ]
 
 
