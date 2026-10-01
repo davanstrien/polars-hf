@@ -347,3 +347,31 @@ def test_default_sink_round_trip(staging_bucket: str) -> None:
     sink_default(df, base, partition_by="g")
 
     assert_frame_equal(plhf.scan_bucket(base).collect().sort("n"), df)
+
+
+@both_sinks
+def test_keyboard_interrupt_leaves_destination_unchanged(
+    staging_api: HfApi, staging_bucket: str, sink
+) -> None:
+    # Deterministic: the interrupt is raised by the query itself, after some
+    # row groups were written (Polars re-raises it unchanged).
+    def interrupt(batch: pl.DataFrame) -> pl.DataFrame:
+        if batch["n"].max() >= 150_000:
+            raise KeyboardInterrupt
+        return batch
+
+    uri = _uri(staging_bucket, "keep/data.parquet")
+    sink(pl.DataFrame({"n": range(1000)}), uri)
+    files_before = _files(staging_api, staging_bucket)
+    interrupted = pl.LazyFrame({"n": range(200_000)}).map_batches(
+        interrupt, streamable=True
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        sink(interrupted, uri, row_group_size=10_000)
+
+    assert _files(staging_api, staging_bucket) == files_before
+    # The xet backend aborted the process-wide Xet session; the next write
+    # gets a new one.
+    sink(pl.DataFrame({"n": [1]}), _uri(staging_bucket, "after.parquet"))
+    assert "after.parquet" in _files(staging_api, staging_bucket)
