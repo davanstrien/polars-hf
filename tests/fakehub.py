@@ -15,6 +15,11 @@ Every request is recorded (:attr:`FakeHub.requests`) and faults can be scripted
 per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
 bytes transferred and error handling without any network access.
 
+A presigned URL carries the number of the signing period it was made in
+(``X-Fake-Period``). :meth:`FakeHub.expire_signed_urls` starts a new period:
+the cdn server then answers 403 to every URL made before, like the real one
+does after the hour that a URL is valid.
+
 File data does not go over HTTP: the real client uploads to Xet storage with
 a native extension. :meth:`FakeHub.patch_uploads` adds one seam per sink
 backend of ``sink_bucket``:
@@ -297,6 +302,7 @@ class FakeHub:
         self.before_batch = None
         self._counters: dict[str, int] = {}
         self.tree_page_size: int | None = None
+        self._signing_period = 0
         self._buckets: dict[str, dict[str, bytes]] = {}
         # sha256 -> content, for every object ever stored (the "CAS").
         self._blobs: dict[str, bytes] = {}
@@ -385,6 +391,11 @@ class FakeHub:
     def read(self, bucket_id: str, path: str) -> bytes:
         with self._lock:
             return self._buckets[bucket_id][path]
+
+    def expire_signed_urls(self) -> None:
+        """Make the cdn server refuse (403) every presigned URL made so far."""
+        with self._lock:
+            self._signing_period += 1
 
     # ---- request log -------------------------------------------------------
 
@@ -738,9 +749,12 @@ class FakeHub:
             if data is None:
                 return _error_reply(404, "EntryNotFound", "File not found")
             digest = _content_hash(data)
+            with self._lock:
+                period = self._signing_period
             location = (
                 f"{self.cdn_endpoint}/xet-bridge-us/{digest}"
-                f"?X-Amz-Expires=3600&X-Amz-Signature={SIGNATURE}"
+                f"?X-Amz-Expires=3600&X-Fake-Period={period}"
+                f"&X-Amz-Signature={SIGNATURE}"
             )
             headers = {
                 "Location": location,
@@ -769,6 +783,12 @@ class FakeHub:
         signature = parse_qs(query).get("X-Amz-Signature", [""])[0]
         if signature != SIGNATURE:
             return _Reply(401, {"Content-Type": "text/plain"}, b"Unauthorized")
+        # A URL without a period (built by a test) does not expire.
+        period = parse_qs(query).get("X-Fake-Period", [None])[0]
+        with self._lock:
+            current = self._signing_period
+        if period is not None and int(period) < current:
+            return _Reply(403, {"Content-Type": "text/plain"}, b"Request has expired")
         if len(parts) != 2 or parts[0] != "xet-bridge-us":
             return _Reply(404, {"Content-Type": "text/plain"}, b"Not Found")
 
