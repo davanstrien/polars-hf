@@ -89,7 +89,9 @@ plhf.sink_bucket(lf, "hf://buckets/ns/name/out.parquet")
 plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year")
 plhf.sink_bucket(lf, "hf://buckets/ns/name/shards", max_rows_per_file=1_000_000)
 
-# Replace the content of a prefix: files this call does not write are deleted.
+# A destination that exists is an error by default. To write there again, say how:
+plhf.sink_bucket(lf, "hf://buckets/ns/name/out.parquet", mode="overwrite")   # replace the file
+plhf.sink_bucket(more, "hf://buckets/ns/name/by_year", partition_by="year", mode="append")
 plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year", mode="overwrite")
 ```
 
@@ -102,17 +104,28 @@ returns (`lazy=True` is rejected). Partitioned writes split by key, by size, or 
 `key=value/` directories and files `00000000.parquet`, `00000001.parquet`, ... (the index is
 hexadecimal; the extension is `.parquet`, `.csv`, `.ipc` or `.jsonl`). Key values are
 percent-encoded like Polars does (`/`, `=`, `%`, `:`, space, control characters and non-ASCII
-bytes), and a null key is `__HIVE_DEFAULT_PARTITION__`. A partitioned write whose query returns
-no rows writes one file with the schema and no rows, `{prefix}/00000000.{extension}`, so the prefix
-can be scanned afterwards.
+bytes), and a null key is `__HIVE_DEFAULT_PARTITION__`. With `mode="append"` every file name also
+carries a token that is unique to the call: `00000000-1f0c9a52b7e3.parquet` (12 random hex
+characters, the same for all files of one call). A partitioned write whose query returns no rows
+writes one file with the schema and no rows, `{prefix}/00000000.{extension}` (with the token in
+`mode="append"`), so the prefix can be scanned afterwards.
 
-**`mode`** sets what happens to objects that are already at the destination:
+**`mode`** sets what happens if the destination exists. A single-file destination exists if there
+is an object at that path. A partitioned destination exists if there is a file at the base prefix
+itself or anywhere below it.
 
 | `mode` | Single file | Partitioned (base prefix) |
 | --- | --- | --- |
-| `"append"` (default) | the object is replaced | existing files stay; a file with the same name as a new file is replaced |
-| `"overwrite"` | same as `"append"` | as `"append"`, then the files that were below the prefix before the write, and that this call did not write, are deleted |
-| `"error"` | `FileExistsError` if the object exists | `FileExistsError` if a file exists at the prefix itself or anywhere below it |
+| `"error"` (default) | `FileExistsError` if the object exists | `FileExistsError` if the destination exists |
+| `"append"` | not possible: `ValueError` | new files are added with names unique to the call; no existing file is replaced or deleted |
+| `"overwrite"` | the object is replaced | the new files are registered (a file with the same name is replaced), then the files that were below the prefix before the write, and that this call did not write, are deleted |
+
+`"error"` raises before anything is uploaded. Its check is a listing before the write: it does not
+exclude a concurrent writer.
+
+`"append"` never replaces rows: two appends with the same partition keys keep the rows of both,
+because their file names differ by the token. Running the same job twice therefore adds the rows
+twice. A generated name that already exists is an error, not a replace.
 
 `"overwrite"` needs a directory below the bucket root: `hf://buckets/ns/name` and
 `hf://buckets/ns/name/` are refused with a `ValueError`. It lists the prefix before the write and
@@ -120,8 +133,7 @@ deletes only files from that listing, so a file that another writer adds during 
 A query that returns no rows still deletes the previous files and leaves one file with the schema
 and no rows.
 A file that another writer *replaces* during the write is still deleted. A file at the prefix itself
-(`out` as a file when the write goes to `out/...`) is neither listed nor deleted. The check of
-`"error"` is also a listing before the write: it does not exclude a concurrent writer.
+(`out` as a file when the write goes to `out/...`) is neither listed nor deleted.
 
 **Paths.** The Hub refuses a path with a backslash, an empty segment (`a//b`) or a `.` / `..`
 segment. `sink_bucket` also refuses a control character in a path and a path segment of more than
