@@ -3,8 +3,9 @@
 Two local HTTP servers run on different ports, so they are different origins:
 
 * the **hub** server answers the bucket API (``/api/buckets/...``) and the
-  ``/buckets/{id}/resolve/{path}`` redirect, and requires an ``Authorization``
-  header, like the real Hub does for private buckets;
+  ``/buckets/{id}/resolve/{path}`` redirect, and answers 401 unless the
+  ``Authorization`` header carries an accepted token, like the real Hub does
+  for private buckets;
 * the **cdn** server stands in for ``cas-bridge.xethub.hf.co``: it serves the
   "presigned" URLs with HTTP range support and no authentication.
 
@@ -13,10 +14,13 @@ per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
 bytes transferred and error handling without any network access.
 
 Uploads do not go over HTTP: the real client uploads to Xet storage with a
-native extension. :meth:`FakeHub.patch_uploads` replaces
-``HfApi.batch_bucket_files`` with a function that stores the files in the fake
-bucket. Both write paths of ``sink_bucket`` end up there (``HfFileSystem`` in
-``"wb"`` mode commits through the same method when the file is closed).
+native extension. :meth:`FakeHub.patch_uploads` replaces the private
+``HfApi._batch_bucket_files`` (one upload + one ``/batch`` request) with a
+function that stores the files in the fake bucket. The public
+``HfApi.batch_bucket_files`` stays real, so its client-side chunking (1,000
+operations per call) and its non-transactional behaviour are exercised. Both
+write paths of ``sink_bucket`` end up there (``HfFileSystem`` in ``"wb"`` mode
+commits through the same method when the file is closed).
 
 The listing semantics were copied from the Hub CI instance
 (``hub-ci.huggingface.co``) on 2026-10-01:
@@ -29,7 +33,10 @@ The listing semantics were copied from the Hub CI instance
 * ``HEAD /buckets/{id}/resolve/{path}`` answers 302 for a file and 404
   ``EntryNotFound`` for a directory or a missing path;
 * ``HEAD /buckets/{id}/tree/{path}`` (the directory web page) answers 401 to a
-  token.
+  token;
+* a batch on a missing bucket answers 404 ``RepoNotFound``;
+* a batch answers 422 for a destination that is empty, starts or ends with
+  ``/``, contains ``//``, a ``..`` segment or a backslash.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import posixpath
 import re
 import threading
 from dataclasses import dataclass, field
@@ -55,7 +63,7 @@ _RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 class ScriptedUploadError(RuntimeError):
-    """Raised by the patched ``batch_bucket_files`` when told to fail."""
+    """Raised by the patched ``_batch_bucket_files`` when told to fail."""
 
 
 @dataclass(frozen=True)
@@ -67,14 +75,18 @@ class RecordedRequest:
     path: str
     query: str
     range: str | None
-    has_authorization: bool
+    authorization: str | None
     status: int
     body_bytes: int
+
+    @property
+    def has_authorization(self) -> bool:
+        return self.authorization is not None
 
 
 @dataclass
 class BatchCall:
-    """One call to the patched ``HfApi.batch_bucket_files``."""
+    """One call to the patched ``HfApi._batch_bucket_files`` (one chunk)."""
 
     bucket_id: str
     added: dict[str, int]
@@ -116,26 +128,43 @@ def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_valid_destination(path: str) -> bool:
+    """Whether the real Hub accepts ``path`` as a bucket file path."""
+    if path == "" or path.startswith("/") or path.endswith("/"):
+        return False
+    if "//" in path or "\\" in path:
+        return False
+    return ".." not in path.split("/")
+
+
 class FakeHub:
     """In-memory buckets served over two local HTTP origins.
 
     Use as a context manager, or call :meth:`start` and :meth:`stop`.
+
+    Parameters
+    ----------
+    token
+        The token the hub server accepts (``Authorization: Bearer <token>``).
+        More tokens can be added with :meth:`accept_token`.
 
     Attributes
     ----------
     requests
         Every request received, in arrival order.
     batch_calls
-        Every call to the patched ``HfApi.batch_bucket_files``.
+        Every call to the patched ``HfApi._batch_bucket_files``: one per chunk
+        of at most 1,000 operations.
     fail_batch_on_call
-        If set to ``N``, the ``N``-th upload call (1-based) raises
+        If set to ``N``, the ``N``-th of those calls (1-based) raises
         :class:`ScriptedUploadError` and stores nothing.
     before_batch
         Optional callable run at the start of every upload call, before the
         files are read. Tests use it to measure local staging.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, token: str) -> None:
+        self._tokens = {token}
         self.requests: list[RecordedRequest] = []
         self.batch_calls: list[BatchCall] = []
         self.fail_batch_on_call: int | None = None
@@ -187,6 +216,11 @@ class FakeHub:
     def cdn_endpoint(self) -> str:
         """Base URL of the server that serves the presigned URLs."""
         return f"http://127.0.0.1:{self._servers[CDN].server_address[1]}"
+
+    def accept_token(self, token: str) -> None:
+        """Make the hub server accept one more token."""
+        with self._lock:
+            self._tokens.add(token)
 
     # ---- bucket contents ---------------------------------------------------
 
@@ -299,50 +333,88 @@ class FakeHub:
     # ---- uploads -----------------------------------------------------------
 
     def patch_uploads(self, monkeypatch) -> None:
-        """Replace ``HfApi.batch_bucket_files`` with an in-memory upload."""
+        """Replace ``HfApi._batch_bucket_files`` with an in-memory upload."""
         from huggingface_hub import HfApi
 
         hub = self
 
-        def batch_bucket_files(
-            api, bucket_id, *, add=None, copy=None, delete=None, token=None
+        def _batch_bucket_files(
+            api, bucket_id, *, add=None, copy=None, delete=None, token=None, **_
         ) -> None:
-            hub._batch(bucket_id, add or [], copy or [], delete or [])
+            hub._batch(api.endpoint, bucket_id, add or [], copy or [], delete or [])
 
-        monkeypatch.setattr(HfApi, "batch_bucket_files", batch_bucket_files)
+        monkeypatch.setattr(HfApi, "_batch_bucket_files", _batch_bucket_files)
 
-    def _batch(self, bucket_id: str, add: list, copy: list, delete: list) -> None:
+    def _raise_http_error(self, url: str, status: int, message: str) -> None:
+        """Raise what the real client raises for this ``/batch`` response.
+
+        The exception is built directly (not with ``hf_raise_for_status``):
+        the HTTP library behind ``huggingface_hub`` differs between versions.
+        """
+        import httpx
+        from huggingface_hub import errors
+
+        response = httpx.Response(
+            status, json={"error": message}, request=httpx.Request("POST", url)
+        )
+        error_class = errors.HfHubHTTPError
+        if status == 404:
+            # Older clients have no bucket-specific error class.
+            error_class = getattr(errors, "BucketNotFoundError", error_class)
+        raise error_class(f"{status} Client Error: {message}", response=response)
+
+    def _batch(
+        self, endpoint: str, bucket_id: str, add: list, copy: list, delete: list
+    ) -> None:
         if copy:
             raise NotImplementedError("the fake bucket does not implement copy=")
         if self.before_batch is not None:
             self.before_batch()
 
-        call = BatchCall(bucket_id=bucket_id, added={}, deleted=list(delete))
+        # The public method passes tuples and strings; accept the client's
+        # internal operation objects too.
+        additions: list[tuple[object, str]] = []
+        for item in add:
+            if isinstance(item, tuple):
+                additions.append(item)
+            else:
+                additions.append((item.source, item.destination))
+        deletions = [item if isinstance(item, str) else item.path for item in delete]
+
+        call = BatchCall(bucket_id=bucket_id, added={}, deleted=deletions)
         with self._lock:
             self.batch_calls.append(call)
             call_number = len(self.batch_calls)
+            bucket_exists = bucket_id in self._buckets
         if self.fail_batch_on_call == call_number:
             call.failed = True
             raise ScriptedUploadError(f"scripted failure of upload call {call_number}")
 
-        # Read every source before the store changes: a real commit is one
+        url = f"{endpoint}/api/buckets/{bucket_id}/batch"
+        if not bucket_exists:
+            call.failed = True
+            self._raise_http_error(url, 404, "Repository not found")
+        for _, destination in additions:
+            if not _is_valid_destination(destination):
+                call.failed = True
+                self._raise_http_error(url, 422, "Invalid file path")
+
+        # Read every source before the store changes: a real call is one
         # request, sent after all the data is uploaded.
         contents: dict[str, bytes] = {}
-        for source, destination in add:
+        for source, destination in additions:
             if isinstance(source, bytes):
                 contents[destination] = source
             else:
                 contents[destination] = Path(source).read_bytes()
 
         with self._lock:
-            if bucket_id not in self._buckets:
-                raise FileNotFoundError(f"fake bucket not found: {bucket_id!r}")
             bucket = self._buckets[bucket_id]
             for destination, data in contents.items():
                 bucket[destination] = data
                 self._blobs[_content_hash(data)] = data
                 call.added[destination] = len(data)
-            for path in delete:
+            for path in deletions:
                 bucket.pop(path, None)
 
     # ---- hub routes --------------------------------------------------------
@@ -417,11 +489,6 @@ class FakeHub:
                 recursive = flag.lower() in ("true", "1")
                 return _json_reply(self._list_tree(files, prefix, recursive))
 
-            if action == "paths-info" and method == "POST":
-                wanted = json.loads(body or b"{}").get("paths", [])
-                found = [self._file_entry(p, files[p]) for p in wanted if p in files]
-                return _json_reply(found)
-
         if parts[:1] == ["buckets"] and len(parts) >= 5 and parts[3] == "resolve":
             bucket_id = f"{parts[1]}/{parts[2]}"
             file_path = unquote("/".join(parts[4:]))
@@ -437,7 +504,17 @@ class FakeHub:
                 f"{self.cdn_endpoint}/xet-bridge-us/{digest}"
                 f"?X-Amz-Expires=3600&X-Amz-Signature={SIGNATURE}"
             )
-            headers = {"Location": location, "X-Linked-Size": str(len(data))}
+            headers = {
+                "Location": location,
+                "X-Xet-Hash": digest,
+                "X-Linked-Etag": f'"{digest}"',
+                "X-Linked-Size": str(len(data)),
+                "Content-Disposition": (
+                    f'inline; filename="{posixpath.basename(file_path)}"'
+                )
+                .encode("ascii", "replace")
+                .decode(),
+            }
             return _Reply(302, headers)
 
         if parts[:1] == ["buckets"] and len(parts) >= 4 and parts[3] == "tree":
@@ -489,12 +566,14 @@ class FakeHub:
         split = urlsplit(raw_path)
         decoded_path = unquote(split.path)
         range_header = headers.get("Range")
-        has_authorization = headers.get("Authorization") is not None
+        authorization = headers.get("Authorization")
+        with self._lock:
+            accepted = {f"Bearer {token}" for token in self._tokens}
 
         fault = self._take_fault(origin, method, decoded_path)
         if fault is not None:
             reply = _Reply(fault.status, dict(fault.headers), fault.body)
-        elif origin == HUB and not has_authorization:
+        elif origin == HUB and authorization not in accepted:
             reply = _error_reply(401, "Unauthorized", "Invalid username or password.")
         elif origin == HUB:
             reply = self._hub_reply(method, split.path, split.query, body)
@@ -510,7 +589,7 @@ class FakeHub:
             path=decoded_path,
             query=split.query,
             range=range_header,
-            has_authorization=has_authorization,
+            authorization=authorization,
             status=reply.status,
             body_bytes=sent,
         )

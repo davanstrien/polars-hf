@@ -158,6 +158,60 @@ def test_empty_directory_raises_file_not_found(
         plhf.scan_bucket(_uri(fake_bucket, "data"))
 
 
+def test_default_token_is_the_staging_ci_token(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    from conftest import STAGING_TOKEN
+
+    fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
+
+    plhf.scan_bucket(_uri(fake_bucket, "data/one.parquet")).collect()
+
+    sent = {request.authorization for request in fake_hub.matching(origin=HUB)}
+    assert sent == {f"Bearer {STAGING_TOKEN}"}
+
+
+def test_explicit_token_reaches_the_hub(fake_hub: FakeHub, fake_bucket: str) -> None:
+    fake_hub.accept_token("hf_explicit_read_token")
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
+    fake_hub.put_parquet(fake_bucket, "data/b.parquet", _numbered_frame(5, 5))
+
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data"), token="hf_explicit_read_token")
+
+    assert lf.collect().height == 10
+    sent = {request.authorization for request in fake_hub.matching(origin=HUB)}
+    assert sent == {"Bearer hf_explicit_read_token"}
+
+
+def test_unknown_token_is_refused(fake_hub: FakeHub, fake_bucket: str) -> None:
+    fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
+    url = f"{fake_hub.endpoint}/buckets/{fake_bucket}/resolve/data/one.parquet"
+
+    wrong = httpx.head(url, headers={"Authorization": "Bearer hf_wrong"})
+    missing = httpx.head(url)
+
+    assert wrong.status_code == 401
+    assert missing.status_code == 401
+    assert fake_hub.requests[0].authorization == "Bearer hf_wrong"
+    assert fake_hub.requests[1].authorization is None
+
+
+def test_resolve_reply_has_the_xet_headers(fake_hub: FakeHub, fake_bucket: str) -> None:
+    from conftest import STAGING_TOKEN
+
+    size = fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
+    url = f"{fake_hub.endpoint}/buckets/{fake_bucket}/resolve/data/one.parquet"
+
+    reply = httpx.head(url, headers={"Authorization": f"Bearer {STAGING_TOKEN}"})
+
+    xet_hash = reply.headers["X-Xet-Hash"]
+    assert reply.status_code == 302
+    assert reply.headers["X-Linked-Size"] == str(size)
+    assert len(xet_hash) == 64
+    assert reply.headers["X-Linked-Etag"] == '"' + xet_hash + '"'
+    assert reply.headers["Location"].startswith(fake_hub.cdn_endpoint)
+
+
 # ---- scripted faults (current behaviour; the retry tests are in ------------
 # ---- test_known_bugs.py) ---------------------------------------------------
 

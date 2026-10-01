@@ -34,16 +34,28 @@ os.environ["HF_TOKEN"] = STAGING_TOKEN
 os.environ["HF_TOKEN_PATH"] = os.path.join(os.sep, "nonexistent", "polars-hf-tests")
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+# A developer's HF_HUB_OFFLINE=1 would make every Hub call fail before it
+# reaches the fake or staging.
+os.environ["HF_HUB_OFFLINE"] = "0"
+# The fake Hub listens on 127.0.0.1: httpx and the Polars HTTP client must not
+# send those requests to a proxy configured in the environment.
+for _name in ("NO_PROXY", "no_proxy"):
+    _hosts = ["127.0.0.1", "localhost"]
+    if os.environ.get(_name):
+        _hosts.append(os.environ[_name])
+    os.environ[_name] = ",".join(_hosts)
 
 import time  # noqa: E402
 import uuid  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
 from typing import TypeVar  # noqa: E402
 
+import httpx  # noqa: E402
 import polars as pl  # noqa: E402
 import pytest  # noqa: E402
 from fakehub import FakeHub  # noqa: E402
 from huggingface_hub import HfApi, HfFileSystem, constants  # noqa: E402
+from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
 from hypothesis import settings  # noqa: E402
 
 if constants.ENDPOINT != STAGING_ENDPOINT:  # pragma: no cover - safety stop
@@ -53,25 +65,25 @@ if constants.ENDPOINT != STAGING_ENDPOINT:  # pragma: no cover - safety stop
         returncode=3,
     )
 
-# Derandomized: every run executes the same examples, so the suite (and its
-# strict xfail properties) cannot flake. No deadline: the first example of a
-# test pays one-off costs (imports, a new HTTP client).
+# Default profile, derandomized: every run executes the same examples, so the
+# suite (and its strict xfail properties) cannot flake. No deadline: the first
+# example of a test pays one-off costs (imports, a new HTTP client).
+# HYPOTHESIS_PROFILE=random selects new examples on every run (and makes
+# --hypothesis-seed effective); the weekly CI run uses it.
 settings.register_profile("polars-hf", derandomize=True, deadline=None, max_examples=60)
-settings.load_profile("polars-hf")
+settings.register_profile("random", derandomize=False, deadline=None, max_examples=60)
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "polars-hf"))
 
 T = TypeVar("T")
 
-# Same transient-error pattern as huggingface_hub's own staging test runs.
+# Transient staging errors only: HTTP 409/502/503/504 and timeouts. Anything
+# else (a missing file, a read error) can be a real read-after-write bug and
+# must fail the test.
+_STAGING_TRANSIENT_STATUS = (409, 502, 503, 504)
 _STAGING_RERUN_PATTERNS = [
-    "OSError",
-    "FileNotFoundError",
     "Timeout",
-    "HTTPError.*409",
-    "HTTPError.*502",
-    "HTTPError.*503",
-    "HTTPError.*504",
-    "HTTPStatusError.*50[234]",
-    "ComputeError",
+    "HTTPError.*(409|502|503|504)",
+    "HTTPStatusError.*(409|502|503|504)",
 ]
 
 
@@ -102,7 +114,7 @@ def fake_hub(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeHub]:
     test so no instance (and no directory listing cache) leaks between tests.
     Uploads are stored in the fake bucket (see ``FakeHub.patch_uploads``).
     """
-    with FakeHub() as hub:
+    with FakeHub(token=STAGING_TOKEN) as hub:
         hub.create_bucket(FAKE_BUCKET)
         monkeypatch.setattr(constants, "ENDPOINT", hub.endpoint)
         hub.patch_uploads(monkeypatch)
@@ -120,17 +132,25 @@ def fake_bucket(fake_hub: FakeHub) -> str:
 # ---- staging ---------------------------------------------------------------
 
 
+def _is_transient_staging_error(error: Exception) -> bool:
+    if isinstance(error, httpx.TimeoutException):
+        return True
+    if isinstance(error, HfHubHTTPError):
+        return error.response.status_code in _STAGING_TRANSIENT_STATUS
+    return False
+
+
 def _staging_retry(action: Callable[[], T], attempts: int = 4) -> T:
-    """Run ``action``, retrying the transient errors staging is known for."""
-    last_error: Exception | None = None
+    """Run ``action``; retry transient staging errors, raise everything else."""
     for attempt in range(attempts):
         try:
             return action()
-        except Exception as error:  # noqa: BLE001 - re-raised below
-            last_error = error
+        except Exception as error:
+            is_last_attempt = attempt == attempts - 1
+            if is_last_attempt or not _is_transient_staging_error(error):
+                raise
             time.sleep(1 + attempt)
-    assert last_error is not None
-    raise last_error
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _create_staging_bucket(api: HfApi) -> str:
@@ -140,10 +160,8 @@ def _create_staging_bucket(api: HfApi) -> str:
 
 
 def _delete_staging_bucket(api: HfApi, bucket_id: str) -> None:
-    try:
-        _staging_retry(lambda: api.delete_bucket(bucket_id, missing_ok=True))
-    except Exception:  # noqa: BLE001 - staging buckets are disposable
-        pass
+    # missing_ok swallows "not found" only; any other error fails the teardown.
+    _staging_retry(lambda: api.delete_bucket(bucket_id, missing_ok=True))
 
 
 @pytest.fixture(scope="session")
