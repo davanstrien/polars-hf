@@ -8,50 +8,78 @@ on:
 permissions:
   contents: read
 
-env:
-  # Keep every uv invocation (sync + run) on the committed lock; see the
-  # --frozen note below.
-  UV_FROZEN: "1"
-
 jobs:
+  # Lint + offline tests with the committed lock. No network access to the Hub:
+  # the tests run against the local fake in tests/fakehub.py.
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      # --frozen, not --locked: the committed lock embeds settings from a
-      # global uv config (exclude-newer) that CI doesn't have, so a
-      # consistency check would always re-resolve and fail.
-      - run: uv sync --frozen
-      - run: uv run ruff check .
-      - run: uv run pytest -q -m "not network"
+      - run: uv sync --locked
+      - run: uv run --locked ruff check .
+      - run: uv run --locked pytest -q -m "not staging"
 
-  # Live round-trips against the fixture bucket. Runs on pushes to main only:
-  # the tests write to a real bucket, so they don't run for PRs (and would
-  # race each other across a matrix). Without an HF_TOKEN repo secret the
-  # tests skip and the job stays green.
-  network:
-    if: github.event_name == 'push'
+  # Offline tests against the edges of the supported dependency range, on one
+  # Python. These jobs resolve without the lock, so they install with
+  # `uv pip` and run with `--no-sync` (a plain `uv run` would re-sync the
+  # environment back to the lock).
+  dependencies:
+    name: deps (${{ matrix.name }})
     runs-on: ubuntu-latest
-    # The tests write fixed paths in one shared bucket: serialize runs so two
-    # close pushes to main can't race on the same objects.
-    concurrency:
-      group: network-fixture-bucket
-      cancel-in-progress: false
+    # Only the release-candidate job may fail: it tracks an unreleased Polars.
+    continue-on-error: ${{ matrix.allow-failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The lowest version of each direct dependency (polars 1.40.0,
+          # huggingface_hub 1.12.0, httpx 0.27.0). Dev tools stay current.
+          - name: lowest-direct
+            install: uv pip install --resolution lowest-direct -e .
+            allow-failure: false
+          - name: latest
+            install: uv pip install --upgrade -e .
+            allow-failure: false
+          - name: polars-2.0-rc
+            install: uv pip install -e . "polars==2.0.0rc2"
+            allow-failure: true
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           enable-cache: true
-      - run: uv sync --frozen
-      - run: uv run pytest -q -m network
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - run: uv venv
+      - run: ${{ matrix.install }}
+      - run: uv pip install --group dev
+      - run: uv pip list
+      - run: uv run --no-sync pytest -q -m "not staging"
+
+  # Live round-trips against the Hub CI staging instance, on every push and
+  # pull request. Each test creates its own uniquely named bucket and deletes
+  # it, so runs cannot race. The token below is the public token of the
+  # staging CI user (the one huggingface_hub's own test suite uses); it is not
+  # a secret and is not valid on huggingface.co. tests/conftest.py forces the
+  # same endpoint and token, and reruns staging tests on transient errors.
+  staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: hf_HubCITokenXXXXXXXXXXXXXXXXXXXXX
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked pytest -q -m staging
