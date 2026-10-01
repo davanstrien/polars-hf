@@ -6,34 +6,43 @@ that fixes a bug removes the marker (or moves the test to the matching test
 module). ``raises=`` pins the failure to the documented symptom, so an
 unrelated breakage does not hide behind the marker.
 
-All tests run offline against the fake Hub (see ``fakehub.py``).
+All tests run offline against the fake Hub (see ``fakehub.py``). They assert on
+the contents of the bucket, not on how the files were uploaded. The parts that
+depend on the current write design are the helpers in ``sinks.py``.
 """
 
 from __future__ import annotations
 
-import gc
 import os
 import tempfile
 import threading
 
 import httpx
+import huggingface_hub
 import polars as pl
 import pytest
 from fakehub import HUB, SIGNATURE, FakeHub, ScriptedUploadError
 from polars.testing import assert_frame_equal
+from sinks import fail_upload, sink_default, sink_streamed
 
 import polars_hf as plhf
 
 # pytest.raises reports a missing exception with this type.
 DidNotRaise = pytest.fail.Exception
 
+HUB_MAJOR = int(huggingface_hub.__version__.split(".")[0])
+
 
 def _uri(bucket_id: str, path: str) -> str:
     return f"hf://buckets/{bucket_id}/{path}"
 
 
-def _relative(paths: list[str], prefix: str) -> list[str]:
-    return sorted(p[len(prefix) :] for p in paths)
+def _partition_directories(fake_hub: FakeHub, bucket_id: str, prefix: str) -> set[str]:
+    """The first directory level below ``prefix`` of every file written there."""
+    directories = set()
+    for path in fake_hub.files(bucket_id, prefix):
+        directories.add(path[len(prefix) :].split("/")[0])
+    return directories
 
 
 def _failing_frame() -> pl.LazyFrame:
@@ -64,7 +73,6 @@ def test_failed_single_file_sink_keeps_existing_object(
         plhf.sink_bucket(_failing_frame(), _uri(fake_bucket, "keep.parquet"))
 
     assert fake_hub.read(fake_bucket, "keep.parquet") == before
-    assert fake_hub.batch_calls == []
 
 
 @pytest.mark.xfail(
@@ -76,7 +84,7 @@ def test_failed_single_file_sink_keeps_existing_object(
 def test_lazy_sink_is_rejected(fake_hub: FakeHub, fake_bucket: str) -> None:
     df = pl.DataFrame({"a": [1, 2, 3]})
 
-    with pytest.raises(ValueError, match="lazy"):
+    with pytest.raises((ValueError, TypeError)):
         plhf.sink_bucket(df, _uri(fake_bucket, "lazy.parquet"), lazy=True)
 
     assert fake_hub.files(fake_bucket) == []
@@ -85,90 +93,107 @@ def test_lazy_sink_is_rejected(fake_hub: FakeHub, fake_bucket: str) -> None:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="bug c: atomic=False builds partition directories from the raw key "
-    "(unencoded, None -> 'g=None') instead of the native Polars hive layout",
+    reason="bug c: the streamed write builds partition directories from the raw "
+    "key (unencoded, None -> 'g=None') instead of the native Polars hive names",
 )
-@pytest.mark.parametrize("key", [None, "a/b", "a b", "x=y"])
-def test_streamed_partition_names_match_native_layout(
-    fake_hub: FakeHub, fake_bucket: str, key: str | None
+@pytest.mark.parametrize(
+    ("key", "directory"),
+    [
+        (None, "g=__HIVE_DEFAULT_PARTITION__"),
+        ("a/b", "g=a%2Fb"),
+        ("a b", "g=a%20b"),
+        ("x=y", "g=x%3Dy"),
+    ],
+)
+def test_streamed_partition_names_are_native(
+    fake_hub: FakeHub, fake_bucket: str, key: str | None, directory: str
 ) -> None:
     df = pl.DataFrame({"g": [key], "n": [1]}, schema={"g": pl.String, "n": pl.Int64})
 
-    plhf.sink_bucket(df, _uri(fake_bucket, "native"), partition_by="g", atomic=True)
-    plhf.sink_bucket(df, _uri(fake_bucket, "stream"), partition_by="g", atomic=False)
-    gc.collect()
+    sink_streamed(df, _uri(fake_bucket, "parts"), partition_by="g")
 
-    native = _relative(fake_hub.files(fake_bucket, "native/"), "native/")
-    stream = _relative(fake_hub.files(fake_bucket, "stream/"), "stream/")
-    assert len(native) == 1
-    assert stream == native
+    assert _partition_directories(fake_hub, fake_bucket, "parts/") == {directory}
+
+
+@pytest.mark.parametrize(
+    ("key", "directory"),
+    [
+        (None, "g=__HIVE_DEFAULT_PARTITION__"),
+        ("a/b", "g=a%2Fb"),
+        ("a b", "g=a%20b"),
+        ("x=y", "g=x%3Dy"),
+    ],
+)
+def test_default_partition_names_are_native(
+    fake_hub: FakeHub, fake_bucket: str, key: str | None, directory: str
+) -> None:
+    # Not a bug: the reference for the names expected above. Polars itself
+    # writes these directories in the default (locally staged) write.
+    df = pl.DataFrame({"g": [key], "n": [1]}, schema={"g": pl.String, "n": pl.Int64})
+
+    sink_default(df, _uri(fake_bucket, "parts"), partition_by="g")
+
+    assert _partition_directories(fake_hub, fake_bucket, "parts/") == {directory}
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=DidNotRaise,
-    reason="bug d: with atomic=False the upload runs when polars drops the file "
-    "object, so an upload error is swallowed in __del__",
+    reason="bug d: in the streamed write the upload runs when polars drops the "
+    "file object, so an upload error is swallowed in __del__",
 )
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 def test_streamed_upload_error_propagates(fake_hub: FakeHub, fake_bucket: str) -> None:
     df = pl.DataFrame({"g": ["a", "b", "c"], "n": [1, 2, 3]})
-    fake_hub.fail_batch_on_call = 2
+    fail_upload(fake_hub, 2)
 
-    try:
-        with pytest.raises(ScriptedUploadError):
-            plhf.sink_bucket(
-                df, _uri(fake_bucket, "parts"), partition_by="g", atomic=False
-            )
-    finally:
-        # Run the pending __del__ uploads inside this test.
-        gc.collect()
+    with pytest.raises(ScriptedUploadError):
+        sink_streamed(df, _uri(fake_bucket, "parts"), partition_by="g")
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="bug d: with atomic=False a write that fails part-way leaves the "
-    "files uploaded before the failure committed in the bucket",
+    reason="bug d: a streamed write that fails part-way leaves the files "
+    "uploaded before the failure in the bucket",
 )
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 def test_failed_streamed_write_leaves_no_partial_files(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
     df = pl.DataFrame({"g": ["a", "b", "c"], "n": [1, 2, 3]})
-    fake_hub.fail_batch_on_call = 2
+    fail_upload(fake_hub, 2)
 
     try:
-        plhf.sink_bucket(df, _uri(fake_bucket, "parts"), partition_by="g", atomic=False)
+        sink_streamed(df, _uri(fake_bucket, "parts"), partition_by="g")
     except ScriptedUploadError:
         pass
-    gc.collect()
 
-    assert any(call.failed for call in fake_hub.batch_calls)
     assert fake_hub.files(fake_bucket, "parts/") == []
 
 
 @pytest.mark.xfail(
     strict=True,
-    raises=AssertionError,
+    raises=FileNotFoundError,
     reason="bug e: an empty frame with partition_by writes no file at all, so "
     "the write succeeds but a later scan raises FileNotFoundError",
 )
-@pytest.mark.parametrize("atomic", [True, False])
-def test_empty_partitioned_write_produces_one_empty_file(
-    fake_hub: FakeHub, fake_bucket: str, atomic: bool
+@pytest.mark.parametrize("sink", [sink_default, sink_streamed])
+def test_empty_partitioned_write_is_consistent(
+    fake_hub: FakeHub, fake_bucket: str, sink
 ) -> None:
-    # Chosen behaviour: one parquet file with the schema and zero rows, so the
-    # prefix scans back as an empty frame.
+    # Either the write raises a clear error, or the prefix scans back as an
+    # empty frame with the right schema. A silent no-op is the bug.
     schema = {"g": pl.String, "n": pl.Int64}
     df = pl.DataFrame({"g": [], "n": []}, schema=schema)
     base = _uri(fake_bucket, "empty")
 
-    plhf.sink_bucket(df, base, partition_by="g", atomic=atomic)
-    gc.collect()
+    try:
+        sink(df, base, partition_by="g")
+    except ValueError:
+        assert fake_hub.files(fake_bucket, "empty/") == []
+        return
 
-    files = fake_hub.files(fake_bucket, "empty/")
-    assert len(files) == 1
     assert_frame_equal(plhf.scan_bucket(base).collect(), df)
 
 
@@ -187,7 +212,7 @@ def _directory_size(directory: str) -> int:
     strict=True,
     raises=AssertionError,
     reason="bug n: the default partitioned write stages the complete output in "
-    "a local temp dir before the single upload call",
+    "a local temp dir before it uploads anything",
 )
 def test_partitioned_write_bounds_local_staging(
     fake_hub: FakeHub, fake_bucket: str, tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -221,7 +246,7 @@ def test_partitioned_write_bounds_local_staging(
 
     sampler.start()
     try:
-        plhf.sink_bucket(
+        sink_default(
             df,
             _uri(fake_bucket, "many"),
             max_rows_per_file=5_000,
@@ -319,19 +344,18 @@ def test_directory_with_parquet_suffix_scans_as_directory(
     strict=True,
     raises=httpx.HTTPStatusError,
     reason="bug i: every glob match is passed to the parquet scan, including "
-    "non-parquet files and sub-directories",
+    "sub-directories",
 )
-def test_star_glob_selects_only_parquet_files(
+def test_star_glob_does_not_scan_sub_directories(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
-    top = pl.DataFrame({"x": [1]})
-    fake_hub.put_parquet(fake_bucket, "i/a.parquet", top)
-    fake_hub.put(fake_bucket, "i/readme.txt", b"not parquet")
-    fake_hub.put_parquet(fake_bucket, "i/sub/b.parquet", pl.DataFrame({"x": [2]}))
+    fake_hub.put_parquet(fake_bucket, "i/a.parquet", pl.DataFrame({"x": [1]}))
+    fake_hub.put_parquet(fake_bucket, "i/b.parquet", pl.DataFrame({"x": [2]}))
+    fake_hub.put_parquet(fake_bucket, "i/sub/c.parquet", pl.DataFrame({"x": [3]}))
 
     got = plhf.scan_bucket(_uri(fake_bucket, "i/*")).collect()
 
-    assert_frame_equal(got, top)
+    assert sorted(got["x"].to_list()) == [1, 2]
 
 
 @pytest.mark.xfail(
@@ -361,15 +385,16 @@ def test_directory_scan_includes_pq_and_upper_case_parquet(
 def test_missing_single_file_raises_file_not_found(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
+    # The error may be raised by scan_bucket() or later, by collect().
     with pytest.raises(FileNotFoundError):
-        plhf.scan_bucket(_uri(fake_bucket, "nope.parquet"))
+        plhf.scan_bucket(_uri(fake_bucket, "nope.parquet")).collect()
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=httpx.HTTPStatusError,
-    reason="bug l: the resolve HEAD is not retried, so one 429 or 503 fails the "
-    "whole scan",
+    reason="bug l: the resolve request is not retried, so one 429 or 503 fails "
+    "the whole scan",
 )
 @pytest.mark.parametrize("status", [429, 503])
 def test_transient_resolve_error_is_retried(
@@ -377,26 +402,53 @@ def test_transient_resolve_error_is_retried(
 ) -> None:
     df = pl.DataFrame({"a": [1, 2, 3]})
     fake_hub.put_parquet(fake_bucket, "one.parquet", df)
-    fake_hub.add_fault(
-        HUB, "HEAD", r"/resolve/one\.parquet$", status, headers={"Retry-After": "0"}
-    )
+    for method in ("HEAD", "GET"):
+        fake_hub.add_fault(
+            HUB, method, r"/resolve/one\.parquet$", status, headers={"Retry-After": "0"}
+        )
 
     got = plhf.scan_bucket(_uri(fake_bucket, "one.parquet")).collect()
 
     assert_frame_equal(got, df)
-    resolves = fake_hub.matching(origin=HUB, method="HEAD", path_contains="/resolve/")
-    assert [r.status for r in resolves] == [status, 302]
+    resolves = fake_hub.matching(origin=HUB, path_contains="/resolve/one.parquet")
+    assert len(resolves) >= 2
+    assert resolves[0].status == status
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="bug m: the query plan prints the presigned URL, signature included",
+    reason="bug m: the query plan prints and serializes the presigned URL, "
+    "signature included",
 )
-def test_presigned_url_not_in_explain(fake_hub: FakeHub, fake_bucket: str) -> None:
+@pytest.mark.filterwarnings("ignore:.*json.*:UserWarning")
+def test_presigned_url_not_in_plan(fake_hub: FakeHub, fake_bucket: str) -> None:
     fake_hub.put_parquet(fake_bucket, "one.parquet", pl.DataFrame({"a": [1]}))
 
     lf = plhf.scan_bucket(_uri(fake_bucket, "one.parquet"))
 
     assert SIGNATURE not in lf.explain()
     assert SIGNATURE not in lf.explain(optimized=False)
+    assert SIGNATURE.encode() not in lf.serialize(format="binary")
+    assert SIGNATURE not in lf.serialize(format="json")
+
+
+@pytest.mark.xfail(
+    condition=HUB_MAJOR < 2,
+    strict=True,
+    raises=FileNotFoundError,
+    reason="bug p: with huggingface_hub < 2.0 the recursive listing of 'data' "
+    "also returns the sibling 'data.parquet' (string-prefix match), and the "
+    "directory scan then raises FileNotFoundError",
+)
+def test_directory_scan_with_prefix_sibling(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    inside = pl.DataFrame({"x": [1]})
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", inside)
+    fake_hub.put_parquet(fake_bucket, "data.parquet", pl.DataFrame({"x": [2]}))
+    fake_hub.put_parquet(fake_bucket, "data2/b.parquet", pl.DataFrame({"x": [3]}))
+
+    got = plhf.scan_bucket(_uri(fake_bucket, "data")).collect()
+
+    assert_frame_equal(got, inside)

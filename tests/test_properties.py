@@ -7,8 +7,9 @@ for the same reason every time.
 
 from __future__ import annotations
 
-import gc
 import string
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -19,6 +20,7 @@ from hypothesis import HealthCheck, Phase, given, settings
 from hypothesis import strategies as st
 from polars.testing import assert_frame_equal
 from polars.testing.parametric import dataframes
+from sinks import sink_default, sink_streamed
 
 import polars_hf as plhf
 from polars_hf._uri import BucketPath, parse_bucket_uri
@@ -225,11 +227,6 @@ def test_single_file_round_trip(
     assert_frame_equal(back, df)
 
 
-_safe_keys = st.text(
-    alphabet=string.ascii_lowercase + string.digits, min_size=1, max_size=4
-)
-
-
 def _clear(fake_hub: FakeHub, bucket_id: str, prefix: str) -> None:
     from huggingface_hub import HfApi
 
@@ -238,28 +235,63 @@ def _clear(fake_hub: FakeHub, bucket_id: str, prefix: str) -> None:
         HfApi().batch_bucket_files(bucket_id, delete=stale)
 
 
+# Characters that need care in a URL or a file name. Glob characters, "@",
+# "/" and "\\" are left out: they are a glob, a rejected revision (bug f) or a
+# path the Hub rejects.
+_risky_fragments = st.sampled_from(
+    ["a", "Z", "0", " ", "#", "%20", "%", "+", ";", "&", "=", ":", ",", "'", "~"]
+    + ["!", "$", "(", ")", "é", "ü", "日本", "\u2603", ".", "-", "_"]
+)
+_risky_stems = (
+    st.lists(_risky_fragments, min_size=1, max_size=8)
+    .map("".join)
+    .filter(lambda stem: stem.strip(".") != "")
+)
+
+
+@_round_trip_settings
+@given(stem=_risky_stems, directory=_risky_stems)
+def test_risky_file_names_round_trip(
+    fake_hub: FakeHub, fake_bucket: str, stem: str, directory: str
+) -> None:
+    _clear(fake_hub, fake_bucket, "")
+    df = pl.DataFrame({"name": [stem], "n": [len(stem)]})
+    path = f"{directory}/{stem}.parquet"
+    uri = f"hf://buckets/{fake_bucket}/{path}"
+
+    plhf.sink_bucket(df, uri)
+
+    assert fake_hub.files(fake_bucket) == [path]
+    assert_frame_equal(plhf.scan_bucket(uri).collect(), df)
+    # The directory scan finds the same file through the listing.
+    directory_uri = f"hf://buckets/{fake_bucket}/{directory}"
+    assert_frame_equal(plhf.scan_bucket(directory_uri).collect(), df)
+
+
+_safe_keys = st.text(
+    alphabet=string.ascii_lowercase + string.digits, min_size=1, max_size=4
+)
+
+
 # Each example reads several files back, so this property is the slowest one.
 @settings(_round_trip_settings, max_examples=6)
 @given(
     keys=st.lists(_safe_keys, min_size=1, max_size=4),
-    atomic=st.booleans(),
+    sink=st.sampled_from([sink_default, sink_streamed]),
     max_rows=st.sampled_from([None, 1, 3]),
 )
 def test_partitioned_round_trip(
     fake_hub: FakeHub,
     fake_bucket: str,
     keys: list[str],
-    atomic: bool,
+    sink,
     max_rows: int | None,
 ) -> None:
     _clear(fake_hub, fake_bucket, "prop-parts/")
     df = pl.DataFrame({"g": keys, "n": range(len(keys))})
     base = f"hf://buckets/{fake_bucket}/prop-parts"
 
-    plhf.sink_bucket(
-        df, base, partition_by="g", max_rows_per_file=max_rows, atomic=atomic
-    )
-    gc.collect()
+    sink(df, base, partition_by="g", max_rows_per_file=max_rows)
     back = plhf.scan_bucket(base).collect()
 
     assert_frame_equal(back.sort("n"), df)
@@ -269,16 +301,26 @@ def test_partitioned_round_trip(
     assert directories == {f"g={key}" for key in keys}
 
 
+# Printable ASCII without "/" and "\\": the raw key would make a path the Hub
+# rejects (422), which is a different failure from the directory name itself.
+_KEY_ALPHABET = (string.printable.strip() + " ").replace("/", "").replace("\\", "")
 _any_keys = st.one_of(
-    st.none(), st.text(alphabet=string.printable.strip() + " ", min_size=1, max_size=6)
+    st.none(), st.text(alphabet=_KEY_ALPHABET, min_size=1, max_size=6)
 )
+
+
+def _native_partition_directories(df: pl.DataFrame, key: str) -> set[str]:
+    """The directory names Polars itself writes for a hive partition by ``key``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        df.lazy().sink_parquet(pl.PartitionBy(tmp, key=key))
+        return {entry.name for entry in Path(tmp).iterdir()}
 
 
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="bug c: atomic=False does not use the native Polars hive encoding "
-    "for partition directory names",
+    reason="bug c: the streamed write does not use the native Polars hive "
+    "encoding for partition directory names",
 )
 @settings(
     max_examples=40,
@@ -286,22 +328,16 @@ _any_keys = st.one_of(
     suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
 )
 @given(keys=st.lists(_any_keys, min_size=1, max_size=4, unique=True))
-def test_partition_layout_is_the_same_in_both_modes(
+def test_streamed_partition_layout_is_native(
     fake_hub: FakeHub, fake_bucket: str, keys: list[str | None]
 ) -> None:
-    _clear(fake_hub, fake_bucket, "layout-")
+    _clear(fake_hub, fake_bucket, "layout/")
     df = pl.DataFrame(
         {"g": keys, "n": range(len(keys))}, schema={"g": pl.String, "n": pl.Int64}
     )
 
-    plhf.sink_bucket(
-        df, f"hf://buckets/{fake_bucket}/layout-a", partition_by="g", atomic=True
-    )
-    plhf.sink_bucket(
-        df, f"hf://buckets/{fake_bucket}/layout-b", partition_by="g", atomic=False
-    )
-    gc.collect()
+    sink_streamed(df, f"hf://buckets/{fake_bucket}/layout", partition_by="g")
 
-    native = [p[len("layout-a/") :] for p in fake_hub.files(fake_bucket, "layout-a/")]
-    stream = [p[len("layout-b/") :] for p in fake_hub.files(fake_bucket, "layout-b/")]
-    assert sorted(stream) == sorted(native)
+    written = fake_hub.files(fake_bucket, "layout/")
+    directories = {path[len("layout/") :].split("/")[0] for path in written}
+    assert directories == _native_partition_directories(df, "g")
