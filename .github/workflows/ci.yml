@@ -4,15 +4,31 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly: the offline suite with randomized Hypothesis examples, and the
+  # staging suite, so drift in dependencies or in the Hub is seen without a
+  # push.
+  schedule:
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
+
+# A newer run for the same ref supersedes the older one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pushes and pull requests run the derandomized Hypothesis profile (the same
+  # examples every time); the weekly run draws new examples.
+  HYPOTHESIS_PROFILE: ${{ github.event_name == 'schedule' && 'random' || 'polars-hf' }}
 
 jobs:
   # Lint + offline tests with the committed lock. No network access to the Hub:
   # the tests run against the local fake in tests/fakehub.py.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -27,13 +43,14 @@ jobs:
       - run: uv run --locked ruff check .
       - run: uv run --locked pytest -q -m "not staging"
 
-  # Offline tests against the edges of the supported dependency range, on one
-  # Python. These jobs resolve without the lock, so they install with
-  # `uv pip` and run with `--no-sync` (a plain `uv run` would re-sync the
-  # environment back to the lock).
+  # Offline tests against the edges of the supported dependency range. These
+  # jobs resolve without the lock, so they install with `uv pip` and run with
+  # `--no-sync` (a plain `uv run` would re-sync the environment back to the
+  # lock).
   dependencies:
     name: deps (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Only the release-candidate job may fail: it tracks an unreleased Polars.
     continue-on-error: ${{ matrix.allow-failure }}
     strategy:
@@ -41,21 +58,25 @@ jobs:
       matrix:
         include:
           # The lowest version of each direct dependency (polars 1.40.0,
-          # huggingface_hub 1.12.0, httpx 0.27.0). Dev tools stay current.
+          # huggingface_hub 1.12.0, httpx 0.27.0) on the lowest supported
+          # Python. Dev tools stay current.
           - name: lowest-direct
+            python-version: "3.10"
             install: uv pip install --resolution lowest-direct -e .
             allow-failure: false
           - name: latest
+            python-version: "3.12"
             install: uv pip install --upgrade -e .
             allow-failure: false
           - name: polars-2.0-rc
+            python-version: "3.12"
             install: uv pip install -e . "polars==2.0.0rc2"
             allow-failure: true
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv venv
       - run: ${{ matrix.install }}
@@ -64,11 +85,12 @@ jobs:
       - run: uv run --no-sync pytest -q -m "not staging"
 
   # Live round-trips against the Hub CI staging instance, on every push and
-  # pull request. Each test creates its own uniquely named bucket and deletes
-  # it, so runs cannot race. The token below is the public token of the
-  # staging CI user (the one huggingface_hub's own test suite uses); it is not
-  # a secret and is not valid on huggingface.co. tests/conftest.py forces the
-  # same endpoint and token, and reruns staging tests on transient errors.
+  # pull request and in the weekly run. Each test creates its own uniquely
+  # named bucket and deletes it, so runs cannot race. The token below is the
+  # public token of the staging CI user (the one huggingface_hub's own test
+  # suite uses); it is not a secret and is not valid on huggingface.co.
+  # tests/conftest.py forces the same endpoint and token, and reruns staging
+  # tests on HTTP 409/502/503/504 and timeouts.
   staging:
     runs-on: ubuntu-latest
     timeout-minutes: 20
