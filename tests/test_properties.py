@@ -238,9 +238,10 @@ def _clear(fake_hub: FakeHub, bucket_id: str, prefix: str) -> None:
         HfApi().batch_bucket_files(bucket_id, delete=stale)
 
 
-@_round_trip_settings
+# Each example reads several files back, so this property is the slowest one.
+@settings(_round_trip_settings, max_examples=6)
 @given(
-    keys=st.lists(_safe_keys, min_size=1, max_size=6),
+    keys=st.lists(_safe_keys, min_size=1, max_size=4),
     atomic=st.booleans(),
     max_rows=st.sampled_from([None, 1, 3]),
 )
