@@ -132,6 +132,8 @@ _EDGE_FILES = [
     "edge/g/data[1].parquet",
     "edge/g/data1.parquet",
     "edge/out.parquet/part-0.parquet",
+    "edge/run[1]/sub/x.parquet",
+    "edge/run1/y.parquet",
     "edge/table",
     "edge/user@example.com.parquet",
 ]
@@ -177,6 +179,14 @@ def test_literal_bracket_file_name(edge_bucket: str) -> None:
     ]
     assert _paths_read(edge_bucket, "edge/g/data[0-9].parquet") == [
         "edge/g/data1.parquet"
+    ]
+
+
+def test_literal_bracket_directory_name(edge_bucket: str) -> None:
+    # Found as a directory entry in the (non-recursive) listing of "edge".
+    assert _paths_read(edge_bucket, "edge/run[1]") == ["edge/run[1]/sub/x.parquet"]
+    assert _paths_read(edge_bucket, "edge/run[0-9]/*.parquet") == [
+        "edge/run1/y.parquet"
     ]
 
 
