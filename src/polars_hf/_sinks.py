@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import secrets
 import shutil
 import tempfile
 import threading
@@ -228,9 +229,9 @@ def _has_control_character(text: str) -> bool:
 class _Destinations:
     """The bucket paths one partitioned write has handed to Polars."""
 
-    def __init__(self, prefix: str, extension: str) -> None:
+    def __init__(self, prefix: str, spec: PartitionSpec) -> None:
         self.prefix = prefix
-        self.extension = extension
+        self.spec = spec
         self.paths: list[str] = []
         self._seen: set[str] = set()
         self._lock = threading.Lock()
@@ -239,14 +240,19 @@ class _Destinations:
         """Name the file Polars asks for: ``(relative path, bucket path)``.
 
         ``args`` is what Polars passes to a ``file_path_provider``. Raises for
-        a path the bucket would refuse and for a path asked for twice (a
-        second file would replace the first one under the same name).
+        a path the bucket would refuse, for a path asked for twice (a second
+        file would replace the first one under the same name) and for a path
+        that must not be replaced (``spec.existing``).
         """
         relative = partition_file_name(
-            args.partition_keys, args.index_in_partition, self.extension
+            args.partition_keys,
+            args.index_in_partition,
+            self.spec.extension,
+            self.spec.suffix,
         )
         path = join_path(self.prefix, relative)
         validate_destination(path)
+        raise_if_existing(path, self.spec.existing)
         with self._lock:
             if path in self._seen:
                 raise RuntimeError(
@@ -275,15 +281,35 @@ def hive_encode(value: str | None) -> str:
     return "".join(encoded)
 
 
+def new_run_id() -> str:
+    """A random token that marks the files of one ``mode="append"`` call."""
+    return secrets.token_hex(6)
+
+
+def raise_if_existing(path: str, existing: frozenset[str]) -> None:
+    """Refuse a generated name that is already in the bucket (append mode)."""
+    if path in existing:
+        raise FileExistsError(
+            f"the generated file name {path!r} already exists in the bucket; "
+            "mode='append' does not replace files. Run the write again to get "
+            "new names"
+        )
+
+
 def partition_file_name(
-    partition_keys: pl.DataFrame, index_in_partition: int, extension: str
+    partition_keys: pl.DataFrame,
+    index_in_partition: int,
+    extension: str,
+    suffix: str = "",
 ) -> str:
     """The path Polars' own hive provider gives a partition file.
 
     ``partition_keys`` is the one-row frame of the key columns that Polars
     passes to a ``file_path_provider`` (no columns when the sink only splits by
     size). The result is relative to the base prefix, for example
-    ``"g=a%2Fb/00000000.parquet"``.
+    ``"g=a%2Fb/00000000.parquet"``. ``suffix`` goes between the file index and
+    the extension (``"00000000-1f0c9a52b7e3.parquet"``); with the default
+    ``""`` the name equals the native one.
     """
     import polars as pl
 
@@ -292,7 +318,8 @@ def partition_file_name(
         # The same cast Polars applies: booleans become "true"/"false", etc.
         value = partition_keys.get_column(name).cast(pl.String).item()
         directories.append(f"{name}={hive_encode(value)}/")
-    return f"{''.join(directories)}{index_in_partition:08x}.{extension}"
+    file_name = f"{index_in_partition:08x}{suffix}.{extension}"
+    return "".join(directories) + file_name
 
 
 # ---- what a backend is asked to write ---------------------------------------
@@ -306,6 +333,10 @@ class PartitionSpec:
     max_rows_per_file: int | None
     max_bytes_per_file: int | None
     extension: str
+    # Appended to the file index of every file name; "" gives native names.
+    suffix: str = ""
+    # Bucket paths that this write must not replace.
+    existing: frozenset[str] = frozenset()
 
     def partition_by(self, base_path: str, file_path_provider: Any = None) -> Any:
         """Build the ``pl.PartitionBy`` target for this spec."""
@@ -500,7 +531,7 @@ class StagedBackend(SinkBackend):
     def write_partitioned(
         self, run_sink: RunSink, prefix: str, spec: PartitionSpec
     ) -> list[str]:
-        destinations = _Destinations(prefix, spec.extension)
+        destinations = _Destinations(prefix, spec)
         additions = []
 
         def provider(args: Any) -> str:
@@ -783,7 +814,7 @@ class StreamBackend(SinkBackend):
     def write_partitioned(
         self, run_sink: RunSink, prefix: str, spec: PartitionSpec
     ) -> list[str]:
-        destinations = _Destinations(prefix, spec.extension)
+        destinations = _Destinations(prefix, spec)
 
         def write(upload: _XetUpload) -> None:
             def provider(args: Any) -> _StreamWriter:

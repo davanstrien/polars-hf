@@ -8,6 +8,7 @@ installed ``huggingface_hub`` cannot run that backend (see ``sinks.py``).
 from __future__ import annotations
 
 import os
+import re
 import threading
 
 import polars as pl
@@ -92,7 +93,7 @@ def test_failed_sink_leaves_existing_object_byte_identical(
     assert len(bytes_before) > 0
 
     with pytest.raises(RuntimeError, match="scripted sink failure"):
-        sink(_failing_frame(), uri, row_group_size=10_000)
+        sink(_failing_frame(), uri, row_group_size=10_000, mode="overwrite")
 
     assert _files(staging_api, staging_bucket) == files_before
     assert _read_bytes(staging_bucket, "keep/data.parquet") == bytes_before
@@ -159,33 +160,62 @@ def test_overwrite_removes_stale_files(
 
 
 @both_sinks
-def test_append_keeps_existing_files(
+def test_append_twice_keeps_all_rows_and_files(
     staging_api: HfApi, staging_bucket: str, sink
 ) -> None:
-    base = _uri(staging_bucket, "shards")
-    sink(pl.DataFrame({"n": range(400)}), base, max_rows_per_file=100)
+    # The same partition keys in both calls: nothing is replaced.
+    base = _uri(staging_bucket, "parts")
+    first = pl.DataFrame({"g": ["a", "a", "b"], "n": [1, 2, 3]})
+    second = pl.DataFrame({"g": ["a", "b", "b"], "n": [4, 5, 6]})
 
-    sink(pl.DataFrame({"n": range(1000, 1100)}), base, max_rows_per_file=100)
+    sink(first, base, partition_by="g", mode="append")
+    files_first = _files(staging_api, staging_bucket)
+    sink(second, base, partition_by="g", mode="append")
 
-    assert len(_files(staging_api, staging_bucket, "shards/")) == 4
+    files_second = _files(staging_api, staging_bucket)
+    assert len(files_first) == 2
+    assert len(files_second) == 4
+    # Same sizes and xet hashes as before for the files of the first call.
+    for path, info in files_first.items():
+        assert files_second[path] == info
+    for path in files_second:
+        assert re.fullmatch(r"parts/g=[ab]/00000000-[0-9a-f]{12}\.parquet", path)
     back = plhf.scan_bucket(base).collect().sort("n")
-    assert back["n"].to_list() == [*range(100, 400), *range(1000, 1100)]
+    assert_frame_equal(back, pl.concat([first, second]))
 
 
 @both_sinks
-def test_error_mode(staging_api: HfApi, staging_bucket: str, sink) -> None:
+def test_overwrite_replaces_a_single_file(
+    staging_api: HfApi, staging_bucket: str, sink
+) -> None:
+    uri = _uri(staging_bucket, "single/out.parquet")
+    sink(pl.DataFrame({"n": [1, 2, 3]}), uri)
+
+    replacement = pl.DataFrame({"n": [7]})
+    sink(replacement, uri, mode="overwrite")
+
+    assert sorted(_files(staging_api, staging_bucket)) == ["single/out.parquet"]
+    assert_frame_equal(plhf.scan_bucket(uri).collect(), replacement)
+    with pytest.raises(ValueError, match="cannot append to the file"):
+        sink(replacement, uri, mode="append")
+
+
+@both_sinks
+def test_default_mode_is_error(staging_api: HfApi, staging_bucket: str, sink) -> None:
     df = pl.DataFrame({"g": ["a", "b"], "n": [1, 2]})
     file_uri = _uri(staging_bucket, "single/out.parquet")
     base = _uri(staging_bucket, "parts")
 
     # A free destination is written.
-    sink(df, file_uri, mode="error")
-    sink(df, base, partition_by="g", mode="error")
+    sink(df, file_uri)
+    sink(df, base, partition_by="g")
     files_before = _files(staging_api, staging_bucket)
     assert len(files_before) == 3
 
-    with pytest.raises(FileExistsError):
-        sink(df, file_uri, mode="error")
+    with pytest.raises(FileExistsError, match="mode='overwrite'"):
+        sink(df, file_uri)
+    with pytest.raises(FileExistsError, match="mode='append'"):
+        sink(df, base, partition_by="g")
     with pytest.raises(FileExistsError):
         sink(df, base, partition_by="g", mode="error")
 
@@ -368,7 +398,7 @@ def test_keyboard_interrupt_leaves_destination_unchanged(
     )
 
     with pytest.raises(KeyboardInterrupt):
-        sink(interrupted, uri, row_group_size=10_000)
+        sink(interrupted, uri, row_group_size=10_000, mode="overwrite")
 
     assert _files(staging_api, staging_bucket) == files_before
     # The stream backend aborted the process-wide Xet session; the next write

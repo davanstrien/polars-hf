@@ -221,7 +221,7 @@ def test_single_file_round_trip(
     # The fixtures are shared by all examples: each one overwrites the file.
     uri = f"hf://buckets/{fake_bucket}/prop/single.parquet"
 
-    plhf.sink_bucket(df, uri)
+    plhf.sink_bucket(df, uri, mode="overwrite")
     back = plhf.scan_bucket(uri).collect()
 
     assert_frame_equal(back, df)

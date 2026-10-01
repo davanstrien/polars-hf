@@ -109,10 +109,19 @@ def _files_below(backend: _sinks.SinkBackend, prefix: str) -> list[str]:
     return paths
 
 
+_SINGLE_FILE_MODES = "Pass mode='overwrite' to replace it."
+_PREFIX_MODES = (
+    "Pass mode='append' to add files next to the existing ones, or "
+    "mode='overwrite' to replace them."
+)
+
+
 def _raise_if_file_exists(backend: _sinks.SinkBackend, path: str, uri: str) -> None:
     for existing in _files_with_prefix(backend, path):
         if existing == path:
-            raise FileExistsError(f"{uri!r} already exists (mode='error')")
+            raise FileExistsError(
+                f"the destination {uri!r} already exists. {_SINGLE_FILE_MODES}"
+            )
 
 
 def _raise_if_prefix_exists(backend: _sinks.SinkBackend, prefix: str, uri: str) -> None:
@@ -120,13 +129,15 @@ def _raise_if_prefix_exists(backend: _sinks.SinkBackend, prefix: str, uri: str) 
     below = []
     for path in _files_with_prefix(backend, prefix):
         if prefix != "" and path == prefix:
-            raise FileExistsError(f"{uri!r} already exists as a file (mode='error')")
+            raise FileExistsError(
+                f"the destination {uri!r} already exists as a file. {_PREFIX_MODES}"
+            )
         if prefix == "" or path.startswith(prefix + "/"):
             below.append(path)
     if below:
         raise FileExistsError(
-            f"{uri!r} already holds {len(below)} file(s), for example "
-            f"{below[0]!r} (mode='error')"
+            f"the destination {uri!r} already holds {len(below)} file(s), for "
+            f"example {below[0]!r}. {_PREFIX_MODES}"
         )
 
 
@@ -157,7 +168,7 @@ def sink_bucket(
     partition_by: str | list[str] | None = None,
     max_rows_per_file: int | None = None,
     max_bytes_per_file: int | None = None,
-    mode: str = "append",
+    mode: str = "error",
     backend: str | None = None,
     **kwargs: Any,
 ) -> None:
@@ -190,6 +201,7 @@ def sink_bucket(
         locally: ``key=value/`` directories with percent-encoded values and
         ``__HIVE_DEFAULT_PARTITION__`` for a null key, and files named
         ``00000000.parquet``, ``00000001.parquet``, ... (``.jsonl`` for ndjson).
+        With ``mode="append"`` the file names carry a token, see ``mode``.
     max_rows_per_file
         Split each partition further: at most this many rows per file.
     max_bytes_per_file
@@ -197,22 +209,28 @@ def sink_bucket(
         Polars' ``approximate_bytes_per_file``: an estimate made while the
         rows are written, so a file can be larger than the value.
     mode
-        What to do with objects that are already at the destination:
+        What to do if the destination exists:
 
-        * ``"append"`` (default): keep them. An object with the same name as a
-          new file is replaced.
-        * ``"overwrite"``: list the files below the base prefix before the
+        * ``"error"`` (default): raise ``FileExistsError`` before anything is
+          uploaded. A single-file destination exists if there is an object at
+          that path. A partitioned destination exists if there is a file at
+          the base prefix or anywhere below it. The check and the write are
+          separate requests, so a concurrent writer is not excluded.
+        * ``"append"``: partitioned writes only. Add files and never replace
+          or delete an existing one. Every file of the call gets a name with
+          a random token that is unique to the call,
+          ``{index}-{token}.{extension}`` (``00000000-1f0c9a52b7e3.parquet``),
+          in the same ``key=value/`` directories. Two appends with the same
+          keys therefore keep the rows of both. A single file cannot be
+          appended to: ``ValueError``.
+        * ``"overwrite"``: for a single file, replace the object. For a
+          partitioned write, list the files below the base prefix before the
           write; after all new files are registered, delete the listed files
           that this call did not write. A file that another writer adds
           during the write is not deleted. The base prefix must be a
-          directory below the bucket root. A query that returns no rows
-          still deletes the listed files and leaves one file with the schema
-          and no rows. For a single-file write this is the same as
-          ``"append"``.
-        * ``"error"``: raise ``FileExistsError`` before anything is written if
-          the destination file exists or, for a partitioned write, if a file
-          exists at the base prefix or anywhere below it. The check and the
-          write are separate requests, so a concurrent writer is not excluded.
+          directory below the bucket root. A query that returns no rows still
+          deletes the listed files and leaves one file with the schema and no
+          rows.
     backend
         ``"stream"`` streams every output file straight into Xet storage and uses
         no local disk for the output. ``"staged"`` writes the output to a local
@@ -231,12 +249,14 @@ def sink_bucket(
     ------
     ValueError
         For an invalid ``uri``, ``format``, ``mode`` or ``backend``, for
-        ``lazy=True``, for ``mode="overwrite"`` on the bucket root, and for a
+        ``lazy=True``, for ``mode="overwrite"`` on the bucket root, for
+        ``mode="append"`` with a single-file destination, and for a
         destination path the Hub refuses (a backslash, an empty segment, a
         ``.`` or ``..`` segment), including one built from a partition value.
         Such a path is rejected before any file is registered.
     FileExistsError
-        With ``mode="error"``, if the destination exists.
+        With ``mode="error"``, if the destination exists. With
+        ``mode="append"``, if a generated file name exists already.
     BucketRegistrationError
         If the upload or the registration request fails, or if the bucket
         rejects some of the files (see ``failures``). It is a ``RuntimeError``.
@@ -254,8 +274,8 @@ def sink_bucket(
     together.
 
     A partitioned write whose query returns no rows writes one file with the
-    schema and no rows, ``{prefix}/00000000.{extension}``, so the prefix can
-    be scanned afterwards.
+    schema and no rows, ``{prefix}/00000000.{extension}`` (with the token in
+    ``mode="append"``), so the prefix can be scanned afterwards.
 
     Examples
     --------
@@ -263,6 +283,9 @@ def sink_bucket(
     >>> plhf.sink_bucket(lf, "hf://buckets/me/data/out.parquet")  # doctest: +SKIP
     >>> plhf.sink_bucket(  # doctest: +SKIP
     ...     lf, "hf://buckets/me/data/by_year", partition_by="year", mode="overwrite"
+    ... )
+    >>> plhf.sink_bucket(  # doctest: +SKIP
+    ...     more, "hf://buckets/me/data/by_year", partition_by="year", mode="append"
     ... )
     """
     import polars as pl
@@ -298,6 +321,13 @@ def sink_bucket(
                 "(or pass a partition argument)"
             )
         _sinks.validate_destination(bp.path)
+        if mode == "append":
+            raise ValueError(
+                f"mode='append' cannot append to the file {uri!r}. Use "
+                "mode='overwrite' to replace the file, or write to a directory "
+                "with a partition argument (for example max_rows_per_file=) to "
+                "append files"
+            )
         if fmt is None:
             fmt = _infer_format(bp.path)
     if fmt not in _SINK_METHOD:
@@ -314,24 +344,37 @@ def sink_bucket(
 
     if mode == "error":
         _raise_if_prefix_exists(sink, prefix, uri)
-    # Listed before the write: only these files can be deleted afterwards, so
-    # a file that another writer adds in the meantime is kept.
+    # Listed before the write. Overwrite deletes only these files afterwards,
+    # so a file that another writer adds in the meantime is kept. Append must
+    # not replace any of them.
     existing_before = []
-    if mode == "overwrite":
+    if mode in ("overwrite", "append"):
         existing_before = _files_below(sink, prefix)
+
+    suffix = ""
+    protected: frozenset[str] = frozenset()
+    if mode == "append":
+        # Names unique to this call: an append never replaces a file, also
+        # not the files of an earlier call with the same partition keys.
+        suffix = f"-{_sinks.new_run_id()}"
+        protected = frozenset(existing_before)
 
     spec = _sinks.PartitionSpec(
         key=partition_by,
         max_rows_per_file=max_rows_per_file,
         max_bytes_per_file=max_bytes_per_file,
         extension=_sinks.PARTITION_EXTENSION[fmt],
+        suffix=suffix,
+        existing=protected,
     )
     written = sink.write_partitioned(run_sink, prefix, spec)
     if not written:
         # No row, so Polars opened no file. Write the schema alone: the prefix
         # then scans back as an empty frame instead of "no such file".
         empty = pl.LazyFrame(schema=lf.collect_schema())
-        empty_path = _sinks.join_path(prefix, f"00000000.{spec.extension}")
+        empty_name = f"00000000{suffix}.{spec.extension}"
+        empty_path = _sinks.join_path(prefix, empty_name)
+        _sinks.raise_if_existing(empty_path, protected)
         written = sink.write_file(_make_run_sink(empty, fmt, sink_kwargs), empty_path)
 
     if mode == "overwrite":

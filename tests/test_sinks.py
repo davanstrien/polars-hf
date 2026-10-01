@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import tempfile
 
 import huggingface_hub
 import polars as pl
 import pytest
-from hypothesis import given, settings
+from fakehub import FakeHub
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from polars.testing import assert_frame_equal
+from sinks import ALL_SINKS
 
 import polars_hf as plhf
 from polars_hf import _sinks
@@ -246,3 +250,64 @@ def test_partition_file_names_without_a_key() -> None:
 
     assert names == _native_names(df, max_rows_per_file=2)
     assert names == {"00000000.parquet", "00000001.parquet", "00000002.parquet"}
+
+
+# ---- append ----------------------------------------------------------------
+
+_append_keys = st.lists(
+    st.one_of(st.none(), st.sampled_from(["a", "b", "a/b", "x y"])),
+    min_size=0,
+    max_size=6,
+)
+
+
+@settings(
+    max_examples=25,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+)
+@given(
+    first=_append_keys,
+    second=_append_keys,
+    sink=st.sampled_from(ALL_SINKS),
+    max_rows=st.sampled_from([None, 1]),
+)
+def test_two_appends_keep_all_rows_and_all_files(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    first: list[str | None],
+    second: list[str | None],
+    sink,
+    max_rows: int | None,
+) -> None:
+    for path in fake_hub.files(fake_bucket):
+        fake_hub.delete(fake_bucket, path)
+    base = f"hf://buckets/{fake_bucket}/appended"
+    schema = {"g": pl.String, "n": pl.Int64}
+    frames = [
+        pl.DataFrame({"g": first, "n": range(len(first))}, schema=schema),
+        pl.DataFrame({"g": second, "n": range(100, 100 + len(second))}, schema=schema),
+    ]
+
+    snapshots = []
+    for frame in frames:
+        sink(frame, base, partition_by="g", max_rows_per_file=max_rows, mode="append")
+        snapshot = {}
+        for path in fake_hub.files(fake_bucket):
+            snapshot[path] = fake_hub.read(fake_bucket, path)
+        snapshots.append(snapshot)
+
+    # Every file of the first call is unchanged after the second call.
+    for path, data in snapshots[0].items():
+        assert snapshots[1][path] == data
+    assert len(snapshots[1]) > len(snapshots[0])
+    # Two run ids, and every name is a native name plus "-{run id}".
+    run_ids = set()
+    for path in snapshots[1]:
+        match = re.fullmatch(
+            r"appended/(.*/)?[0-9a-f]{8}-([0-9a-f]{12})\.parquet", path
+        )
+        assert match is not None, path
+        run_ids.add(match.group(2))
+    assert len(run_ids) == 2
+    back = plhf.scan_bucket(base).collect().sort("n")
+    assert_frame_equal(back, pl.concat(frames), check_column_order=False)

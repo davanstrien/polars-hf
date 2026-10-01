@@ -302,7 +302,7 @@ def test_failed_single_file_sink_keeps_existing_object(
     before = _snapshot(fake_hub, fake_bucket)
 
     with pytest.raises(RuntimeError, match="scripted sink failure"):
-        sink(_failing_frame(), _uri(fake_bucket, "keep.parquet"))
+        sink(_failing_frame(), _uri(fake_bucket, "keep.parquet"), mode="overwrite")
 
     assert _snapshot(fake_hub, fake_bucket) == before
     assert fake_hub.batch_calls == []
@@ -389,7 +389,11 @@ def test_failed_stream_write_raises_the_upload_error(
     fake_hub.fail_stream_write_on_call = 1
 
     with pytest.raises(ScriptedUploadError) as error:
-        sink_streamed(pl.DataFrame({"a": [1, 2]}), _uri(fake_bucket, "keep.parquet"))
+        sink_streamed(
+            pl.DataFrame({"a": [1, 2]}),
+            _uri(fake_bucket, "keep.parquet"),
+            mode="overwrite",
+        )
 
     assert isinstance(error.value.__cause__, pl.exceptions.PolarsError)
     assert _snapshot(fake_hub, fake_bucket) == before
@@ -531,20 +535,194 @@ def test_unknown_mode_is_rejected(fake_hub: FakeHub, fake_bucket: str) -> None:
     assert fake_hub.requests == []
 
 
+def _run_ids(monkeypatch: pytest.MonkeyPatch, *tokens: str) -> None:
+    """Make the next ``mode="append"`` calls use these run ids, in order."""
+    remaining = list(tokens)
+    monkeypatch.setattr(_sinks, "new_run_id", lambda: remaining.pop(0))
+
+
 @both_sinks
-def test_append_keeps_other_files_and_replaces_same_names(
+def test_default_mode_raises_if_the_destination_exists(
     fake_hub: FakeHub, fake_bucket: str, sink
 ) -> None:
-    base = _uri(fake_bucket, "shards")
-    sink(pl.DataFrame({"n": range(400)}), base, max_rows_per_file=100)
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+    file_uri = _uri(fake_bucket, "out.parquet")
+    base = _uri(fake_bucket, "parts")
+    sink(df, file_uri)
+    sink(df, base, partition_by="g")
+    before = _snapshot(fake_hub, fake_bucket)
+    fake_hub.batch_calls.clear()
+    fake_hub.commits.clear()
 
-    smaller = pl.DataFrame({"n": range(1000, 1200)})
-    sink(smaller, base, max_rows_per_file=100)
+    with pytest.raises(FileExistsError) as file_error:
+        sink(df, file_uri)
+    with pytest.raises(FileExistsError) as prefix_error:
+        sink(df, base, partition_by="g")
 
-    # Files 0 and 1 are new, files 2 and 3 are left from the first write.
-    assert len(fake_hub.files(fake_bucket, "shards/")) == 4
+    assert file_uri in str(file_error.value)
+    assert "mode='overwrite'" in str(file_error.value)
+    assert base in str(prefix_error.value)
+    assert "mode='append'" in str(prefix_error.value)
+    assert "mode='overwrite'" in str(prefix_error.value)
+    assert _snapshot(fake_hub, fake_bucket) == before
+    assert fake_hub.batch_calls == []
+    assert fake_hub.commits == []
+
+
+@both_sinks
+def test_append_to_a_single_file_is_refused(
+    fake_hub: FakeHub, fake_bucket: str, sink
+) -> None:
+    df = pl.DataFrame({"a": [1]})
+
+    with pytest.raises(ValueError, match="cannot append to the file") as error:
+        sink(df, _uri(fake_bucket, "out.parquet"), mode="append")
+
+    assert "mode='overwrite'" in str(error.value)
+    assert fake_hub.requests == []
+
+
+@both_sinks
+def test_append_twice_keeps_all_rows_and_files(
+    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same keys in both calls: before, the second call replaced
+    # g=a/00000000.parquet and the rows of the first call were lost.
+    _run_ids(monkeypatch, "aaaaaaaaaaaa", "bbbbbbbbbbbb")
+    base = _uri(fake_bucket, "parts")
+    first = pl.DataFrame({"g": ["a", "a", "b"], "n": [1, 2, 3]})
+    second = pl.DataFrame({"g": ["a", "b", "b"], "n": [4, 5, 6]})
+
+    sink(first, base, partition_by="g", max_rows_per_file=1, mode="append")
+    after_first = _snapshot(fake_hub, fake_bucket)
+    sink(second, base, partition_by="g", max_rows_per_file=1, mode="append")
+
+    assert sorted(after_first) == [
+        "parts/g=a/00000000-aaaaaaaaaaaa.parquet",
+        "parts/g=a/00000001-aaaaaaaaaaaa.parquet",
+        "parts/g=b/00000000-aaaaaaaaaaaa.parquet",
+    ]
+    after_second = _snapshot(fake_hub, fake_bucket)
+    # The files of the first call are still there, byte for byte.
+    for path, data in after_first.items():
+        assert after_second[path] == data
+    assert sorted(set(after_second) - set(after_first)) == [
+        "parts/g=a/00000000-bbbbbbbbbbbb.parquet",
+        "parts/g=b/00000000-bbbbbbbbbbbb.parquet",
+        "parts/g=b/00000001-bbbbbbbbbbbb.parquet",
+    ]
     back = plhf.scan_bucket(base).collect().sort("n")
-    assert back["n"].to_list() == [*range(200, 400), *range(1000, 1200)]
+    assert_frame_equal(back, pl.concat([first, second]))
+    assert all(call.deleted == [] for call in fake_hub.batch_calls)
+
+
+def test_append_run_id_is_random_per_call(fake_hub: FakeHub, fake_bucket: str) -> None:
+    import re
+
+    base = _uri(fake_bucket, "shards")
+    df = pl.DataFrame({"n": [1]})
+
+    for _ in range(3):
+        sink_default(df, base, max_rows_per_file=10, mode="append")
+
+    names = fake_hub.files(fake_bucket)
+    assert len(names) == 3
+    for name in names:
+        assert re.fullmatch(r"shards/00000000-[0-9a-f]{12}\.parquet", name)
+    assert plhf.scan_bucket(base).collect().height == 3
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "ndjson"])
+def test_append_names_are_the_same_with_both_backends(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, fmt: str
+) -> None:
+    _run_ids(monkeypatch, "0123456789ab", "0123456789ab")
+    df = pl.DataFrame({"g": ["a/b", None, "c"] + ["many"] * 17, "n": range(20)})
+    options = {
+        "partition_by": "g",
+        "max_rows_per_file": 1,
+        "mode": "append",
+        "format": fmt,
+    }
+
+    sink_streamed(df, _uri(fake_bucket, "streamed"), **options)
+    sink_staged(df, _uri(fake_bucket, "staged"), **options)
+
+    streamed = _relative(fake_hub.files(fake_bucket, "streamed/"), "streamed/")
+    staged = _relative(fake_hub.files(fake_bucket, "staged/"), "staged/")
+    assert streamed == staged
+    extension = "jsonl" if fmt == "ndjson" else fmt
+    assert f"g=many/00000010-0123456789ab.{extension}" in streamed
+    assert f"g=a%2Fb/00000000-0123456789ab.{extension}" in streamed
+    # The names differ from the native ones only by the suffix.
+    native = sorted(name.replace("-0123456789ab", "") for name in streamed)
+    sink_streamed(df, _uri(fake_bucket, "native"), **{**options, "mode": "error"})
+    assert _relative(fake_hub.files(fake_bucket, "native/"), "native/") == native
+
+
+@both_sinks
+def test_append_refuses_a_generated_name_that_exists(
+    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two calls with the same run id cannot happen by chance (48 random
+    # bits); if a name exists all the same, it is an error, not a replace.
+    _run_ids(monkeypatch, "cccccccccccc", "cccccccccccc")
+    base = _uri(fake_bucket, "parts")
+    df = pl.DataFrame({"g": ["a", "b"], "n": [1, 2]})
+    sink(df, base, partition_by="g", mode="append")
+    before = _snapshot(fake_hub, fake_bucket)
+    fake_hub.batch_calls.clear()
+
+    with pytest.raises(FileExistsError, match="generated file name"):
+        sink(df, base, partition_by="g", mode="append")
+
+    assert _snapshot(fake_hub, fake_bucket) == before
+    assert fake_hub.batch_calls == []
+
+
+@both_sinks
+def test_append_with_an_empty_result_adds_one_empty_file(
+    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run_ids(monkeypatch, "aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc")
+    base = _uri(fake_bucket, "parts")
+    df = pl.DataFrame({"g": ["a"], "n": [1]})
+
+    # A first write with no rows keeps the prefix scannable.
+    sink(df.clear(), base, partition_by="g", mode="append")
+    assert fake_hub.files(fake_bucket) == ["parts/00000000-aaaaaaaaaaaa.parquet"]
+    assert_frame_equal(plhf.scan_bucket(base).collect(), df.clear())
+
+    sink(df, base, partition_by="g", mode="append")
+    sink(df.clear(), base, partition_by="g", mode="append")
+
+    assert fake_hub.files(fake_bucket) == [
+        "parts/00000000-aaaaaaaaaaaa.parquet",
+        "parts/00000000-cccccccccccc.parquet",
+        "parts/g=a/00000000-bbbbbbbbbbbb.parquet",
+    ]
+    assert_frame_equal(plhf.scan_bucket(base).collect(), df)
+
+
+@both_sinks
+def test_append_next_to_files_with_native_names(
+    fake_hub: FakeHub, fake_bucket: str, sink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run_ids(monkeypatch, "aaaaaaaaaaaa")
+    base = _uri(fake_bucket, "shards")
+    first = pl.DataFrame({"n": range(400)})
+    sink(first, base, max_rows_per_file=100)
+    before = _snapshot(fake_hub, fake_bucket)
+
+    more = pl.DataFrame({"n": range(1000, 1200)})
+    sink(more, base, max_rows_per_file=100, mode="append")
+
+    after = _snapshot(fake_hub, fake_bucket)
+    assert len(after) == 6
+    for path, data in before.items():
+        assert after[path] == data
+    back = plhf.scan_bucket(base).collect().sort("n")
+    assert_frame_equal(back, pl.concat([first, more]))
 
 
 @both_sinks
@@ -1029,8 +1207,10 @@ def test_write_error_is_raised_even_if_the_sink_swallows_it(
 def test_missing_bucket_raises_the_registration_error(fake_hub: FakeHub, sink) -> None:
     df = pl.DataFrame({"a": [1]})
 
+    # mode="overwrite": no listing before the write, so the first request to
+    # the missing bucket is the upload or the registration.
     with pytest.raises(BucketRegistrationError) as error:
-        sink(df, "hf://buckets/fake-user/no-such-bucket/a.parquet")
+        sink(df, "hf://buckets/fake-user/no-such-bucket/a.parquet", mode="overwrite")
 
     assert isinstance(error.value.__cause__, HfHubHTTPError)
     assert error.value.__cause__.response.status_code == 404
@@ -1161,7 +1341,10 @@ def test_segment_of_255_bytes_is_accepted(fake_hub: FakeHub, fake_bucket: str) -
 def test_same_output_file_asked_twice_is_refused() -> None:
     from types import SimpleNamespace
 
-    destinations = _sinks._Destinations("parts", "parquet")
+    spec = _sinks.PartitionSpec(
+        key="g", max_rows_per_file=None, max_bytes_per_file=None, extension="parquet"
+    )
+    destinations = _sinks._Destinations("parts", spec)
     args = SimpleNamespace(
         partition_keys=pl.DataFrame({"g": ["a"]}), index_in_partition=0
     )
@@ -1239,7 +1422,8 @@ def test_hub_backend_verification_passes_and_costs_one_listing(
             fake_hub.matching(origin=HUB, method="GET", path_contains="/tree")
         )
 
-    assert listings == {True: 0, False: 1}
+    # One listing for the default mode="error", one more for the check.
+    assert listings == {True: 1, False: 2}
 
 
 def test_verification_reports_a_wrong_size(fake_hub: FakeHub, fake_bucket: str) -> None:

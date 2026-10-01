@@ -361,6 +361,11 @@ class FakeHub:
         self.put(bucket_id, path, data)
         return len(data)
 
+    def delete(self, bucket_id: str, path: str) -> None:
+        """Remove ``path`` from the bucket (a missing path is not an error)."""
+        with self._lock:
+            self._buckets[bucket_id].pop(path, None)
+
     def files(self, bucket_id: str, prefix: str = "") -> list[str]:
         """Sorted paths in the bucket that start with ``prefix``."""
         with self._lock:
