@@ -11,7 +11,8 @@ from importlib.metadata import PackageNotFoundError, version
 # speedup. Must be set before polars' first cloud IO; it is read once and cached.
 os.environ.setdefault("POLARS_CONCURRENCY_BUDGET", "64")
 
-from polars_hf._uri import BucketPath, parse_bucket_uri  # noqa: E402
+from polars_hf._sinks import BucketRegistrationError  # noqa: E402
+from polars_hf._uri import BucketPath, parse_bucket_uri
 from polars_hf.read import scan_bucket
 from polars_hf.write import sink_bucket
 
@@ -20,4 +21,10 @@ try:
 except PackageNotFoundError:  # running from a source tree that is not installed
     __version__ = "0+unknown"
 
-__all__ = ["BucketPath", "parse_bucket_uri", "scan_bucket", "sink_bucket"]
+__all__ = [
+    "BucketPath",
+    "BucketRegistrationError",
+    "parse_bucket_uri",
+    "scan_bucket",
+    "sink_bucket",
+]

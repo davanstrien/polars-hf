@@ -77,7 +77,6 @@ def test_explicit_xet_backend_raises_when_unavailable(
 
     message = str(error.value)
     assert "huggingface_hub>=1.19" in message
-    assert "hf_xet>=1.5.1" in message
     assert "huggingface_hub 1.12.0 has no Xet session helpers" in message
     assert "backend='hub'" in message
 

@@ -54,20 +54,22 @@ def staging_sinks() -> list:
     return [streamed, pytest.param(sink_staged, id="hub")]
 
 
-def fail_upload(fake_hub: FakeHub, number: int) -> None:
-    """Make the ``number``-th upload to the bucket (1-based) fail.
+def fail_stream_upload(fake_hub: FakeHub, number: int) -> None:
+    """Make the upload of the ``number``-th file (1-based) of the xet backend fail.
 
-    For the hub backend an upload is one batch of at most 1,000 files; for
-    the xet backend it is one file. Both raise ``ScriptedUploadError``.
+    The stream raises ``ScriptedUploadError`` when it is finished. The hub
+    backend has no per-file upload: use :func:`fail_batch`.
     """
-    fake_hub.fail_batch_on_call = number
     fake_hub.fail_stream_finish_on_call = number
 
 
-def fail_registration(fake_hub: FakeHub, number: int) -> None:
+def fail_batch(fake_hub: FakeHub, number: int) -> None:
     """Make the ``number``-th batch of bucket operations (1-based) fail.
 
-    The file data is uploaded; the request that makes the files visible (or
-    deletes stale ones) is refused.
+    For the hub backend a batch is the upload and the registration of at most
+    1,000 files (or a delete request); it raises ``ScriptedUploadError``. For
+    the xet backend it is a registration or delete request, sent after the
+    file data is uploaded; the fake answers 403 and the backend raises
+    ``BucketRegistrationError``.
     """
     fake_hub.fail_batch_on_call = number

@@ -19,6 +19,10 @@ a local directory); the xet backend rebuilds the same names in
 Neither backend is transactional: the bucket API has no transactions. Files
 are registered in requests of at most 1,000 operations, and a failure between
 two requests leaves the earlier ones applied.
+
+The xet backend relies on private parts of its dependencies: the session
+helpers of ``huggingface_hub.utils._xet`` and the ``/api/buckets/{id}/batch``
+request, which it builds itself the way ``HfApi._batch_bucket_files`` does.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 import huggingface_hub
 from huggingface_hub import HfApi
+from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import build_hf_headers, hf_raise_for_status, http_backoff
 
 if TYPE_CHECKING:
@@ -70,25 +75,84 @@ _HIVE_ENCODED_ASCII = frozenset(b"/=%: ")
 
 
 class BucketRegistrationError(RuntimeError):
-    """The bucket rejected some of the files of a write.
+    """The bucket did not accept the files (or deletions) of a write.
+
+    Raised by both backends when the upload or the ``/batch`` request fails,
+    and when the bucket rejects single operations of a request. With the hub
+    backend the error of ``huggingface_hub`` is the ``__cause__``.
 
     Attributes
     ----------
     failures
         The ``failed`` entries of the ``/batch`` response: one dict per
-        rejected operation, with the keys ``path`` and ``error``.
+        rejected operation, with the keys ``path`` and ``error``. Empty when
+        the request failed as a whole.
     """
 
-    def __init__(self, bucket_id: str, failures: list[dict]) -> None:
-        self.failures = failures
-        lines = []
-        for failure in failures[:10]:
+    def __init__(self, message: str, failures: list[dict] | None = None) -> None:
+        self.failures = list(failures or [])
+        lines = [message]
+        for failure in self.failures[:10]:
             lines.append(f"  - {failure.get('path')}: {failure.get('error')}")
-        if len(failures) > 10:
-            lines.append(f"  - ... and {len(failures) - 10} more")
-        super().__init__(
-            f"bucket {bucket_id!r} rejected {len(failures)} operation(s); the other "
-            "operations of the same request were applied:\n" + "\n".join(lines)
+        if len(self.failures) > 10:
+            lines.append(f"  - ... and {len(self.failures) - 10} more")
+        super().__init__("\n".join(lines))
+
+
+def _rejected(bucket_id: str, failures: list[dict], sent: int) -> str:
+    """Message for a request of ``sent`` operations with rejected ones."""
+    message = (
+        f"bucket {bucket_id!r} rejected {len(failures)} of {sent} operation(s) "
+        "of a request"
+    )
+    applied = sent - len(failures)
+    if applied > 0:
+        message += f"; the other {applied} were applied"
+    return message + ":"
+
+
+def incompatible_xet_error(error: BaseException) -> RuntimeError:
+    """The error for a private Xet API that no longer has the expected shape."""
+    try:
+        from importlib.metadata import version
+
+        hf_xet_version = version("hf_xet")
+    except Exception:
+        hf_xet_version = "unknown"
+    return RuntimeError(
+        "the 'xet' sink backend is not compatible with the installed "
+        f"huggingface_hub {huggingface_hub.__version__} / hf_xet {hf_xet_version} "
+        f"({type(error).__name__}: {error}). Use backend='hub'."
+    )
+
+
+# Raised by Python when a private function or object has changed its
+# signature or lost an attribute.
+_API_SHAPE_ERRORS = (TypeError, AttributeError)
+
+
+# ---- destination paths ------------------------------------------------------
+
+
+def validate_destination(path: str) -> None:
+    """Raise ``ValueError`` for a bucket path that the Hub refuses.
+
+    The Hub rejects a backslash, an empty segment (a leading or trailing
+    slash, ``//``) and the segments ``.`` and ``..``. For a partitioned write
+    the offending segment is the ``key=value`` directory, so the message names
+    the partition value.
+    """
+    for segment in path.split("/"):
+        if segment == "":
+            reason = "an empty path segment"
+        elif segment in (".", ".."):
+            reason = f"the path segment {segment!r}"
+        elif "\\" in segment:
+            reason = f"a backslash in the path segment {segment!r}"
+        else:
+            continue
+        raise ValueError(
+            f"invalid bucket path {path!r}: the Hub does not accept {reason}"
         )
 
 
@@ -206,11 +270,19 @@ class HubBackend(SinkBackend):
 
     name = "hub"
 
-    def __init__(
-        self, bucket_id: str, token: str | None, staging_dir: str | None = None
-    ) -> None:
+    def __init__(self, bucket_id: str, token: str | None) -> None:
         super().__init__(bucket_id, token)
-        self.staging_dir = staging_dir or os.environ.get(STAGING_DIR_ENV_VAR) or None
+        self.staging_dir = os.environ.get(STAGING_DIR_ENV_VAR) or None
+
+    def _batch(self, **operations: Any) -> None:
+        """``HfApi.batch_bucket_files``, with its errors as one error type."""
+        try:
+            self.api.batch_bucket_files(self.bucket_id, **operations)
+        except HfHubHTTPError as error:
+            raise BucketRegistrationError(
+                f"the upload to bucket {self.bucket_id!r} failed: {error}",
+                getattr(error, "failures", None),
+            ) from error
 
     @contextmanager
     def _staging(self) -> Iterator[str]:
@@ -224,7 +296,7 @@ class HubBackend(SinkBackend):
         with self._staging() as directory:
             local = os.path.join(directory, "data")
             run_sink(local)
-            self.api.batch_bucket_files(self.bucket_id, add=[(local, path)])
+            self._batch(add=[(local, path)])
         return [path]
 
     def write_partitioned(
@@ -239,20 +311,23 @@ class HubBackend(SinkBackend):
                     relative = os.path.relpath(local, directory).replace(os.sep, "/")
                     additions.append((local, join_path(prefix, relative)))
             additions.sort(key=lambda addition: addition[1])
+            # Before the upload: one refused path must not leave the others.
+            for _, destination in additions:
+                validate_destination(destination)
             if additions:
-                self.api.batch_bucket_files(self.bucket_id, add=additions)
+                self._batch(add=additions)
         return [destination for _, destination in additions]
 
     def delete(self, paths: list[str]) -> None:
         if paths:
-            self.api.batch_bucket_files(self.bucket_id, delete=paths)
+            self._batch(delete=paths)
 
 
 # ---- xet backend ------------------------------------------------------------
 
 _XET_REQUIREMENT = (
-    "the 'xet' sink backend needs huggingface_hub>=1.19 with hf_xet>=1.5.1 "
-    "(installed by huggingface_hub on x86_64 and arm64)"
+    "the 'xet' sink backend needs huggingface_hub>=1.19 and the hf_xet that it "
+    "requires (installed by huggingface_hub on x86_64 and arm64)"
 )
 
 
@@ -315,13 +390,15 @@ class _XetCommit:
         self._commit.abort()
 
     def interrupt(self) -> None:
-        """Stop the shared Xet session after a ``KeyboardInterrupt``."""
-        try:
-            from huggingface_hub.utils._xet import abort_xet_session
-        except ImportError:
-            self._commit.abort()
-        else:
-            abort_xet_session()
+        """Stop the shared Xet session after a ``KeyboardInterrupt``.
+
+        The session is process-wide: other Xet uploads and downloads that run
+        in the same process are cancelled too. ``huggingface_hub`` does the
+        same in its own uploads.
+        """
+        from huggingface_hub.utils._xet import abort_xet_session
+
+        abort_xet_session()
 
 
 def open_xet_commit(endpoint: str, bucket_id: str, headers: dict[str, str]) -> Any:
@@ -359,16 +436,17 @@ class _StreamWriter:
         self.path = path
         self.stream = stream
 
-    def write(self, data: Any) -> int:
-        chunk = data if isinstance(data, bytes) else bytes(data)
+    def write(self, data: bytes) -> int:
+        # Polars passes ``bytes`` (checked for the four formats on Polars
+        # 1.40.0, 1.41.2, 1.44.2 and 2.0.0rc2), which the stream takes as is.
         try:
-            self.stream.write(chunk)
+            self.stream.write(data)
         except BaseException as error:
-            # Polars reports a failed write as its own ComputeError; keep the
-            # original so the backend can raise it.
+            # Polars reports a failed write as its own ComputeError, or not at
+            # all; keep the original so the backend can raise it.
             self._upload.record_write_error(error)
             raise
-        return len(chunk)
+        return len(data)
 
     def flush(self) -> None:
         pass
@@ -396,7 +474,12 @@ class _XetUpload:
         self._lock = threading.Lock()
 
     def open(self, path: str) -> _StreamWriter:
-        writer = _StreamWriter(self, path, self.commit.open_stream(path))
+        validate_destination(path)
+        try:
+            stream = self.commit.open_stream(path)
+        except _API_SHAPE_ERRORS as error:
+            raise incompatible_xet_error(error) from error
+        writer = _StreamWriter(self, path, stream)
         with self._lock:
             self.writers.append(writer)
         return writer
@@ -442,18 +525,27 @@ class XetBackend(SinkBackend):
 
     def _upload(self, write: Callable[[_XetUpload], None]) -> list[str]:
         """Run ``write`` against a new commit; register its files on success."""
-        commit = open_xet_commit(self.api.endpoint, self.bucket_id, self.headers)
+        try:
+            commit = open_xet_commit(self.api.endpoint, self.bucket_id, self.headers)
+        except _API_SHAPE_ERRORS as error:
+            raise incompatible_xet_error(error) from error
         upload = _XetUpload(commit)
         operations = []
         try:
             write(upload)
+            # Do not rely on Polars to raise for a write() that failed.
+            if upload.write_error is not None:
+                raise upload.write_error
             if not upload.writers:
                 commit.abort()
                 return []
-            results = _finish_streams(upload.writers)
-            for writer, result in zip(upload.writers, results, strict=True):
-                operations.append(self._add_operation(writer.path, result))
-            commit.wait_to_finish()
+            try:
+                results = _finish_streams(upload.writers)
+                for writer, result in zip(upload.writers, results, strict=True):
+                    operations.append(self._add_operation(writer.path, result))
+                commit.wait_to_finish()
+            except _API_SHAPE_ERRORS as error:
+                raise incompatible_xet_error(error) from error
         except KeyboardInterrupt:
             commit.interrupt()
             raise
@@ -490,17 +582,39 @@ class XetBackend(SinkBackend):
             for operation in chunk:
                 lines.append(json.dumps(operation).encode() + b"\n")
             body = b"".join(lines)
-            response = http_backoff("POST", url, headers=headers, content=body)
-            # Rejected operations are listed in the body of a 200 (some failed)
-            # or of a 422 (all failed).
-            if response.status_code in (200, 422):
-                try:
-                    failures = response.json().get("failed", [])
-                except ValueError:
-                    failures = []
-                if failures:
-                    raise BucketRegistrationError(self.bucket_id, failures)
+            # http_backoff retries 429 and 5xx answers and connection errors.
+            # A repeated request is harmless: the operations are idempotent.
+            try:
+                response = http_backoff("POST", url, headers=headers, content=body)
+            except _API_SHAPE_ERRORS as error:
+                raise incompatible_xet_error(error) from error
+            self._check_batch_response(response, sent=len(chunk))
+
+    def _check_batch_response(self, response: Any, sent: int) -> None:
+        """Raise unless the bucket applied all ``sent`` operations."""
+        # Rejected operations are listed in the body of a 200 (some failed)
+        # or of a 422 (all failed).
+        failures = None
+        if response.status_code in (200, 422):
+            try:
+                failures = response.json().get("failed", [])
+            except (ValueError, AttributeError):
+                failures = None
+            if failures:
+                message = _rejected(self.bucket_id, failures, sent)
+                raise BucketRegistrationError(message, failures)
+        try:
             hf_raise_for_status(response)
+        except HfHubHTTPError as error:
+            raise BucketRegistrationError(
+                f"the registration in bucket {self.bucket_id!r} failed: {error}"
+            ) from error
+        if failures is None:
+            raise BucketRegistrationError(
+                f"bucket {self.bucket_id!r} answered {response.status_code} to a "
+                "registration request with a body that is not the expected JSON; "
+                "the state of the operations is unknown"
+            )
 
     def write_file(self, run_sink: RunSink, path: str) -> list[str]:
         def write(upload: _XetUpload) -> None:
@@ -555,13 +669,8 @@ def resolve_backend_name(backend: str | None) -> str:
     return requested
 
 
-def make_backend(
-    backend: str | None,
-    bucket_id: str,
-    token: str | None,
-    staging_dir: str | None = None,
-) -> SinkBackend:
+def make_backend(backend: str | None, bucket_id: str, token: str | None) -> SinkBackend:
     name = resolve_backend_name(backend)
     if name == "xet":
         return XetBackend(bucket_id, token)
-    return HubBackend(bucket_id, token, staging_dir=staging_dir)
+    return HubBackend(bucket_id, token)

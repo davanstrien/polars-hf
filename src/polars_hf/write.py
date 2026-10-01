@@ -16,7 +16,6 @@ requests. A failure between two requests leaves the earlier ones applied.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -116,15 +115,37 @@ def _raise_if_file_exists(backend: _sinks.SinkBackend, path: str, uri: str) -> N
             raise FileExistsError(f"{uri!r} already exists (mode='error')")
 
 
-def _raise_if_prefix_not_empty(
-    backend: _sinks.SinkBackend, prefix: str, uri: str
-) -> None:
-    existing = _files_below(backend, prefix)
-    if existing:
+def _raise_if_prefix_exists(backend: _sinks.SinkBackend, prefix: str, uri: str) -> None:
+    """Raise if a file is at ``prefix`` itself or anywhere below it."""
+    below = []
+    for path in _files_with_prefix(backend, prefix):
+        if prefix != "" and path == prefix:
+            raise FileExistsError(f"{uri!r} already exists as a file (mode='error')")
+        if prefix == "" or path.startswith(prefix + "/"):
+            below.append(path)
+    if below:
         raise FileExistsError(
-            f"{uri!r} already holds {len(existing)} file(s), for example "
-            f"{existing[0]!r} (mode='error')"
+            f"{uri!r} already holds {len(below)} file(s), for example "
+            f"{below[0]!r} (mode='error')"
         )
+
+
+def _partition_prefix(path: str, uri: str, mode: str) -> str:
+    """The base prefix of a partitioned write (``""`` is the bucket root)."""
+    if path != "" and path.strip("/") == "":
+        raise ValueError(
+            f"invalid destination {uri!r}: the path consists of slashes only"
+        )
+    prefix = path[:-1] if path.endswith("/") else path
+    if prefix == "":
+        if mode == "overwrite":
+            # It would delete every other object of the bucket.
+            raise ValueError(
+                f"mode='overwrite' needs a directory below the bucket root, got {uri!r}"
+            )
+        return prefix
+    _sinks.validate_destination(prefix)
+    return prefix
 
 
 def sink_bucket(
@@ -138,7 +159,6 @@ def sink_bucket(
     max_bytes_per_file: int | None = None,
     mode: str = "append",
     backend: str | None = None,
-    staging_dir: str | os.PathLike[str] | None = None,
     **kwargs: Any,
 ) -> None:
     """Write a polars frame to a Hugging Face bucket.
@@ -160,8 +180,9 @@ def sink_bucket(
         Destination ``hf://buckets/{namespace}/{name}/{path}`` URI: a file path for
         single-file writes, or a base prefix for partitioned writes.
     format
-        ``"parquet"`` (default for partitioned), ``"csv"``, ``"ipc"``, or ``"ndjson"``.
-        For single-file writes it is inferred from the extension if omitted.
+        ``"parquet"`` (default for partitioned), ``"csv"``, ``"ipc"``, or ``"ndjson"``
+        (case-insensitive). For single-file writes it is inferred from the
+        extension if omitted.
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub``.
     partition_by
@@ -176,13 +197,16 @@ def sink_bucket(
 
         * ``"append"`` (default): keep them. An object with the same name as a
           new file is replaced.
-        * ``"overwrite"``: after all new files are registered, delete the
-          files below the base prefix that this call did not write. For a
-          single-file write this is the same as ``"append"``.
+        * ``"overwrite"``: list the files below the base prefix before the
+          write; after all new files are registered, delete the listed files
+          that this call did not write. A file that another writer adds
+          during the write is not deleted. The base prefix must be a
+          directory below the bucket root. For a single-file write this is
+          the same as ``"append"``.
         * ``"error"``: raise ``FileExistsError`` before anything is written if
-          the destination file exists, or if any file exists below the base
-          prefix. The check and the write are separate requests, so a
-          concurrent writer is not excluded.
+          the destination file exists or, for a partitioned write, if a file
+          exists at the base prefix or anywhere below it. The check and the
+          write are separate requests, so a concurrent writer is not excluded.
     backend
         ``"xet"`` streams every output file straight into Xet storage and uses
         no local disk for the output. ``"hub"`` writes the output to a local
@@ -191,32 +215,37 @@ def sink_bucket(
         output is large. ``None`` (default) reads the environment variable
         ``POLARS_HF_SINK_BACKEND`` and otherwise uses ``"xet"`` when the
         installed ``huggingface_hub`` and ``hf_xet`` support it
-        (huggingface_hub>=1.19), else ``"hub"``.
-    staging_dir
-        Directory for the temporary files of the ``"hub"`` backend. Defaults to
-        the environment variable ``POLARS_HF_STAGING_DIR``, then to the system
-        temporary directory. The ``"xet"`` backend does not use it.
+        (huggingface_hub>=1.19), else ``"hub"``. The ``"hub"`` backend stages
+        in the directory named by the environment variable
+        ``POLARS_HF_STAGING_DIR``, else in the system temporary directory.
     **kwargs
         Forwarded to the underlying polars ``sink_*``. ``lazy=True`` is rejected.
 
     Raises
     ------
     ValueError
-        For an invalid ``uri``, ``format``, ``mode`` or ``backend``, and for
-        ``lazy=True``.
+        For an invalid ``uri``, ``format``, ``mode`` or ``backend``, for
+        ``lazy=True``, for ``mode="overwrite"`` on the bucket root, and for a
+        destination path the Hub refuses (a backslash, an empty segment, a
+        ``.`` or ``..`` segment), including one built from a partition value.
+        Such a path is rejected before any file is registered.
     FileExistsError
         With ``mode="error"``, if the destination exists.
+    BucketRegistrationError
+        If the upload or the registration request fails, or if the bucket
+        rejects some of the files (see ``failures``). It is a ``RuntimeError``.
     RuntimeError
         If ``backend="xet"`` is requested and the installed packages do not
-        support it, or if the bucket rejects some of the files.
+        support it or are not compatible with it.
 
     Notes
     -----
     The write is not transactional. Files are registered in requests of at most
     1,000 operations, and ``mode="overwrite"`` deletes stale files afterwards.
-    If one of these requests fails, the earlier requests stay applied: the
-    destination can then hold a part of the new files, and with
-    ``mode="overwrite"`` it can hold new and stale files together.
+    If one of these requests fails, the error is raised and the earlier
+    requests stay applied: the destination can then hold a part of the new
+    files, and with ``mode="overwrite"`` it can hold new and stale files
+    together.
 
     A partitioned write whose query returns no rows writes one file with the
     schema and no rows, ``{prefix}/00000000.{extension}``, so the prefix can
@@ -245,8 +274,15 @@ def sink_bucket(
     )
     lf = frame.lazy()
 
+    if format is not None:
+        fmt = format.lower()
+    elif partitioned:
+        fmt = "parquet"
+    else:
+        fmt = None
+
     if partitioned:
-        fmt = format or "parquet"
+        prefix = _partition_prefix(bp.path, uri, mode)
     else:
         if not bp.path:
             raise ValueError(f"a file path within the bucket is required, got {uri!r}")
@@ -255,13 +291,13 @@ def sink_bucket(
                 f"{uri!r} names a directory; a single-file write needs a file path "
                 "(or pass a partition argument)"
             )
-        fmt = format or _infer_format(bp.path)
+        _sinks.validate_destination(bp.path)
+        if fmt is None:
+            fmt = _infer_format(bp.path)
     if fmt not in _SINK_METHOD:
-        raise ValueError(f"unsupported format {fmt!r}")
+        raise ValueError(f"unsupported format {format!r}")
 
-    if staging_dir is not None:
-        staging_dir = os.fspath(staging_dir)
-    sink = _sinks.make_backend(backend, bp.bucket_id, token, staging_dir=staging_dir)
+    sink = _sinks.make_backend(backend, bp.bucket_id, token)
     run_sink = _make_run_sink(lf, fmt, sink_kwargs)
 
     if not partitioned:
@@ -270,9 +306,13 @@ def sink_bucket(
         sink.write_file(run_sink, bp.path)
         return
 
-    prefix = bp.path.rstrip("/")
     if mode == "error":
-        _raise_if_prefix_not_empty(sink, prefix, uri)
+        _raise_if_prefix_exists(sink, prefix, uri)
+    # Listed before the write: only these files can be deleted afterwards, so
+    # a file that another writer adds in the meantime is kept.
+    existing_before = []
+    if mode == "overwrite":
+        existing_before = _files_below(sink, prefix)
 
     spec = _sinks.PartitionSpec(
         key=partition_by,
@@ -291,7 +331,7 @@ def sink_bucket(
     if mode == "overwrite":
         kept = set(written)
         stale = []
-        for path in _files_below(sink, prefix):
+        for path in existing_before:
             if path not in kept:
                 stale.append(path)
         sink.delete(stale)
