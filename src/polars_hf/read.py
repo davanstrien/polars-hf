@@ -1,17 +1,25 @@
-"""Scan parquet from Hugging Face buckets as a native polars ``LazyFrame``.
+"""Scan parquet from Hugging Face buckets with native polars parquet scans.
 
 Bucket files are XET-backed: the Hub ``resolve`` URL 302-redirects (when
 requested with auth) to a presigned CDN URL (``us.aws.cdn.hf.co/xet-bridge-*``
 on huggingface.co) that needs no auth and supports HTTP range requests. We
 follow that redirect in Python and hand the **signed URLs** to native
 :func:`polars.scan_parquet`, so polars' Rust object store does async,
-concurrent, range-read scans with full projection / predicate / slice pushdown
+concurrent, range-read scans with projection / predicate / row-limit pushdown
 — the same mechanism the upstream ``hf://`` reader uses, but reachable from
 stock polars.
 
 Stock polars cannot authenticate a generic ``https://`` URL itself (bearer-token
 injection is gated behind the ``hf://`` scheme), which is why we resolve the
 signed URL here rather than passing the ``resolve`` URL directly.
+
+A signed URL holds a signature and is valid for about one hour. By default
+(``resolve="collect"``) ``scan_bucket`` therefore returns a LazyFrame over a
+polars IO-plugin source (:class:`_BucketSource`): the plan holds no URL, and
+the URLs are resolved when the query runs, for one group of files at a time.
+Each group is one native ``scan_parquet``; its output crosses into Python as
+whole DataFrames. ``resolve="now"`` resolves every URL in ``scan_bucket`` and
+returns the native scan node itself.
 
 All Hub requests (the bucket listing and the ``resolve`` requests) are sent
 with the shared ``huggingface_hub`` session
@@ -24,6 +32,7 @@ not bounded and differ between huggingface_hub versions.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import re
@@ -44,6 +53,7 @@ from huggingface_hub.utils import (
     hf_raise_for_status,
     parse_ratelimit_headers,
 )
+from polars.io.plugins import register_io_source
 
 from polars_hf._glob import glob_to_regex, has_glob, literal_prefix
 from polars_hf._uri import BucketPath, parse_bucket_uri
@@ -53,6 +63,23 @@ logger = logging.getLogger(__name__)
 # The signed URL carries its own expiry (an ``Expires`` query parameter, about
 # one hour after the resolve request), so URLs are resolved at scan time.
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
+_RESOLVE_MODES = ("collect", "now")
+# A collect-time scan resolves and scans the files in groups of this size: one
+# group is one burst of resolve requests and one native multi-file scan. The
+# URLs of a group are resolved when the group before it is exhausted, so a URL
+# is never older than the scan of its own group.
+_GROUP_FILES = 64
+# A query with a row limit starts with a small group and multiplies the size
+# up to _GROUP_FILES: head(5) resolves one file, not a full group.
+_LIMITED_FIRST_GROUP = 1
+_LIMITED_GROUP_GROWTH = 4
+# The signed URL of the first file is resolved for the schema (and, for a
+# single-file URI, by scan_bucket itself). The scan uses that URL again if it
+# is not older than this many seconds.
+_URL_REUSE_SECONDS = 300.0
+# scan_parquet options whose result depends on the rows of all earlier files.
+# With one of them the files are scanned as one group.
+_ONE_GROUP_OPTIONS = ("row_index_name", "n_rows")
 _MAX_RESOLVE_WORKERS = 16
 _MAX_REDIRECT_HOPS = 5
 # Entries per listing page (the ``limit`` query parameter). ``None`` leaves
@@ -114,23 +141,45 @@ class _Budget:
     One instance is shared by the listing and by all resolve threads, so the
     deadline applies to the call as a whole. ``operation`` names the public
     function in messages; the write path passes ``"sink_bucket"``.
+
+    A collect-time scan makes one instance per group of files (and one for
+    the schema): ``scope`` then names in messages what the deadline applies
+    to, and ``files_total`` / ``files_resolved`` carry the progress of the
+    whole scan into the group.
     """
 
-    def __init__(self, bucket_id: str, operation: str = "scan_bucket") -> None:
+    def __init__(
+        self,
+        bucket_id: str,
+        operation: str = "scan_bucket",
+        *,
+        scope: str | None = None,
+        files_total: int = 0,
+        files_resolved: int = 0,
+    ) -> None:
         self.bucket_id = bucket_id
         self.operation = operation
+        self.scope = scope if scope is not None else f"{operation} call"
         self.deadline = time.monotonic() + _SCAN_DEADLINE
-        self.files_total = 0
-        self._files_resolved = 0
+        self.files_total = files_total
+        # A total given by the caller is the total of the scan: a resolve of
+        # some of its files does not replace it.
+        self._total_is_given = files_total > 0
+        self._files_resolved = files_resolved
         self._wait_announced = False
         self._lock = threading.Lock()
+
+    def count_files(self, total: int) -> None:
+        """Set the number of files to resolve, unless the caller gave a total."""
+        if not self._total_is_given:
+            self.files_total = total
 
     def file_resolved(self) -> None:
         with self._lock:
             self._files_resolved += 1
 
     def announce_wait(self, message: str) -> None:
-        """Warn about a long wait, once per ``scan_bucket`` call.
+        """Warn about a long wait, once per ``scan_bucket`` call or group.
 
         All resolve threads usually wait for the same rate-limit reset: one
         warning is enough. Under a warnings-as-errors filter ``warnings.warn``
@@ -218,7 +267,7 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
         asked = "the Hub asks to wait" if hint is not None else "the next retry is in"
         reason = (
             f"{asked} {wait:.0f} s, but only {left:.0f} s are left of the "
-            f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.operation} call; "
+            f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.scope}; "
             "try again later"
         )
         raise _retry_error(response, budget, what, reason)
@@ -422,7 +471,7 @@ def _iter_tree_pages(
         if time.monotonic() > budget.deadline:
             raise TimeoutError(
                 f"the listing of {uri!r} did not finish within the "
-                f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.operation} call "
+                f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.scope} "
                 f"({listed} entries were listed)"
             )
         requested.add(url)
@@ -690,7 +739,7 @@ def _signed_urls(
 ) -> list[str]:
     """Resolve every path to its signed URL, one HEAD request per file."""
     bucket_id = budget.bucket_id
-    budget.files_total = len(paths)
+    budget.count_files(len(paths))
 
     def resolve(path: str) -> str:
         url = _signed_url(
@@ -702,21 +751,294 @@ def _signed_urls(
         budget.file_resolved()
         return url
 
+    if not paths:
+        return []
     if len(paths) == 1:
         return [resolve(paths[0])]
     with ThreadPoolExecutor(max_workers=min(_MAX_RESOLVE_WORKERS, len(paths))) as pool:
         return list(pool.map(resolve, paths))
 
 
+# ---- collect-time source ---------------------------------------------------
+
+
+def _group_bounds(
+    n_files: int, *, limited: bool, one_group: bool
+) -> Iterator[tuple[int, int]]:
+    """The ``(start, stop)`` file indices of every group of a scan, in order.
+
+    Without a row limit every group has ``_GROUP_FILES`` files. With one, the
+    first group has ``_LIMITED_FIRST_GROUP`` file and the size is multiplied
+    by ``_LIMITED_GROUP_GROWTH`` up to ``_GROUP_FILES``.
+    """
+    if one_group:
+        yield (0, n_files)
+        return
+    size = _LIMITED_FIRST_GROUP if limited else _GROUP_FILES
+    start = 0
+    while start < n_files:
+        stop = min(start + size, n_files)
+        yield (start, stop)
+        start = stop
+        size = min(size * _LIMITED_GROUP_GROWTH, _GROUP_FILES)
+
+
+def _without_signed_urls(
+    error: Exception, uris_by_url: dict[str, str]
+) -> Exception | None:
+    """A copy of ``error`` whose message names bucket files, not signed URLs.
+
+    Polars puts the URL of a file in the message of a read error (an expired
+    URL, a file that is not parquet). Returns ``None`` if the message holds
+    none of the URLs.
+    """
+    message = str(error)
+    clean = message
+    for url, uri in uris_by_url.items():
+        clean = clean.replace(url, uri)
+        # The query string holds the signature: remove it also where the URL
+        # is printed in another form.
+        query = urlparse(url).query
+        if query:
+            clean = clean.replace(query, "<signature removed>")
+    if clean == message:
+        return None
+    try:
+        return type(error)(clean)
+    except Exception:
+        return RuntimeError(clean)
+
+
+class _BucketSource:
+    """The files of one collect-time ``scan_bucket`` call, as a polars IO source.
+
+    Polars calls :meth:`schema` when it needs the schema of the LazyFrame, and
+    calls the object when the query runs. The object holds the bucket paths;
+    no signed URL is part of the query plan.
+
+    A pickled source (``LazyFrame.serialize``) holds the endpoint, the bucket
+    id, the paths and the scan options. It does not hold the token, the
+    request headers or a signed URL: a source that was unpickled sends its
+    requests with the token that ``huggingface_hub`` finds in its environment.
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        headers: dict[str, str],
+        bucket_id: str,
+        paths: list[str],
+        scan_kwargs: dict[str, object],
+        first_url: str | None = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self.bucket_id = bucket_id
+        self.paths = paths
+        self.scan_kwargs = scan_kwargs
+        self._init_unpickled_state(headers)
+        if first_url is not None:
+            self._first_url = (first_url, time.monotonic())
+
+    def _init_unpickled_state(self, headers: dict[str, str] | None) -> None:
+        self._headers = headers
+        self._schema: pl.Schema | None = None
+        # The signed URL of the first file and the time it was resolved.
+        self._first_url: tuple[str, float] | None = None
+        self._lock = threading.Lock()
+        self._schema_lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, object]:
+        return {
+            "endpoint": self.endpoint,
+            "bucket_id": self.bucket_id,
+            "paths": self.paths,
+            "scan_kwargs": self.scan_kwargs,
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._init_unpickled_state(None)
+
+    # ---- requests ----------------------------------------------------------
+
+    def _hub_headers(self) -> dict[str, str]:
+        with self._lock:
+            if self._headers is None:
+                self._headers = build_hf_headers()
+            return self._headers
+
+    def _uri(self, index: int) -> str:
+        return _file_uri(self.bucket_id, self.paths[index])
+
+    def _recent_first_url(self) -> str | None:
+        with self._lock:
+            cached = self._first_url
+        if cached is None:
+            return None
+        url, resolved_at = cached
+        if time.monotonic() - resolved_at > _URL_REUSE_SECONDS:
+            return None
+        return url
+
+    def _resolve(self, start: int, stop: int, scope: str) -> list[str]:
+        """The signed URLs of the files ``start`` to ``stop - 1``.
+
+        The requests have their own retry budget (``_SCAN_DEADLINE`` from
+        now). The first file is not resolved again if its URL is recent.
+        """
+        urls: list[str] = []
+        if start == 0:
+            first_url = self._recent_first_url()
+            if first_url is not None:
+                urls.append(first_url)
+        first_missing = start + len(urls)
+        budget = _Budget(
+            self.bucket_id,
+            scope=scope,
+            files_total=len(self.paths),
+            files_resolved=first_missing,
+        )
+        paths = self.paths[first_missing:stop]
+        urls.extend(_signed_urls(self.endpoint, self._hub_headers(), paths, budget))
+        if start == 0 and first_missing == 0:
+            with self._lock:
+                self._first_url = (urls[0], time.monotonic())
+        return urls
+
+    # ---- schema ------------------------------------------------------------
+
+    def schema(self) -> pl.Schema:
+        """The schema of the LazyFrame; read once, from the first file.
+
+        It is the schema of a native scan of the first file with the scan
+        options of the call: one ``resolve`` request (none if the URL of the
+        file is recent) and the footer of that file, unless ``schema=`` makes
+        the read unnecessary for polars.
+        """
+        with self._schema_lock:
+            if self._schema is None:
+                scope = "schema read of a scan_bucket query"
+                urls = self._resolve(0, 1, scope)
+                lf = pl.scan_parquet(urls, **self.scan_kwargs)
+                try:
+                    self._schema = lf.collect_schema()
+                except Exception as error:
+                    clean = _without_signed_urls(error, {urls[0]: self._uri(0)})
+                    if clean is None:
+                        raise
+                    raise clean from None
+            return self._schema
+
+    def _file_schema(self) -> pl.Schema:
+        """The columns of :meth:`schema` that are read from the files."""
+        added = (
+            self.scan_kwargs.get("include_file_paths"),
+            self.scan_kwargs.get("row_index_name"),
+        )
+        columns = {}
+        for name, dtype in self.schema().items():
+            if name not in added:
+                columns[name] = dtype
+        return pl.Schema(columns)
+
+    # ---- scan --------------------------------------------------------------
+
+    def _scan_group(self, urls: list[str], uris_by_url: dict[str, str]) -> pl.LazyFrame:
+        """The native scan of one group of files."""
+        scan_kwargs = dict(self.scan_kwargs)
+        if scan_kwargs.get("schema") is None:
+            # Polars takes the schema of a scan from its first file. Every
+            # group must use the schema of the first file of the whole scan.
+            scan_kwargs["schema"] = self._file_schema()
+        lf = pl.scan_parquet(urls, **scan_kwargs)
+        path_column = scan_kwargs.get("include_file_paths")
+        if path_column is not None:
+            # Polars fills the column with the signed URLs.
+            bucket_uri = pl.col(path_column).replace_strict(
+                uris_by_url, return_dtype=pl.String
+            )
+            lf = lf.with_columns(bucket_uri)
+        return lf
+
+    def __call__(
+        self,
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
+    ) -> Iterator[pl.DataFrame]:
+        """Scan the files group by group (the IO source function of polars).
+
+        The projection, the predicate and the row limit that polars pushed
+        into the source are applied to the native scan of every group. When
+        polars gives a row limit and a predicate, the limit is on the rows
+        before the predicate (``head(n).filter(...)``).
+        """
+        one_group = False
+        for option in _ONE_GROUP_OPTIONS:
+            if self.scan_kwargs.get(option) is not None:
+                one_group = True
+        if n_rows is not None and predicate is not None:
+            # The batches hold the rows after the predicate: they do not tell
+            # how many rows of the limit a group used.
+            one_group = True
+        groups = _group_bounds(
+            len(self.paths), limited=n_rows is not None, one_group=one_group
+        )
+        scope = "group of files of a scan_bucket query"
+        remaining = n_rows
+        for start, stop in groups:
+            urls = self._resolve(start, stop, scope)
+            uris_by_url = {}
+            for offset, url in enumerate(urls):
+                uris_by_url[url] = self._uri(start + offset)
+
+            lf = self._scan_group(urls, uris_by_url)
+            if remaining is not None:
+                lf = lf.head(remaining)
+            if predicate is not None:
+                lf = lf.filter(predicate)
+            if with_columns is not None:
+                lf = lf.select(with_columns)
+            try:
+                batches = lf.collect_batches(chunk_size=batch_size, engine="streaming")
+                for batch in batches:
+                    if remaining is not None:
+                        remaining -= batch.height
+                    yield batch
+            except Exception as error:
+                clean = _without_signed_urls(error, uris_by_url)
+                if clean is None:
+                    raise
+                raise clean from None
+            if remaining is not None and remaining <= 0:
+                return
+
+
+def _collect_time_scan(source: _BucketSource, uri: str) -> pl.LazyFrame:
+    """The LazyFrame of a collect-time scan: an IO-plugin node over ``source``."""
+    options = {}
+    parameters = inspect.signature(register_io_source).parameters
+    if "explain_name" in parameters:
+        # Polars 2 prints these in explain() instead of "PYTHON SCAN".
+        options["explain_name"] = "HF BUCKET SCAN"
+        options["explain_detail"] = f"{uri} ({len(source.paths)} files)"
+    return register_io_source(source, schema=source.schema, **options)
+
+
 def scan_bucket(
-    uri: str, *, token: str | None = None, **scan_kwargs: object
+    uri: str,
+    *,
+    token: str | None = None,
+    resolve: str = "collect",
+    **scan_kwargs: object,
 ) -> pl.LazyFrame:
     """Lazily scan parquet file(s) from a Hugging Face bucket.
 
-    Returns a native polars ``LazyFrame`` (via :func:`polars.scan_parquet` over
-    presigned URLs), so projection, predicate, and slice pushdown, streaming, and
-    multi-file concurrency all work natively — only the column chunks actually
-    needed are transferred.
+    The files are read by native :func:`polars.scan_parquet` scans over
+    presigned URLs, so only the column chunks a query needs are transferred.
+    ``scan_bucket`` itself finds the files and reads no file data.
 
     Parameters
     ----------
@@ -738,14 +1060,29 @@ def scan_bucket(
     token
         Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
         ``HF_TOKEN`` env var or cached login).
+    resolve
+        When the presigned URLs of the files are resolved:
+
+        * ``"collect"`` (default): when the query runs. The LazyFrame is a
+          polars IO-plugin source that holds the bucket paths. The plan
+          (``explain()``, ``serialize()``) holds no signed URL, and a URL is
+          resolved shortly before it is used, so the plan does not expire.
+        * ``"now"``: in ``scan_bucket``. The LazyFrame is the native
+          ``scan_parquet`` node over the signed URLs: the URLs (with their
+          signature) are visible in the plan and are valid for ~1 hour from
+          the call.
+
+        See Notes for what differs between the two.
     **scan_kwargs
         Forwarded to :func:`polars.scan_parquet` — e.g.
         ``storage_options={"max_retries": 5}`` for flaky connections,
         ``missing_columns="insert"`` / ``extra_columns="ignore"`` for
         heterogeneous schemas across globbed files, ``schema=``, or
-        ``cast_options=``. Options that derive meaning from the file *path*
-        (``hive_partitioning=``, ``include_file_paths=``) see the presigned
-        CDN URLs, not the bucket paths, so they are not useful here.
+        ``cast_options=``. ``include_file_paths="col"`` gives the
+        ``hf://buckets/...`` URI of the file of every row with
+        ``resolve="collect"``, and the signed URL with ``resolve="now"``.
+        ``hive_partitioning=`` sees the presigned URLs, not the bucket paths,
+        so it finds no partition columns.
 
     Returns
     -------
@@ -755,7 +1092,8 @@ def scan_bucket(
     ------
     ValueError
         The URI is not a valid bucket URI, a glob ends with ``/`` or uses
-        ``**`` inside a path segment, or a matched file is empty (0 bytes).
+        ``**`` inside a path segment, ``resolve`` is not a known mode, or a
+        matched file is empty (0 bytes).
     FileNotFoundError
         The bucket does not exist, or no file matches ``uri``.
     PermissionError
@@ -775,17 +1113,32 @@ def scan_bucket(
 
     Notes
     -----
-    ``scan_bucket`` makes these Hub requests and reads no file data:
+    **Hub requests of the call.** ``scan_bucket`` finds the files:
 
     * a file: one ``resolve`` request (HEAD);
-    * a directory of N parquet files: one ``resolve`` request that the Hub
-      answers "not found", one listing request per page of results, then N
-      ``resolve`` requests. With a trailing ``/`` (and for the whole bucket)
-      the first request is not made;
-    * a glob that selects N files: one listing request per page, then N
-      ``resolve`` requests. A glob whose only glob segment is the last one
-      (``data/*.parquet``) lists that directory only; other globs list the
-      subtree below the text before their first glob character.
+    * a directory: one ``resolve`` request that the Hub answers "not found",
+      then one listing request per page of results. With a trailing ``/``
+      (and for the whole bucket) the first request is not made;
+    * a glob: one listing request per page. A glob whose only glob segment is
+      the last one (``data/*.parquet``) lists that directory only; other
+      globs list the subtree below the text before their first glob
+      character.
+
+    With ``resolve="now"`` it then sends one ``resolve`` request for each of
+    the N files.
+
+    **Hub requests of a query** (``resolve="collect"``). The schema is read
+    when polars first needs it (``collect()``, ``collect_schema()``,
+    ``explain()``), once per LazyFrame: one ``resolve`` request for the first
+    file and the footer of that file. A query then scans the files in path
+    order in groups of 64. The URLs of a group are resolved (one ``resolve``
+    request per file) when the group before it is exhausted, and the group is
+    one native multi-file scan with the projection, the predicate and the row
+    limit of the query. A query with a row limit (``head(n)``) uses groups of
+    1, 4, 16, then 64 files and stops when it has its rows. The signed URL of
+    the first file is used again if it is less than 5 minutes old, so a full
+    scan of N files sends N ``resolve`` requests, and a single-file scan
+    sends none after the one of the call.
 
     ``resolve`` requests count in the Hub's "resolvers" rate limit.
 
@@ -793,18 +1146,45 @@ def scan_bucket(
     ``HF_HUB_OFFLINE=1`` and a custom client factory
     (``huggingface_hub.set_client_factory``) apply to them.
 
-    A 408, 429 or 5xx answer to any of these requests (every listing page,
-    every ``resolve``) is retried up to 5 times. The wait is the one the Hub
-    asks for (rate-limit reset, ``Retry-After``), else 1 s doubling up to 8 s;
-    a wait of more than 5 s that the Hub asks for is announced with one
-    warning per call (logged instead if warnings are turned into errors).
-    ``scan_bucket`` raises instead of waiting when the wait would end more
-    than 10 minutes after the call started. Timeouts and connection errors
-    are not retried.
+    **Retries.** A 408, 429 or 5xx answer to any of these requests (every
+    listing page, every ``resolve``) is retried up to 5 times. The wait is
+    the one the Hub asks for (rate-limit reset, ``Retry-After``), else 1 s
+    doubling up to 8 s; a wait of more than 5 s that the Hub asks for is
+    announced with one warning (logged instead if warnings are turned into
+    errors). A wait is made only if it ends within 10 minutes; else the error
+    is raised. The 10 minutes start with the ``scan_bucket`` call for its own
+    requests, and with the first request of the schema read and of every
+    group for the requests of a query. Timeouts and connection errors are not
+    retried.
 
-    Signed URLs are resolved when ``scan_bucket`` is called and are valid for
-    ~1 hour. Collect within that window; for long-lived plans, call
-    ``scan_bucket`` again to refresh.
+    **Errors of a query** (``resolve="collect"``). An error of a ``resolve``
+    request of a query (a file that was deleted after the listing, a 401 or
+    403, a rate limit that the retries did not clear) is raised by
+    ``collect()``, not by ``scan_bucket``. Polars 2 raises the exception of
+    the list above. Polars 1.x wraps an exception of an IO source: it raises
+    ``polars.exceptions.ComputeError`` whose message holds the type name and
+    the message of that exception. All polars versions wrap an error of the
+    schema read in a ``ComputeError`` ("schema callable failed"). A read
+    error of polars names the ``hf://`` URI of the file, not its signed URL.
+
+    **What the IO-plugin node changes for a query** (``resolve="collect"``):
+
+    * polars pushes the projection, the predicate and ``head(n)`` into the
+      source. It does not push ``tail()`` or a slice with an offset: these
+      scan all files. ``resolve="now"`` reads only the last files for them;
+    * ``select(pl.len())`` reads one column, because polars asks an IO source
+      for one column to count the rows. ``resolve="now"`` answers a row count
+      from the file footers;
+    * a group must be scanned within the ~1 hour that its URLs are valid;
+    * with ``row_index_name=`` or ``n_rows=``, and for a row limit before a
+      predicate (``head(n).filter(...)``), all files are one group: all
+      their URLs are resolved at the start of the query;
+    * every group is scanned with the schema of the first file of the scan
+      (as ``schema=``), unless ``schema=`` is given;
+    * ``LazyFrame.serialize()`` needs the ``cloudpickle`` package. The
+      serialized plan holds the bucket paths and the scan options, not the
+      token: the query that is deserialized uses the token of its own
+      environment.
 
     Examples
     --------
@@ -812,12 +1192,16 @@ def scan_bucket(
     >>> lf = plhf.scan_bucket("hf://buckets/me/data/*.parquet")  # doctest: +SKIP
     >>> lf.filter(pl.col("label") == 1).head(5).collect()  # doctest: +SKIP
     """
+    if resolve not in _RESOLVE_MODES:
+        raise ValueError(f"resolve must be one of {_RESOLVE_MODES}, not {resolve!r}")
     bp = parse_bucket_uri(uri)
     # Read at call time, like HfApi does when it is created.
     endpoint = constants.ENDPOINT
     headers = build_hf_headers(token=token)
     budget = _Budget(bp.bucket_id)
 
+    paths = None
+    first_url = None
     if bp.path and not bp.is_glob and not bp.path.endswith("/"):
         # A file needs no listing: ask for its signed URL directly. When the
         # Hub answers "not found", the path can still be a directory.
@@ -826,9 +1210,24 @@ def scan_bucket(
         except FileNotFoundError:
             pass
         else:
+            if resolve == "now":
+                return pl.scan_parquet(urls, **scan_kwargs)
+            paths = [bp.path]
+            first_url = urls[0]
+
+    if paths is None:
+        files = _list_files(endpoint, headers, bp, uri, budget)
+        paths = [file.path for file in files]
+        if resolve == "now":
+            urls = _signed_urls(endpoint, headers, paths, budget)
             return pl.scan_parquet(urls, **scan_kwargs)
 
-    files = _list_files(endpoint, headers, bp, uri, budget)
-    paths = [file.path for file in files]
-    urls = _signed_urls(endpoint, headers, paths, budget)
-    return pl.scan_parquet(urls, **scan_kwargs)
+    source = _BucketSource(
+        endpoint=endpoint,
+        headers=headers,
+        bucket_id=bp.bucket_id,
+        paths=paths,
+        scan_kwargs=scan_kwargs,
+        first_url=first_url,
+    )
+    return _collect_time_scan(source, uri)

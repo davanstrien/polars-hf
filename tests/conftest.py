@@ -45,6 +45,7 @@ for _name in ("NO_PROXY", "no_proxy"):
         _hosts.append(os.environ[_name])
     os.environ[_name] = ",".join(_hosts)
 
+import re  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
@@ -90,6 +91,35 @@ if HUB_MAJOR >= 2:
     import httpx2 as hub_httpx
 else:
     hub_httpx = httpx
+
+POLARS_MAJOR = int(pl.__version__.split(".")[0])
+
+
+@contextmanager
+def raises_at_collect(
+    expected: type[BaseException],
+    match: str | None = None,
+    *,
+    schema_step: bool = False,
+) -> Iterator[pytest.ExceptionInfo]:
+    """Expect ``expected`` from a query of a collect-time ``scan_bucket``.
+
+    Polars 1.x wraps an exception that an IO source raises in a
+    ``ComputeError`` whose message holds the type name and the message;
+    Polars 2 raises the exception itself. Every version wraps an exception of
+    the schema read (``schema_step=True``). ``match`` is searched in the
+    message in both cases.
+    """
+    wrapped = schema_step or POLARS_MAJOR < 2
+    raised = pl.exceptions.ComputeError if wrapped else expected
+    with pytest.raises(raised) as error:
+        yield error
+    message = str(error.value)
+    if wrapped:
+        assert f"{expected.__name__}: " in message
+    if match is not None:
+        assert re.search(match, message), message
+
 
 # Transient staging errors only: HTTP 409/502/503/504 and timeouts. Anything
 # else (a missing file, a read error) can be a real read-after-write bug and

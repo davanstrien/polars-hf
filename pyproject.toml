@@ -26,6 +26,8 @@ Repository = "https://github.com/davanstrien/polars-hf"
 
 [dependency-groups]
 dev = [
+    # LazyFrame.serialize() pickles the IO source of scan_bucket with cloudpickle.
+    "cloudpickle>=3",
     # The fake Hub and the tests build requests and responses with httpx.
     # polars-hf itself sends its requests through the huggingface_hub session.
     "httpx>=0.27,<1",

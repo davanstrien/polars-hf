@@ -1,10 +1,12 @@
 """Known bugs, written as tests of the DESIRED behaviour.
 
-Every test here is ``xfail(strict=True)``: it fails today for the stated
+A test of an open bug is ``xfail(strict=True)``: it fails today for the stated
 reason, and the suite goes red as soon as it starts to pass. The pull request
 that fixes a bug removes the marker (or moves the test to the matching test
 module). ``raises=`` pins the failure to the documented symptom, so an
 unrelated breakage does not hide behind the marker.
+
+No bug is open: every test here is a regression test without a marker.
 
 All tests run offline against the fake Hub (see ``fakehub.py``).
 
@@ -40,8 +42,8 @@ def test_at_sign_in_file_path_is_not_a_revision() -> None:
 
 # ---- read path -------------------------------------------------------------
 
-# Bugs g to l and p are fixed: their tests have no marker and stay as
-# regression tests. Bug m is open.
+# Bugs g to m and p are fixed: their tests have no marker and stay as
+# regression tests.
 
 
 def test_literal_bracket_file_name_reads_that_file(
@@ -120,12 +122,9 @@ def test_transient_resolve_error_is_retried(
     assert resolves[0].status == status
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug m: the query plan prints and serializes the presigned URL, "
-    "signature included",
-)
+# Bug m: the query plan printed and serialized the presigned URL, signature
+# included. The default mode resolves the URLs when the query runs;
+# test_collect_time.py has the tests of resolve="now", which keeps them.
 @pytest.mark.filterwarnings("ignore:.*json.*:UserWarning")
 def test_presigned_url_not_in_plan(fake_hub: FakeHub, fake_bucket: str) -> None:
     fake_hub.put_parquet(fake_bucket, "one.parquet", pl.DataFrame({"a": [1]}))

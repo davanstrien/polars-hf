@@ -622,11 +622,71 @@ def test_threads_of_one_scan_warn_once(
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        plhf.scan_bucket(_uri(fake_bucket, "data/"))
+        plhf.scan_bucket(_uri(fake_bucket, "data/"), resolve="now")
 
     assert len(clock.waits) == n_files
     ours = [w for w in caught if "scan_bucket: Hub rate limit" in str(w.message)]
     assert len(ours) == 1
+
+
+def test_query_warns_once_for_the_schema_and_once_per_group(
+    fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
+) -> None:
+    import warnings
+
+    n_files = 6
+    for i in range(n_files):
+        _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    # One rate-limited answer for every file.
+    for i in range(n_files):
+        route = rf"/resolve/data/p{i}\.parquet$"
+        fake_hub.add_fault(HUB, "HEAD", route, 429, headers=_rate_limited(20))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert lf.collect().height == n_files
+
+    # The first file is resolved for the schema, the others as one group.
+    assert clock.waits == [21.0] * n_files
+    ours = [w for w in caught if "scan_bucket: Hub rate limit" in str(w.message)]
+    assert len(ours) == 2
+
+
+def test_deadline_of_a_query_starts_with_each_group(
+    fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
+) -> None:
+    for i in range(3):
+        _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    # The query runs long after the call: the 600 s of the call are over.
+    clock.now += 10 * read._SCAN_DEADLINE
+    fake_hub.add_fault(
+        HUB, "HEAD", r"/resolve/data/p2", 503, headers={"Retry-After": "400"}
+    )
+
+    with pytest.warns(UserWarning, match="waiting 400 s"):
+        assert lf.collect().height == 3
+
+    assert clock.waits == [400.0]
+
+
+def test_group_budget_message_names_the_group(clock: FakeClock) -> None:
+    budget = _Budget(
+        "ns/name",
+        scope="group of files of a scan_bucket query",
+        files_total=200,
+        files_resolved=64,
+    )
+    handler, seen = _answers(Response(429, headers=_rate_limited(900)))
+
+    with hub_session(handler):
+        with pytest.raises(HfHubHTTPError) as error:
+            _signed_url(RESOLVE, {}, uri=URI, budget=budget)
+
+    message = str(error.value)
+    assert "; 64 of 200 files were resolved" in message
+    assert "600 s allowed for one group of files of a scan_bucket query" in message
 
 
 # ---- through scan_bucket, on the fake Hub ----------------------------------
@@ -653,7 +713,7 @@ def test_rate_limited_scan_reports_the_files_resolved(
     )
 
     with pytest.raises(HfHubHTTPError) as error:
-        plhf.scan_bucket(_uri(fake_bucket, "data/"))
+        plhf.scan_bucket(_uri(fake_bucket, "data/"), resolve="now")
 
     message = str(error.value)
     assert "rate limit for resolve requests was reached" in message
