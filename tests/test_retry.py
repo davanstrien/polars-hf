@@ -118,6 +118,28 @@ def test_retry_after_http_date_falls_back_to_the_backoff(clock: FakeClock) -> No
     assert clock.waits == [1.0]
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "soon", ""])
+def test_non_finite_retry_after_falls_back_to_the_backoff(
+    clock: FakeClock, value: str
+) -> None:
+    handler, seen = _answers(Response(503, headers={"retry-after": value}))
+
+    with hub_session(handler):
+        assert _resolve() == SIGNED
+
+    assert clock.waits == [1.0]
+    assert len(seen) == 2
+
+
+def test_negative_retry_after_is_no_wait(clock: FakeClock) -> None:
+    handler, _ = _answers(Response(503, headers={"retry-after": "-5"}))
+
+    with hub_session(handler):
+        assert _resolve() == SIGNED
+
+    assert clock.waits == [0.0]
+
+
 def test_rate_limit_reset_above_the_cap_raises_without_waiting(
     clock: FakeClock,
 ) -> None:
@@ -180,15 +202,14 @@ def test_waits_stop_at_the_deadline_of_the_call(
 
 def test_total_wait_of_one_call_is_bounded(clock: FakeClock) -> None:
     # Every answer asks for the longest wait that is allowed.
-    handler, _ = _answers(*[Response(429, headers=_rate_limited(59))] * 100)
+    handler, seen = _answers(*[Response(429, headers=_rate_limited(59))] * 100)
 
     with hub_session(handler):
-        with pytest.raises(HfHubHTTPError):
+        with pytest.raises(HfHubHTTPError, match="no success after 5 retries"):
             _resolve()
 
-    assert len(clock.waits) == read._MAX_RETRIES
-    assert sum(clock.waits) <= read._MAX_RETRIES * read._MAX_WAIT_PER_RETRY
-    assert sum(clock.waits) <= read._SCAN_DEADLINE
+    assert clock.waits == [60.0] * read._MAX_RETRIES
+    assert len(seen) == read._MAX_RETRIES + 1
 
 
 def test_deadline_is_shared_by_the_requests_of_one_call(clock: FakeClock) -> None:

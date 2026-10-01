@@ -22,6 +22,7 @@ limit on every wait and on the total time of one ``scan_bucket`` call.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -120,21 +121,31 @@ class _Budget:
         return f"; {resolved} of {self.files_total} files were resolved"
 
 
+def _finite_seconds(value: object) -> float | None:
+    """``value`` as a number of seconds, or ``None`` if it is not a finite one."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(seconds, 0.0)
+
+
 def _server_wait_hint(response) -> float | None:
-    """Seconds the server asks to wait before the next attempt, if it says so."""
+    """Seconds the server asks to wait before the next attempt, if it says so.
+
+    A hint that is not a finite number of seconds (``nan``, an HTTP date) is
+    no hint: the caller then uses the backoff.
+    """
     if response.status_code == 429:
         info = parse_ratelimit_headers(response.headers)
         if info is not None and info.remaining == 0:
-            # One more second: the reset time is rounded down.
-            return float(info.reset_in_seconds) + 1
-    retry_after = response.headers.get("retry-after")
-    if retry_after is not None:
-        try:
-            return max(float(retry_after), 0.0)
-        except ValueError:
-            # An HTTP date: not used by the Hub; fall back to the backoff.
-            return None
-    return None
+            reset = _finite_seconds(info.reset_in_seconds)
+            if reset is not None:
+                # One more second: the reset time is rounded down.
+                return reset + 1
+    return _finite_seconds(response.headers.get("retry-after"))
 
 
 def _retry_error(response, budget: _Budget, what: str, reason: str) -> HfHubHTTPError:

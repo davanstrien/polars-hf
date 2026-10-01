@@ -161,7 +161,9 @@ same applies to the listing, which is then started again from its first page (in
 `huggingface_hub` itself retries the requests for the later pages). The wait before a retry is the
 one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. `scan_bucket`
 does not sleep longer than that: if one wait would be longer than 60 s, or would end more than
-10 minutes after the call started, it raises `HfHubHTTPError`. For a rate limit the message names
+10 minutes after the call started, it raises `HfHubHTTPError`. That limit bounds the waits, not
+the requests: a request already in flight can still run to its 30 s timeout after it. A
+`Retry-After` that is an HTTP date (or not a finite number) is ignored and the backoff is used. For a rate limit the message names
 the bucket, the quota and how many files were already resolved. Timeouts and connection errors
 are not retried.
 
