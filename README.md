@@ -195,8 +195,8 @@ as `xfailed`. Because the marker is strict, a test that starts to pass turns the
 see the current failure of such a test, run it with `--runxfail`.
 
 CI runs the offline suite on Python 3.10–3.14 with the locked dependencies, and again with the
-lowest supported direct dependencies, the latest releases, and the Polars 2.0 release candidate
-(that last job is allowed to fail). The staging suite runs on every push and pull request. A weekly
+lowest supported direct dependencies, the latest releases, and the newest Polars 2 pre-release
+(that last job is allowed to fail). The staging suite runs on pull requests and on pushes to `main`. A weekly
 scheduled run repeats all jobs with the `random` Hypothesis profile.
 
 ## License

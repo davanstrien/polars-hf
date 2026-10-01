@@ -13,11 +13,6 @@ on:
 permissions:
   contents: read
 
-# A newer run for the same ref supersedes the older one.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   # Pushes and pull requests run the derandomized Hypothesis profile (the same
   # examples every time); the weekly run draws new examples.
@@ -29,6 +24,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # A newer run for the same ref supersedes the older one.
+    concurrency:
+      group: ci-test-${{ github.ref }}-${{ matrix.python-version }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +50,10 @@ jobs:
     name: deps (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Only the release-candidate job may fail: it tracks an unreleased Polars.
+    concurrency:
+      group: ci-deps-${{ github.ref }}-${{ matrix.name }}
+      cancel-in-progress: true
+    # Only the pre-release job may fail: it tracks an unreleased Polars.
     continue-on-error: ${{ matrix.allow-failure }}
     strategy:
       fail-fast: false
@@ -68,9 +70,12 @@ jobs:
             python-version: "3.12"
             install: uv pip install --upgrade -e .
             allow-failure: false
-          - name: polars-2.0-rc
+          # The newest Polars 2 pre-release (or release, once there is one).
+          # A specifier that names a pre-release makes uv accept pre-releases
+          # for polars only.
+          - name: polars-prerelease
             python-version: "3.12"
-            install: uv pip install -e . "polars==2.0.0rc2"
+            install: uv pip install -e . "polars>=2.0.0rc1"
             allow-failure: true
     steps:
       - uses: actions/checkout@v6
@@ -97,6 +102,11 @@ jobs:
   staging:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Never cancelled: a cancelled run skips the fixture teardown and leaves
+    # its buckets on staging. Runs for the same ref queue instead.
+    concurrency:
+      group: ci-staging-${{ github.ref }}
+      cancel-in-progress: false
     env:
       HF_ENDPOINT: https://hub-ci.huggingface.co
       HF_TOKEN: hf_HubCITokenXXXXXXXXXXXXXXXXXXXXX
