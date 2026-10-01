@@ -35,7 +35,7 @@ uv add "polars-hf @ git+https://github.com/davanstrien/polars-hf"
 # or: pip install "git+https://github.com/davanstrien/polars-hf"
 ```
 
-Requires `polars>=1.40,<1.50` and `huggingface_hub>=1.12`.
+Requires `polars>=1.40,<3`, `huggingface_hub>=1.12` and `httpx>=0.27,<1`.
 
 ### On Hugging Face Jobs
 
@@ -157,8 +157,35 @@ so they are not useful here.
 ```bash
 uv sync
 uv run ruff check .
-uv run pytest                 # network tests skip without an HF token
+uv run pytest                 # offline suite (the default)
+uv run pytest -m staging      # live tests against the Hub CI staging instance
 ```
+
+**Offline tests** need no network and no token. `tests/fakehub.py` runs a local fake Hub: one HTTP
+server for the bucket API and the `resolve` redirect, and a second one (another origin) that serves
+the "presigned" URLs with range requests. It records every request and the bytes it serves, and can
+be scripted to fail (`429`, `503`, `403`, ...). Uploads are stored in memory through a patched
+`HfApi.batch_bucket_files`. Use the `fake_hub` / `fake_bucket` fixtures.
+
+**Staging tests** (`-m staging`) do real round-trips against `https://hub-ci.huggingface.co`, the
+instance `huggingface_hub` uses for its own tests. `tests/conftest.py` sets `HF_ENDPOINT` and
+`HF_TOKEN` to the staging endpoint and its public CI token *before* `huggingface_hub` is imported,
+so the test process never talks to `huggingface.co` and never reads your own token. Each test
+creates a uniquely named bucket and deletes it afterwards. Staging can answer `409`/`502`/`504`;
+these tests are rerun automatically (`pytest-rerunfailures`).
+
+**Property tests** (`tests/test_properties.py`) use [Hypothesis](https://hypothesis.readthedocs.io)
+with a derandomized profile, so every run executes the same examples.
+
+**Known bugs** are in `tests/test_known_bugs.py` as `@pytest.mark.xfail(strict=True)` tests. Each one
+asserts the behaviour we *want* and fails today for the reason in its `reason=`, so it is reported
+as `xfailed`. Because the marker is strict, a test that starts to pass turns the suite red
+(`XPASS(strict)`): the pull request that fixes a bug must remove the marker in the same change. To
+see the current failure of such a test, run it with `--runxfail`.
+
+CI runs the offline suite on Python 3.10–3.14 with the locked dependencies, and again with the
+lowest supported direct dependencies, the latest releases, and the Polars 2.0 release candidate
+(that last job is allowed to fail). The staging suite runs on every push and pull request.
 
 ## License
 
