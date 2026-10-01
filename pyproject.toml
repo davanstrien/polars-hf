@@ -1,7 +1,7 @@
 [project]
 name = "polars-hf"
 version = "0.1.0"
-description = "Read and write Hugging Face Hub buckets with Polars, as a pure-Python IO plugin"
+description = "Read and write Hugging Face Hub buckets with Polars"
 readme = "README.md"
 authors = [
     { name = "Daniel van Strien", email = "daniel@huggingface.co" }

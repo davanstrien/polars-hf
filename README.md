@@ -14,9 +14,10 @@ read `hf://buckets/...`. `polars-hf` fills that gap from the outside.
 
 It returns a **native** `pl.scan_parquet` LazyFrame: bucket files are XET-backed, so `scan_bucket`
 follows the authenticated Hub `resolve` redirect to a presigned CDN URL
-(`us.aws.cdn.hf.co/xet-bridge-*`) and hands that to Polars. Polars' own Rust object store then does async, concurrent, **range-read**
-scans — so **projection, predicate, and slice pushdown**, streaming, and multi-file concurrency all
-work natively and only the column chunks actually needed are transferred. (This is the same read
+(`us.aws.cdn.hf.co/xet-bridge-*`) and hands that to Polars. Polars' own Rust object store then does
+async, concurrent, **range-read** scans — so **projection, predicate, and slice pushdown**,
+streaming, and multi-file concurrency all work natively and only the column chunks actually needed
+are transferred. (This is the same read
 mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Python because stock
 Polars can't attach a bearer token to a generic `https://` URL.)
 
@@ -111,19 +112,21 @@ plhf.scan_bucket("hf://buckets/ns/name/data.parquet", token="hf_...")
 hf://buckets/{namespace}/{name}/{path}
 ```
 
-`scan_bucket` reads `{path}` as, in this order:
+`scan_bucket` reads `{path}` as:
 
-1. **A single file**, if a file with exactly this name exists — whatever its extension, and also
-   when the name contains glob characters (`data[1].parquet` reads that file, not `data1.parquet`).
-2. **A directory, or the whole bucket** when `{path}` is empty: every `.parquet` / `.pq` file below
-   it, at any depth; the extension is matched case-insensitively. A trailing `/` forces this
-   reading. A directory named `out.parquet/` is scanned as a directory.
-3. **A glob** (`data/*.parquet`, `data/**/part-*.parquet`): every *file* that matches. `*`, `?` and
-   `[...]` match inside one path segment; `**` must be a whole segment and matches any number of
-   directories. Braces (`{a,b}`) are not expanded. A glob never passes a sub-directory to the
-   scan, and it does not filter by extension: `data/*` also selects `data/notes.txt`, and Polars
-   then fails at `collect()` because that file is not parquet. Use `data/*.parquet`, or `data` for
-   the directory reading.
+1. **A glob**, if it has a glob character (`*`, `?` or `[`), for example `data/*.parquet` or
+   `data/**/part-*.parquet`: every *file* that matches. `*`, `?` and `[...]` match inside one path
+   segment; `**` must be a whole segment and matches any number of directories. Braces (`{a,b}`)
+   are not expanded. A glob never passes a sub-directory to the scan, and it does not filter by
+   extension: `data/*` also selects `data/notes.txt`, and Polars then fails at `collect()` because
+   that file is not parquet. Use `data/*.parquet`, or `data` for the directory reading. A file
+   whose name is exactly the pattern wins over the matches (`data[1].parquet` reads that file,
+   not `data1.parquet`).
+2. Else **a single file**, if a file with exactly this name exists — whatever its extension.
+3. Else **a directory, or the whole bucket** when `{path}` is empty: every `.parquet` / `.pq` file
+   below it, at any depth; the extension is matched case-insensitively. A trailing `/` forces
+   this reading. A directory named `out.parquet/` is scanned as a directory. Only the files of
+   that directory are listed: a sibling such as `train_full/` costs nothing when you scan `train`.
 
 A glob selects files, so it cannot end with `/`: `data/*/` raises `ValueError`. Use
 `data/*/*.parquet` or `data/**/*.parquet`.
@@ -147,25 +150,31 @@ again to refresh.
 
 | `{path}` | Requests |
 | --- | --- |
-| one file named `*.parquet` / `*.pq` | 1 `resolve` (HEAD) |
-| a directory or a glob that selects N files | 1 listing per page of results + N `resolve` |
-| one file with another extension | 1 listing + 1 `resolve` |
+| one file, any extension | 1 `resolve` (HEAD) |
+| a directory of N parquet files (`data`) | 1 `resolve` (answered "not found") + 1 listing per page of results + N `resolve` |
+| the same with a trailing slash (`data/`), or the whole bucket | 1 listing per page + N `resolve` |
+| a glob that selects N files | 1 listing per page + N `resolve` |
+| a path that does not exist | 1 `resolve` + 1 listing |
 
-A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. A
-directory scan and a glob with `**` list the whole subtree.
+A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. Other
+globs list the subtree below the text before their first glob character. An invalid glob raises
+before any request.
 
 `resolve` requests count in the Hub's "resolvers" rate limit, so a scan of N files uses N of them.
 
 **Retries.** A `408`, `429` or `5xx` answer to a `resolve` request is retried up to 5 times. The
 same applies to the listing, which is then started again from its first page (inside one listing,
 `huggingface_hub` itself retries the requests for the later pages). The wait before a retry is the
-one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. `scan_bucket`
-does not sleep longer than that: if one wait would be longer than 60 s, or would end more than
-10 minutes after the call started, it raises `HfHubHTTPError`. That limit bounds the waits, not
-the requests: a request already in flight can still run to its 30 s timeout after it. A
-`Retry-After` that is an HTTP date (or not a finite number) is ignored and the backoff is used. For a rate limit the message names
-the bucket, the quota and how many files were already resolved. Timeouts and connection errors
-are not retried.
+one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. When the Hub
+asks for more than 5 s, a warning announces the wait, so a paused scan is not silent.
+
+One `scan_bucket` call waits only while the wait ends within 10 minutes of its start. A rate-limit
+reset in 300 s is waited for; a wait that would pass the 10 minutes raises `HfHubHTTPError` at
+once. The message says how long the Hub asked to wait and how much time was left; for a rate
+limit it also names the bucket, the quota and how many files were already resolved. That limit
+bounds the waits, not the requests: a request already in flight can still run to its 30 s timeout
+after it. A `Retry-After` that is an HTTP date (or not a finite number) is ignored and the backoff
+is used. Timeouts and connection errors are not retried.
 
 All requests use the shared HTTP session of `huggingface_hub`, so `HF_HUB_OFFLINE=1` and a custom
 client factory (`huggingface_hub.set_client_factory`) apply.
