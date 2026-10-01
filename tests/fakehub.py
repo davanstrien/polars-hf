@@ -22,6 +22,11 @@ operations per call) and its non-transactional behaviour are exercised. Both
 write paths of ``sink_bucket`` end up there (``HfFileSystem`` in ``"wb"`` mode
 commits through the same method when the file is closed).
 
+That patch is the ONLY way uploads are captured. A sink backend that uploads
+through ``hf_xet`` streams and posts to ``/api/buckets/{id}/batch`` itself is
+NOT covered: the fake has no ``/batch`` route and no Xet upload stand-in. The
+pull request that adds such a write path must add that seam here.
+
 The listing semantics were copied from the Hub CI instance
 (``hub-ci.huggingface.co``) on 2026-10-01:
 

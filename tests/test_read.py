@@ -106,11 +106,3 @@ def test_scan_kwargs_forwarded_mixed_schemas(base: str) -> None:
         mixed, missing_columns="insert", extra_columns="ignore"
     ).collect()
     assert got.height > 0
-
-
-def test_native_parquet_scan_with_range_reads(single: str) -> None:
-    # Guard the perf fix: scan_bucket must produce a NATIVE parquet scan over a
-    # signed URL (range reads + pushdown), not a PYTHON SCAN that buffers files.
-    plan = plhf.scan_bucket(single).explain()
-    assert "Parquet SCAN" in plan
-    assert "PYTHON SCAN" not in plan

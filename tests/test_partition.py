@@ -1,4 +1,4 @@
-"""Partitioned-write tests for sink_bucket (both atomic modes), on staging.
+"""Partitioned-write tests for sink_bucket (default and streamed writes), on staging.
 
 Selected with ``pytest -m staging``. Each test writes to its own new bucket
 (the ``staging_bucket`` fixture), so tests cannot race on shared paths.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 from huggingface_hub import HfApi
+from sinks import sink_default, sink_streamed
 
 import polars_hf as plhf
 
@@ -26,13 +27,11 @@ def _bucket_parquet(api: HfApi, bucket_id: str, prefix_in_bucket: str) -> list[s
     )
 
 
-@pytest.mark.parametrize("atomic", [True, False])
-def test_partition_by_key(
-    staging_api: HfApi, staging_bucket: str, atomic: bool
-) -> None:
+@pytest.mark.parametrize("sink", [sink_default, sink_streamed])
+def test_partition_by_key(staging_api: HfApi, staging_bucket: str, sink) -> None:
     df = pl.DataFrame({"g": ["a", "a", "b", "c", "c", "c"], "n": range(6)})
     base = f"hf://buckets/{staging_bucket}/ptest/k"
-    plhf.sink_bucket(df, base, partition_by="g", atomic=atomic)
+    sink(df, base, partition_by="g")
 
     back = plhf.scan_bucket(f"{base}/**/*.parquet").collect()
     assert back.height == 6
@@ -43,13 +42,11 @@ def test_partition_by_key(
     assert any("g=c/" in f for f in files)
 
 
-@pytest.mark.parametrize("atomic", [True, False])
-def test_partition_by_size(
-    staging_api: HfApi, staging_bucket: str, atomic: bool
-) -> None:
+@pytest.mark.parametrize("sink", [sink_default, sink_streamed])
+def test_partition_by_size(staging_api: HfApi, staging_bucket: str, sink) -> None:
     df = pl.DataFrame({"n": range(1000)})
     base = f"hf://buckets/{staging_bucket}/ptest/s"
-    plhf.sink_bucket(df, base, max_rows_per_file=250, atomic=atomic)
+    sink(df, base, max_rows_per_file=250)
 
     back = plhf.scan_bucket(f"{base}/**/*.parquet").collect()
     assert back.height == 1000
@@ -62,7 +59,7 @@ def test_partition_by_size(
 def test_partition_key_and_size(staging_api: HfApi, staging_bucket: str) -> None:
     df = pl.DataFrame({"g": ["a"] * 500 + ["b"] * 500, "n": range(1000)})
     base = f"hf://buckets/{staging_bucket}/ptest/ks"
-    plhf.sink_bucket(df, base, partition_by="g", max_rows_per_file=300, atomic=True)
+    sink_default(df, base, partition_by="g", max_rows_per_file=300)
 
     back = plhf.scan_bucket(f"{base}/**/*.parquet").collect()
     assert back.height == 1000

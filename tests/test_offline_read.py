@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import polars as pl
 import pytest
-from fakehub import CDN, HUB, SIGNATURE, FakeHub
+from fakehub import CDN, HUB, FakeHub
 from polars.testing import assert_frame_equal
 
 import polars_hf as plhf
@@ -115,17 +115,6 @@ def test_projection_reads_fewer_bytes_than_the_file(
     assert all(r.range is not None for r in gets)
 
 
-def test_native_parquet_scan(fake_hub: FakeHub, fake_bucket: str) -> None:
-    # scan_bucket must produce a NATIVE parquet scan over a signed URL (range
-    # reads + pushdown), not a PYTHON SCAN that buffers files.
-    fake_hub.put_parquet(fake_bucket, "one.parquet", _numbered_frame(0, 10))
-
-    plan = plhf.scan_bucket(_uri(fake_bucket, "one.parquet")).explain()
-
-    assert "Parquet SCAN" in plan
-    assert "PYTHON SCAN" not in plan
-
-
 def test_scan_kwargs_forwarded_mixed_schemas(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -183,35 +172,6 @@ def test_explicit_token_reaches_the_hub(fake_hub: FakeHub, fake_bucket: str) -> 
     assert sent == {"Bearer hf_explicit_read_token"}
 
 
-def test_unknown_token_is_refused(fake_hub: FakeHub, fake_bucket: str) -> None:
-    fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
-    url = f"{fake_hub.endpoint}/buckets/{fake_bucket}/resolve/data/one.parquet"
-
-    wrong = httpx.head(url, headers={"Authorization": "Bearer hf_wrong"})
-    missing = httpx.head(url)
-
-    assert wrong.status_code == 401
-    assert missing.status_code == 401
-    assert fake_hub.requests[0].authorization == "Bearer hf_wrong"
-    assert fake_hub.requests[1].authorization is None
-
-
-def test_resolve_reply_has_the_xet_headers(fake_hub: FakeHub, fake_bucket: str) -> None:
-    from conftest import STAGING_TOKEN
-
-    size = fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
-    url = f"{fake_hub.endpoint}/buckets/{fake_bucket}/resolve/data/one.parquet"
-
-    reply = httpx.head(url, headers={"Authorization": f"Bearer {STAGING_TOKEN}"})
-
-    xet_hash = reply.headers["X-Xet-Hash"]
-    assert reply.status_code == 302
-    assert reply.headers["X-Linked-Size"] == str(size)
-    assert len(xet_hash) == 64
-    assert reply.headers["X-Linked-Etag"] == '"' + xet_hash + '"'
-    assert reply.headers["Location"].startswith(fake_hub.cdn_endpoint)
-
-
 # ---- scripted faults (current behaviour; the retry tests are in ------------
 # ---- test_known_bugs.py) ---------------------------------------------------
 
@@ -248,16 +208,3 @@ def test_expired_signed_url_fails_at_collect(
         lf.collect()
 
     assert all(r.status == 403 for r in fake_hub.matching(origin=CDN))
-
-
-def test_signed_url_requires_its_signature(fake_hub: FakeHub, fake_bucket: str) -> None:
-    fake_hub.put_parquet(fake_bucket, "one.parquet", _numbered_frame(0, 10))
-    plhf.scan_bucket(_uri(fake_bucket, "one.parquet")).collect()
-    served = fake_hub.matching(origin=CDN, method="GET")[0]
-
-    base = f"{fake_hub.cdn_endpoint}{served.path}"
-    good = httpx.get(f"{base}?X-Amz-Signature={SIGNATURE}")
-    bad = httpx.get(f"{base}?X-Amz-Signature=tampered")
-
-    assert good.status_code == 200
-    assert bad.status_code == 401

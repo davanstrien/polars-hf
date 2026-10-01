@@ -307,7 +307,8 @@ def test_at_sign_in_file_path_is_not_a_revision() -> None:
     strict=True,
     raises=AssertionError,
     reason="bug g: a path with '[' and ']' is globbed, so 'data[1].parquet' is "
-    "read as the character class and matches 'data1.parquet'",
+    "read as the character class and matches 'data1.parquet'. Intended fix: "
+    "try the literal path first, then fall back to glob",
 )
 def test_literal_bracket_file_name_reads_that_file(
     fake_hub: FakeHub, fake_bucket: str

@@ -136,8 +136,18 @@ def fake_bucket(fake_hub: FakeHub) -> str:
 # ---- staging ---------------------------------------------------------------
 
 
+# huggingface_hub 2.x sends its requests with httpx2; 1.x uses httpx.
+_TIMEOUT_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException,)
+try:
+    import httpx2
+except ImportError:
+    pass
+else:
+    _TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException)
+
+
 def _is_transient_staging_error(error: Exception) -> bool:
-    if isinstance(error, httpx.TimeoutException):
+    if isinstance(error, _TIMEOUT_ERRORS):
         return True
     if isinstance(error, HfHubHTTPError):
         return error.response.status_code in _STAGING_TRANSIENT_STATUS
