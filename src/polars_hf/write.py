@@ -215,14 +215,15 @@ def sink_bucket(
           that path. A partitioned destination exists if there is a file
           anywhere below the base prefix. The check and the write are
           separate requests, so a concurrent writer is not excluded.
-        * ``"append"``: partitioned writes only. Add files and never replace
-          or delete an existing one. Every file of the call gets a name with
-          a random token that is unique to the call,
-          ``{index}-{token}.{extension}`` (``00000000-1f0c9a52b7e3.parquet``),
-          in the same ``key=value/`` directories. Two appends with the same
-          keys therefore keep the rows of both. The prefix is not listed
-          before the write. A single file cannot be appended to:
-          ``ValueError``.
+        * ``"append"``: partitioned writes only. Add files and delete
+          nothing. Every file of the call gets a name with a random 48-bit
+          run id that is generated once per call,
+          ``{index}-{run id}.{extension}``
+          (``00000000-1f0c9a52b7e3.parquet``), in the same ``key=value/``
+          directories. Two appends with the same keys therefore keep the
+          rows of both. The prefix is not listed before the write, so a
+          collision with an existing name is negligible but not excluded by
+          a check. A single file cannot be appended to: ``ValueError``.
         * ``"overwrite"``: for a single file, replace the object. For a
           partitioned write, list the files below the base prefix before the
           write; after all new files are registered, delete the listed files
@@ -258,7 +259,10 @@ def sink_bucket(
         With ``mode="error"``, if the destination exists. In every mode, if
         the write would create a file and a directory of the same name: a
         single-file write to ``out`` when objects exist below ``out/``, or a
-        partitioned write below ``out/`` when ``out`` is a file.
+        partitioned write below ``out/`` when ``out`` is a file. Only the
+        destination itself is checked, with one listing page of the
+        destination directory and one exact check of the path; an ancestor
+        that is a file (``a`` for ``a/b/c.parquet``) is not detected.
     BucketRegistrationError
         If the upload or the registration request fails, or if the bucket
         rejects some of the files (see ``failures``). It is a ``RuntimeError``.

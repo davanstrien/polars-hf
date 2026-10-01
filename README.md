@@ -118,16 +118,18 @@ base prefix.
 | `mode` | Single file | Partitioned (base prefix) |
 | --- | --- | --- |
 | `"error"` (default) | `FileExistsError` if the object exists | `FileExistsError` if the destination exists |
-| `"append"` | not possible: `ValueError` | new files are added with names unique to the call; no existing file is replaced or deleted |
+| `"append"` | not possible: `ValueError` | new files are added under names that carry a random 48-bit run id per call; nothing is deleted |
 | `"overwrite"` | the object is replaced | the new files are registered (a file with the same name is replaced), then the files that were below the prefix before the write, and that this call did not write, are deleted |
 
 **A file and a directory of one name are refused, in every mode.** A single-file write to `out`
 raises `FileExistsError` if there are objects below `out/`, and a partitioned write to `out/...`
 raises `FileExistsError` if `out` is a file. The bucket could store both; `sink_bucket` does not
-create such a pair.
+create such a pair. Only the destination itself is checked: an *ancestor* that is a file (a write to
+`a/b/c.parquet` while `a` is a file) is not detected.
 
-The checks run before anything is uploaded and cost a fixed number of requests, whatever the
-destination and its siblings hold. They do not exclude a concurrent writer.
+The checks run before anything is uploaded. An existence check costs one listing page of the
+destination directory plus one exact check of the path, whatever the destination and its siblings
+hold. The checks do not exclude a concurrent writer.
 
 | Write | Requests before the upload |
 | --- | --- |
@@ -141,10 +143,10 @@ These requests use the listing and the retry limits of the read path: bounded re
 of 10 minutes per call, `PermissionError` for a token without access and `FileNotFoundError` for a
 bucket that does not exist.
 
-`"append"` never replaces rows: two appends with the same partition keys keep the rows of both,
-because their file names differ by the token. Running the same job twice therefore adds the rows
-twice. The token has 48 random bits; `sink_bucket` does not list the prefix to look for a name that
-exists already.
+`"append"` gives the files of each call names with a random 48-bit run id. Two appends with the
+same partition keys therefore keep the rows of both, and running the same job twice adds the rows
+twice. A name collision with an existing object is negligible but not excluded by a check:
+`sink_bucket` does not list the prefix to look for a name that exists already.
 
 `"overwrite"` needs a directory below the bucket root: `hf://buckets/ns/name` and
 `hf://buckets/ns/name/` are refused with a `ValueError`. It lists the prefix before the write and
