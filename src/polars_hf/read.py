@@ -954,7 +954,8 @@ class _BucketSource:
         lf = pl.scan_parquet(urls, **scan_kwargs)
         path_column = scan_kwargs.get("include_file_paths")
         if path_column is not None:
-            # Polars fills the column with the signed URLs.
+            # Polars fills the column with the signed URLs. Two files of one
+            # group that have the same URL (the same content) get one URI.
             bucket_uri = pl.col(path_column).replace_strict(
                 uris_by_url, return_dtype=pl.String
             )

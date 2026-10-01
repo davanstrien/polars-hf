@@ -472,7 +472,9 @@ or `storage_options={"max_retries": 5}` for flaky connections (this replaces the
 above).
 
 `include_file_paths="file"` adds the `hf://buckets/...` URI of the file of every row. (With
-`resolve="now"` the column holds the presigned URL, signature included.) `hive_partitioning=` sees
+`resolve="now"` the column holds the presigned URL, signature included.) The URI is found from
+the presigned URL of the file: if two files with the same content get the same URL, their rows
+show the URI of one of them. `hive_partitioning=` sees
 the presigned CDN URLs, not the bucket paths, so it finds no partition columns in either mode.
 
 ## Limitations
