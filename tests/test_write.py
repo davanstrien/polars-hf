@@ -1,12 +1,11 @@
-"""Tests for sink_bucket: pure format inference + live round-trips."""
+"""Tests for sink_bucket: pure format inference + staging round-trips."""
 
 from __future__ import annotations
 
-import os
-
 import polars as pl
 import pytest
-from huggingface_hub import HfFileSystem, get_token
+from conftest import STAGING_ENDPOINT, STAGING_TOKEN
+from huggingface_hub import HfFileSystem
 
 import polars_hf as plhf
 from polars_hf.write import _infer_format
@@ -43,16 +42,12 @@ def test_sink_requires_file_path() -> None:
 
 def test_sink_revision_rejected() -> None:
     with pytest.raises(ValueError, match="do not support @revision"):
-        plhf.sink_bucket(pl.DataFrame({"a": [1]}), "hf://buckets/ns/name@main/x.parquet")
+        plhf.sink_bucket(
+            pl.DataFrame({"a": [1]}), "hf://buckets/ns/name@main/x.parquet"
+        )
 
 
-# ---- live round-trips (network, token-gated) -------------------------------
-
-_HAS_TOKEN = bool(get_token() or os.environ.get("HF_TOKEN"))
-network = pytest.mark.skipif(not _HAS_TOKEN, reason="no Hugging Face token available")
-
-BUCKET = "davanstrien/polars-hf-wheels"
-PREFIX = f"hf://buckets/{BUCKET}/sink-tests"
+# ---- staging round-trips (pytest -m staging) --------------------------------
 
 _READERS = {
     "parquet": pl.read_parquet,
@@ -62,42 +57,53 @@ _READERS = {
 }
 
 
-@pytest.mark.network
-@network
+def _staging_fs() -> HfFileSystem:
+    return HfFileSystem(endpoint=STAGING_ENDPOINT, token=STAGING_TOKEN)
+
+
+@pytest.mark.staging
 @pytest.mark.parametrize("ext", ["parquet", "csv", "ipc", "ndjson"])
-def test_roundtrip_lazyframe(ext: str) -> None:
+def test_roundtrip_lazyframe(staging_bucket: str, ext: str) -> None:
     df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "c": [1.5, 2.5, 3.5]})
-    uri = f"{PREFIX}/lazy.{ext}"
+    uri = f"hf://buckets/{staging_bucket}/sink-tests/lazy.{ext}"
     plhf.sink_bucket(df.lazy(), uri)
 
-    fs = HfFileSystem()
-    with fs.open(f"buckets/{BUCKET}/sink-tests/lazy.{ext}", "rb") as f:
+    with _staging_fs().open(
+        f"buckets/{staging_bucket}/sink-tests/lazy.{ext}", "rb"
+    ) as f:
         back = _READERS[ext](f)
     assert back.shape == (3, 3)
     if ext in ("parquet", "ipc"):
         assert back.equals(df)
 
 
-@pytest.mark.network
-@network
-def test_roundtrip_dataframe_via_scan_bucket() -> None:
+@pytest.mark.staging
+def test_roundtrip_dataframe_via_scan_bucket(staging_bucket: str) -> None:
     # Eager DataFrame input, and read back through our own scan_bucket.
     df = pl.DataFrame({"n": range(100), "g": ["a", "b"] * 50})
-    uri = f"{PREFIX}/eager.parquet"
+    uri = f"hf://buckets/{staging_bucket}/sink-tests/eager.parquet"
     plhf.sink_bucket(df, uri)
     back = plhf.scan_bucket(uri).collect()
     assert back.shape == (100, 2)
     assert back.equals(df)
 
 
-@pytest.mark.network
-@network
-def test_format_override() -> None:
+@pytest.mark.staging
+def test_roundtrip_explicit_token(staging_bucket: str) -> None:
+    df = pl.DataFrame({"a": [1, 2]})
+    uri = f"hf://buckets/{staging_bucket}/sink-tests/token.parquet"
+    plhf.sink_bucket(df, uri, token=STAGING_TOKEN)
+    assert plhf.scan_bucket(uri, token=STAGING_TOKEN).collect().equals(df)
+
+
+@pytest.mark.staging
+def test_format_override(staging_bucket: str) -> None:
     # Extension says .data but we force parquet.
     df = pl.DataFrame({"a": [1, 2]})
-    uri = f"{PREFIX}/override.data"
+    uri = f"hf://buckets/{staging_bucket}/sink-tests/override.data"
     plhf.sink_bucket(df, uri, format="parquet")
-    fs = HfFileSystem()
-    with fs.open(f"buckets/{BUCKET}/sink-tests/override.data", "rb") as f:
+    with _staging_fs().open(
+        f"buckets/{staging_bucket}/sink-tests/override.data", "rb"
+    ) as f:
         back = pl.read_parquet(f)
     assert back.shape == (2, 1)
