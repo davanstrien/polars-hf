@@ -121,7 +121,9 @@ hf://buckets/{namespace}/{name}/{path}
    extension: `data/*` also selects `data/notes.txt`, and Polars then fails at `collect()` because
    that file is not parquet. Use `data/*.parquet`, or `data` for the directory reading. A file
    whose name is exactly the pattern wins over the matches (`data[1].parquet` reads that file,
-   not `data1.parquet`).
+   not `data1.parquet`). A *directory* name with glob characters is not read literally: escape
+   them with a character class — `[[]` for `[`, `[*]` for `*`, `[?]` for `?`. The files of the
+   directory `run[1]/` are `run[[]1]/*.parquet`.
 2. Else **a single file**, if a file with exactly this name exists — whatever its extension.
 3. Else **a directory, or the whole bucket** when `{path}` is empty: every `.parquet` / `.pq` file
    below it, at any depth; the extension is matched case-insensitively. A trailing `/` forces
@@ -167,7 +169,9 @@ up to 5 times; only the failed request is sent again. `scan_bucket` sends the li
 itself (it does not call `HfApi.list_bucket_tree`), so the same limits apply to every page and on
 every supported `huggingface_hub` version. The wait before a retry is the
 one the Hub asks for (rate-limit reset, `Retry-After`), else 1 s doubling up to 8 s. When the Hub
-asks for more than 5 s, a warning announces the wait, so a paused scan is not silent.
+asks for more than 5 s, one warning per `scan_bucket` call announces the wait, so a paused scan is
+not silent. If your warning filter turns warnings into errors, the message is logged (logger
+`polars_hf.read`) instead, and the scan continues.
 
 One `scan_bucket` call waits only while the wait ends within 10 minutes of its start. A rate-limit
 reset in 300 s is waited for; a wait that would pass the 10 minutes raises `HfHubHTTPError` at
@@ -190,6 +194,8 @@ client factory (`huggingface_hub.set_client_factory`) apply.
 | A glob ends with `/`, or uses `**` inside a segment (`data/**.parquet`) | `ValueError` |
 | The Hub serves a file itself instead of redirecting to a presigned URL (a file that is not Xet-backed) | `RuntimeError`; Polars cannot read a URL that needs the token |
 | Any other HTTP error, or a `408` / `429` / `5xx` that the retries did not clear | `huggingface_hub.errors.HfHubHTTPError` |
+| A listing answer is not what the Hub API documents (not a JSON list, a next link that leaves the Hub or repeats a page) | `RuntimeError` |
+| A listing with many pages does not finish within 10 minutes | `TimeoutError` |
 | A timeout or a connection error | the exception of the HTTP library (`httpx` / `httpx2`), not retried |
 
 A private bucket that the token cannot see is reported by the Hub as "not found", so it raises
