@@ -35,7 +35,8 @@ uv add "polars-hf @ git+https://github.com/davanstrien/polars-hf"
 # or: pip install "git+https://github.com/davanstrien/polars-hf"
 ```
 
-Requires `polars>=1.40,<3`, `huggingface_hub>=1.12,<3` and `httpx>=0.27,<1`.
+Requires `polars>=1.40,<3`, `huggingface_hub>=1.12,<3` and `httpx>=0.27,<1`. Writes that use no
+local disk need `huggingface_hub>=1.19` (see [Writing](#writing)).
 
 ### On Hugging Face Jobs
 
@@ -87,14 +88,63 @@ plhf.sink_bucket(lf, "hf://buckets/ns/name/out.parquet")
 # Partitioned: pass a base prefix + partition options (native pl.PartitionBy):
 plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year")
 plhf.sink_bucket(lf, "hf://buckets/ns/name/shards", max_rows_per_file=1_000_000)
+
+# Replace the content of a prefix: files this call does not write are deleted.
+plhf.sink_bucket(lf, "hf://buckets/ns/name/by_year", partition_by="year", mode="overwrite")
 ```
 
-`sink_bucket` accepts a `LazyFrame` (streaming) or a `DataFrame`. Partitioned writes split by key
-(hive `key=value/` layout), by size, or both. Two modes:
+`sink_bucket` accepts a `LazyFrame` (streaming) or a `DataFrame` and runs the query before it
+returns (`lazy=True` is rejected). Partitioned writes split by key, by size, or both.
 
-- `atomic=True` (default) — stage partitions locally, upload in one commit; bounded by local disk.
-- `atomic=False` — stream each partition straight to the bucket; handles bigger-than-disk, one commit
-  per file (cheap on buckets, which are not git-backed).
+**Object names.** A partitioned write uses the names Polars writes to a local directory:
+`key=value/` directories and files `00000000.parquet`, `00000001.parquet`, ... (the index is
+hexadecimal; the extension is `.parquet`, `.csv`, `.ipc` or `.jsonl`). Key values are
+percent-encoded like Polars does (`/`, `=`, `%`, `:`, space, control characters and non-ASCII
+bytes), and a null key is `__HIVE_DEFAULT_PARTITION__`. A partitioned write whose query returns
+no rows writes one file with the schema and no rows, `{prefix}/00000000.{extension}`, so the prefix
+can be scanned afterwards.
+
+**`mode`** sets what happens to objects that are already at the destination:
+
+| `mode` | Single file | Partitioned (base prefix) |
+| --- | --- | --- |
+| `"append"` (default) | the object is replaced | existing files stay; a file with the same name as a new file is replaced |
+| `"overwrite"` | same as `"append"` | as `"append"`, then every file below the prefix that this call did not write is deleted |
+| `"error"` | `FileExistsError` if the object exists | `FileExistsError` if any file exists below the prefix |
+
+`"overwrite"` on a bucket root (`hf://buckets/ns/name`) deletes every other file of the bucket.
+The check of `"error"` is a listing before the write: it does not exclude a concurrent writer.
+
+**`backend`** sets how the output reaches the bucket:
+
+| `backend` | How | Local disk | Needs |
+| --- | --- | --- | --- |
+| `"xet"` | each output file is streamed into Xet storage with `hf_xet` while Polars writes it, then all files are registered in the bucket | none for the output | `huggingface_hub>=1.19` (which installs `hf_xet>=1.5.1` on x86_64 and arm64) |
+| `"hub"` | Polars writes the output to a temporary directory; `HfApi.batch_bucket_files` uploads it | the size of the complete output | any supported `huggingface_hub` |
+
+The default (`backend=None`) is the environment variable `POLARS_HF_SINK_BACKEND` if set, else
+`"xet"` when the installed packages support it, else `"hub"`. An explicit `"xet"` that cannot run
+raises an error; it does not fall back. The `"hub"` backend stages in `staging_dir=`, else in
+`POLARS_HF_STAGING_DIR`, else in the system temporary directory, and removes the files when the write
+ends. With `"xet"`, all upload streams stay open until the query ends, so memory use grows with the
+number of output files.
+
+**What a failure leaves behind.** With both backends, no file is registered in the bucket before the
+Polars sink has finished without an error. If the query fails, the destination is unchanged: an
+existing object keeps its content, and no partial or empty file appears. An upload error is raised
+to the caller; in a write of at most 1,000 files it also leaves the destination unchanged.
+
+The write is **not transactional**, because the bucket API has no transactions:
+
+- Files are registered in requests of at most 1,000 operations. If a write of more than 1,000 files
+  fails between two requests, the files of the earlier requests stay in the bucket.
+- If the bucket rejects single files of a request (for example an invalid path), it still applies
+  the other files of that request. `sink_bucket` then raises an error that lists the rejected
+  paths.
+- `mode="overwrite"` deletes the stale files only after all new files are registered, in separate
+  requests. If a delete request fails, the prefix holds the new files and the remaining stale
+  files.
+- A reader can see a part of the new files while the requests are in progress.
 
 ### Authentication
 
@@ -167,15 +217,25 @@ uv run pytest -m staging      # live tests against the Hub CI staging instance
 **Offline tests** need no network and no token. `tests/fakehub.py` runs a local fake Hub: one HTTP
 server for the bucket API and the `resolve` redirect, and a second one (another origin) that serves
 the "presigned" URLs with range requests. It records every request and the bytes it serves, and can
-be scripted to fail (`429`, `503`, `403`, ...). Uploads are stored in memory through a patched
-`HfApi._batch_bucket_files`, so the client-side chunking of the public method stays real. Use the
-`fake_hub` / `fake_bucket` fixtures.
+be scripted to fail (`429`, `503`, `403`, ...). File uploads do not go over HTTP; the fake has one
+seam per sink backend. For the `"hub"` backend, a patched `HfApi._batch_bucket_files` stores the
+files in memory, so the client-side chunking of the public method stays real. For the `"xet"`
+backend, an in-memory object replaces the `hf_xet` upload commit, and the backend's own
+registration request goes to the fake's `POST /api/buckets/{id}/batch` route. The fake also reports
+the `"xet"` backend as available, so the offline suite runs both backends with every supported
+`huggingface_hub`. The real `hf_xet` upload is covered by the staging tests only. Use the
+`fake_hub` / `fake_bucket` fixtures. `tests/sinks.py` is the one place that names the write design
+(backends and failure switches); write tests go through its helpers.
 
 **Staging tests** (`-m staging`) do real round-trips against `https://hub-ci.huggingface.co`, the
 instance `huggingface_hub` uses for its own tests. `tests/conftest.py` sets `HF_ENDPOINT` and
 `HF_TOKEN` to the staging endpoint and its public CI token *before* `huggingface_hub` is imported,
 so the test process never talks to `huggingface.co` and never reads your own token. Each test
-creates a uniquely named bucket and deletes it afterwards. Staging can answer
+creates a uniquely named bucket and deletes it afterwards. `tests/test_staging_sinks.py` runs the
+same write scenarios for both sink backends; the `xet` cases are skipped when the installed
+`huggingface_hub` is older than 1.19. `test_local_disk_use` measures the growth of the temporary
+directory during a write (16 MB by default; `POLARS_HF_DISK_TEST_MB=300 uv run pytest -m staging -k
+test_local_disk_use -s` prints a larger measurement). Staging can answer
 `409`/`502`/`503`/`504` or time out; a test that fails with one of these is rerun automatically
 (`pytest-rerunfailures`). Other failures are not rerun.
 
