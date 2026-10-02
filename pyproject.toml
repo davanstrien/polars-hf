@@ -26,6 +26,8 @@ Repository = "https://github.com/davanstrien/polars-hf"
 
 [dependency-groups]
 dev = [
+    # LazyFrame.serialize() pickles the IO source of scan_bucket with cloudpickle.
+    "cloudpickle>=3",
     # The fake Hub and the tests build requests and responses with httpx.
     # polars-hf itself sends its requests through the huggingface_hub session.
     "httpx>=0.27,<1",
@@ -49,8 +51,10 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Live staging tests are opt-in: `pytest -m staging` (a later -m replaces this one).
-addopts = "-m 'not staging'"
+# Slow offline tests run with `pytest -m slow`, and in the weekly CI run.
+addopts = "-m 'not staging and not slow'"
 xfail_strict = true
 markers = [
     "staging: live tests against the Hub CI instance (hub-ci.huggingface.co)",
+    "slow: offline tests that wait for the retries of polars (several seconds each)",
 ]

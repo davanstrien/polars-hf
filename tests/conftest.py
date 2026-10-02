@@ -45,6 +45,7 @@ for _name in ("NO_PROXY", "no_proxy"):
         _hosts.append(os.environ[_name])
     os.environ[_name] = ",".join(_hosts)
 
+import re  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
@@ -90,6 +91,69 @@ if HUB_MAJOR >= 2:
     import httpx2 as hub_httpx
 else:
     hub_httpx = httpx
+
+POLARS_MAJOR = int(pl.__version__.split(".")[0])
+
+# A query parameter that holds a signature or a credential of a presigned URL
+# (CloudFront, S3 and Xet forms), plain or percent-encoded.
+_SIGNED_PARAMETER = re.compile(
+    r"(signature|policy|key-pair-id|x-amz-[a-z0-9-]+|x-xet-[a-z0-9-]+)(=|%3d)",
+    re.IGNORECASE,
+)
+
+
+def assert_no_signed_url(text: str | bytes, fake_hub: FakeHub) -> None:
+    """``text`` holds no presigned URL of the fake Hub and no part of one.
+
+    The check does not depend on the names the fake uses: the host of the cdn
+    server must not appear, and no signature-like query parameter.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("latin-1")
+    cdn_host = fake_hub.cdn_endpoint.partition("://")[2]
+    assert cdn_host not in text
+    assert _SIGNED_PARAMETER.search(text) is None
+
+
+def exception_chain(error: BaseException) -> list[BaseException]:
+    """``error`` and every exception linked to it as cause or context."""
+    chain: list[BaseException] = []
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is seen for seen in chain):
+            continue
+        chain.append(current)
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return chain
+
+
+@contextmanager
+def raises_at_collect(
+    expected: type[BaseException],
+    match: str | None = None,
+    *,
+    schema_step: bool = False,
+) -> Iterator[pytest.ExceptionInfo]:
+    """Expect ``expected`` from a query of a collect-time ``scan_bucket``.
+
+    Polars 1.x wraps an exception that an IO source raises in a
+    ``ComputeError`` whose message holds the type name and the message;
+    Polars 2 raises the exception itself. Every version wraps an exception of
+    the schema read (``schema_step=True``). ``match`` is searched in the
+    message in both cases.
+    """
+    wrapped = schema_step or POLARS_MAJOR < 2
+    raised = pl.exceptions.ComputeError if wrapped else expected
+    with pytest.raises(raised) as error:
+        yield error
+    message = str(error.value)
+    if wrapped:
+        assert f"{expected.__name__}: " in message
+    if match is not None:
+        assert re.search(match, message), message
+
 
 # Transient staging errors only: HTTP 409/502/503/504 and timeouts. Anything
 # else (a missing file, a read error) can be a real read-after-write bug and
@@ -163,6 +227,25 @@ def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     # the fake Hub. test_retry.py checks that these names exist.
     for name in RETRY_BACKOFF_CONSTANTS:
         monkeypatch.setattr(read, name, 0.001, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_mode_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mode or an acknowledgement of the developer's shell must not reach a test."""
+    monkeypatch.delenv("POLARS_HF_RESOLVE", raising=False)
+    monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", raising=False)
+
+
+@pytest.fixture
+def allow_signed_urls_in_plan(
+    monkeypatch: pytest.MonkeyPatch, _no_mode_from_the_environment: None
+) -> None:
+    """Acknowledge ``resolve="now"`` for one test.
+
+    Tests use that mode as the reference (the plain native scan) and must ask
+    for this fixture. A test without it cannot pass through the gated mode.
+    """
+    monkeypatch.setenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", "1")
 
 
 @pytest.fixture(autouse=True)

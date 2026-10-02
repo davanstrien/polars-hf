@@ -62,6 +62,22 @@ def test_signed_url_requires_its_signature(fake_hub: FakeHub, fake_bucket: str) 
     assert bad.status_code == 401
 
 
+def test_signed_urls_can_be_expired(fake_hub: FakeHub, fake_bucket: str) -> None:
+    from conftest import STAGING_TOKEN
+
+    fake_hub.put_parquet(fake_bucket, "one.parquet", _numbered_frame(0, 10))
+    resolve = f"{fake_hub.endpoint}/buckets/{fake_bucket}/resolve/one.parquet"
+    headers = {"Authorization": f"Bearer {STAGING_TOKEN}"}
+    old = httpx.head(resolve, headers=headers).headers["Location"]
+    assert httpx.get(old).status_code == 200
+
+    fake_hub.expire_signed_urls()
+    new = httpx.head(resolve, headers=headers).headers["Location"]
+
+    assert httpx.get(old).status_code == 403
+    assert httpx.get(new).status_code == 200
+
+
 def test_patched_batch_supports_bytes_paths_and_delete(
     fake_hub: FakeHub, fake_bucket: str, tmp_path
 ) -> None:

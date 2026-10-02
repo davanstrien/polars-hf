@@ -1,4 +1,10 @@
-"""Offline read tests: ``scan_bucket`` against the fake Hub (no network)."""
+"""Offline read tests: ``scan_bucket`` against the fake Hub (no network).
+
+The tests of the requests of ``scan_bucket()`` run in both ``resolve`` modes:
+``"now"`` resolves every file in the call, ``"collect"`` (the default) resolves
+none of the listed files before the query runs. ``test_collect_time.py`` has
+the tests of what a query requests.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +26,14 @@ def _uri(bucket_id: str, path: str) -> str:
 def _numbered_frame(start: int, rows: int) -> pl.DataFrame:
     ids = pl.int_range(start, start + rows, eager=True)
     return pl.DataFrame({"id": ids, "label": (ids % 3).cast(pl.String)})
+
+
+MODES = ("collect", "now")
+
+
+def _resolves_in_the_call(mode: str, n_files: int) -> int:
+    """The ``resolve`` requests that ``scan_bucket()`` sends for N listed files."""
+    return n_files if mode == "now" else 0
 
 
 def _wide_frame(rows: int) -> pl.DataFrame:
@@ -61,28 +75,34 @@ def test_directory_scan_is_recursive(fake_hub: FakeHub, fake_bucket: str) -> Non
     assert_frame_equal(got.sort("id"), _numbered_frame(0, 20))
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_scan_is_lazy_and_resolves_one_head_per_file(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     n_files = 4
     for i in range(n_files):
         frame = _numbered_frame(i * 100, 100)
         fake_hub.put_parquet(fake_bucket, f"data/run_{i}.parquet", frame)
 
-    lf = plhf.scan_bucket(_uri(fake_bucket, "data/run_*.parquet"))
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/run_*.parquet"), resolve=mode)
 
     # Building the LazyFrame transfers no file data: nothing reaches the cdn
-    # and the resolve endpoint only sees HEAD requests, one per file.
+    # and the resolve endpoint only sees HEAD requests: one per file with
+    # resolve="now", none with resolve="collect".
     assert fake_hub.matching(origin=CDN) == []
     assert fake_hub.matching(origin=HUB, method="GET", path_contains="/resolve/") == []
     heads = fake_hub.matching(origin=HUB, method="HEAD", path_contains="/resolve/")
-    assert len(heads) == n_files
-    assert sorted(r.path for r in heads) == [
-        f"/buckets/{fake_bucket}/resolve/data/run_{i}.parquet" for i in range(n_files)
-    ]
+    assert len(heads) == _resolves_in_the_call(mode, n_files)
 
     assert lf.collect().height == n_files * 100
     assert len(fake_hub.matching(origin=CDN, method="GET")) > 0
+    # After the query, both modes have sent one HEAD request per file.
+    assert fake_hub.matching(origin=HUB, method="GET", path_contains="/resolve/") == []
+    heads = fake_hub.matching(origin=HUB, method="HEAD", path_contains="/resolve/")
+    assert sorted(r.path for r in heads) == [
+        f"/buckets/{fake_bucket}/resolve/data/run_{i}.parquet" for i in range(n_files)
+    ]
 
 
 def test_authorization_stays_on_the_hub_origin(
@@ -283,19 +303,23 @@ def _hub_calls(fake_hub: FakeHub) -> list[tuple[str, str, int]]:
     return calls
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_single_parquet_file_is_one_request(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     fake_hub.put_parquet(fake_bucket, "data/one.parquet", _numbered_frame(0, 5))
 
-    plhf.scan_bucket(_uri(fake_bucket, "data/one.parquet"))
+    plhf.scan_bucket(_uri(fake_bucket, "data/one.parquet"), resolve=mode)
 
     assert _hub_calls(fake_hub) == [("HEAD", "resolve", 302)]
     assert fake_hub.matching(origin=CDN) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_directory_of_n_files_is_one_listing_and_n_resolves(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     n_files = 20
     for i in range(n_files):
@@ -303,39 +327,44 @@ def test_directory_of_n_files_is_one_listing_and_n_resolves(
         fake_hub.put_parquet(fake_bucket, f"data/sub{i % 3}/part-{i}.parquet", frame)
     fake_hub.put(fake_bucket, "data/_SUCCESS", b"")
 
-    lf = plhf.scan_bucket(_uri(fake_bucket, "data"))
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data"), resolve=mode)
 
     # The path is tried as a file first; the listing then names the files.
     calls = _hub_calls(fake_hub)
     assert calls[:2] == [("HEAD", "resolve", 404), ("GET", "tree", 200)]
-    assert calls[2:] == [("HEAD", "resolve", 302)] * n_files
+    in_the_call = _resolves_in_the_call(mode, n_files)
+    assert calls[2:] == [("HEAD", "resolve", 302)] * in_the_call
     # No file data, and no request to the cdn, before collect().
     assert fake_hub.matching(origin=CDN) == []
+
+    assert lf.collect().height == n_files * 10
+    # N resolve requests in total, in the call or in the query.
+    assert _hub_calls(fake_hub)[2:] == [("HEAD", "resolve", 302)] * n_files
     resolved = fake_hub.matching(origin=HUB, method="HEAD")
     assert len({request.path for request in resolved}) == n_files + 1
 
-    assert lf.collect().height == n_files * 10
 
-
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_glob_is_one_listing_and_one_resolve_per_match(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     for i in range(3):
         frame = _numbered_frame(i * 10, 10)
         fake_hub.put_parquet(fake_bucket, f"data/run_{i}.parquet", frame)
     fake_hub.put_parquet(fake_bucket, "data/other.parquet", _numbered_frame(90, 5))
 
-    plhf.scan_bucket(_uri(fake_bucket, "data/run_*.parquet"))
+    plhf.scan_bucket(_uri(fake_bucket, "data/run_*.parquet"), resolve=mode)
 
-    assert (
-        _hub_calls(fake_hub) == [("GET", "tree", 200)] + [("HEAD", "resolve", 302)] * 3
-    )
+    resolves = [("HEAD", "resolve", 302)] * _resolves_in_the_call(mode, 3)
+    assert _hub_calls(fake_hub) == [("GET", "tree", 200)] + resolves
     # The glob is in the last segment: its directory is listed, not the subtree.
     listing = fake_hub.matching(origin=HUB, method="GET")[0]
     assert listing.path.endswith("/tree/data")
     assert listing.query == "recursive=false"
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("path", ["data", "data/**/*.parquet"])
 def test_directory_and_recursive_glob_list_the_subtree(
     fake_hub: FakeHub, fake_bucket: str, path: str
@@ -343,7 +372,7 @@ def test_directory_and_recursive_glob_list_the_subtree(
     fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
     fake_hub.put_parquet(fake_bucket, "data/x/y/b.parquet", _numbered_frame(5, 5))
 
-    plhf.scan_bucket(_uri(fake_bucket, path))
+    plhf.scan_bucket(_uri(fake_bucket, path), resolve="now")
 
     listings = fake_hub.matching(origin=HUB, method="GET")
     assert [request.query for request in listings] == ["recursive=true"]
@@ -421,18 +450,19 @@ def test_file_without_parquet_extension_is_one_request(
     assert _hub_calls(fake_hub) == [("HEAD", "resolve", 302)]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("path", ["data/", ""])
 def test_trailing_slash_and_whole_bucket_skip_the_file_request(
-    fake_hub: FakeHub, fake_bucket: str, path: str
+    fake_hub: FakeHub, fake_bucket: str, path: str, mode: str
 ) -> None:
     fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
     fake_hub.put_parquet(fake_bucket, "data/b.parquet", _numbered_frame(5, 5))
 
-    plhf.scan_bucket(_uri(fake_bucket, path))
+    plhf.scan_bucket(_uri(fake_bucket, path), resolve=mode)
 
-    assert (
-        _hub_calls(fake_hub) == [("GET", "tree", 200)] + [("HEAD", "resolve", 302)] * 2
-    )
+    resolves = [("HEAD", "resolve", 302)] * _resolves_in_the_call(mode, 2)
+    assert _hub_calls(fake_hub) == [("GET", "tree", 200)] + resolves
 
 
 @pytest.mark.parametrize("path", ["nope", "nope.parquet", "data/nope.bin"])
@@ -479,14 +509,17 @@ def test_invalid_glob_makes_no_request(fake_hub: FakeHub, fake_bucket: str) -> N
     assert fake_hub.matching(origin=HUB) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_directory_named_like_a_file_costs_one_extra_resolve(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     fake_hub.put_parquet(
         fake_bucket, "out.parquet/part-0.parquet", _numbered_frame(0, 5)
     )
 
-    plhf.scan_bucket(_uri(fake_bucket, "out.parquet"))
+    # The requests of the call and of one query.
+    plhf.scan_bucket(_uri(fake_bucket, "out.parquet"), resolve=mode).collect()
 
     assert _hub_calls(fake_hub) == [
         ("HEAD", "resolve", 404),
@@ -691,11 +724,13 @@ def test_file_served_without_redirect_is_rejected(
     assert fake_hub.matching(origin=CDN) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("mode", MODES)
 def test_expired_signed_url_fails_at_collect(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     fake_hub.put_parquet(fake_bucket, "one.parquet", _numbered_frame(0, 10))
-    lf = plhf.scan_bucket(_uri(fake_bucket, "one.parquet"))
+    lf = plhf.scan_bucket(_uri(fake_bucket, "one.parquet"), resolve=mode)
     # An expired presigned URL: the cdn refuses every request from now on.
     for method in ("HEAD", "GET"):
         fake_hub.add_fault(

@@ -4,11 +4,19 @@ Selected with ``pytest -m staging``. The ``staging_read_bucket`` fixture seeds a
 bucket once per module with synthetic data (see ``conftest.staging_seed_files``):
 ``smoke/filtered.parquet`` is 500 x 4, ``smoke/bench/run_*.parquet`` are three
 homogeneous 100k-row files, and ``smoke/*.parquet`` has mixed schemas.
+
+``scan_bucket`` resolves the presigned URLs when the query runs
+(``resolve="collect"``, the default), so these tests cover that mode. The last
+section compares it with ``resolve="now"``, which needs the variable
+``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1``: the tests that use that mode ask
+for the ``allow_signed_urls_in_plan`` fixture.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
+from urllib.parse import urlparse
 
 import polars as pl
 import pytest
@@ -357,6 +365,7 @@ def test_multi_page_listing_equals_one_page(
     assert len(one_page) == 8
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_odd_names_are_listed_and_resolved(
     odd_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -369,7 +378,7 @@ def test_odd_names_are_listed_and_resolved(
         read.pl, "scan_parquet", lambda urls, **kw: resolved.extend(urls)
     )
 
-    plhf.scan_bucket(f"hf://buckets/{odd_bucket}/odd/")
+    plhf.scan_bucket(f"hf://buckets/{odd_bucket}/odd/", resolve="now")
 
     assert len(resolved) == len(_ODD_NAMES)
 
@@ -380,3 +389,199 @@ def test_missing_bucket_listing_raises_file_not_found(odd_bucket: str) -> None:
 
     with pytest.raises(FileNotFoundError, match="not found"):
         _own_listing(missing, "", True)
+
+
+# ---- resolve="collect" (the default) and resolve="now" ---------------------
+#
+# Every test above runs in the default mode. These pin, on the real Hub, what
+# differs between the modes and that both return the same rows.
+
+
+def _signed_url_hosts(lf: pl.LazyFrame) -> set[str]:
+    """The hosts of the URLs in the plan of a ``resolve="now"`` scan."""
+    urls = re.findall(r"https?://[^\s\"\x27\[\],]+", lf.explain())
+    return {urlparse(url).netloc for url in urls}
+
+
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.filterwarnings("ignore:.*json.*:UserWarning")
+def test_default_plan_holds_no_signed_url(glob: str) -> None:
+    from conftest import STAGING_ENDPOINT, STAGING_TOKEN
+
+    now = plhf.scan_bucket(glob, resolve="now")
+    hosts = _signed_url_hosts(now)
+    # The native node holds the presigned URLs: another host than the Hub.
+    assert hosts and urlparse(STAGING_ENDPOINT).netloc not in hosts
+    assert "signature=" in now.explain().lower()
+
+    lf = plhf.scan_bucket(glob)
+    # A query, so that the source has resolved URLs and read the schema.
+    assert lf.head(1).collect().height == 1
+
+    binary = lf.serialize(format="binary")
+    for text in (lf.explain(), lf.explain(optimized=False)):
+        assert "https://" not in text
+        assert "signature=" not in text.lower()
+    for host in hosts:
+        assert host.encode() not in binary
+    assert b"signature=" not in binary.lower()
+    assert STAGING_TOKEN.encode() not in binary
+    assert "signature=" not in lf.serialize(format="json").lower()
+
+
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize("group_files", [2, 64])
+def test_modes_return_the_same_rows_in_the_same_order(
+    glob: str, monkeypatch: pytest.MonkeyPatch, group_files: int
+) -> None:
+    from polars_hf import read
+
+    # With groups of 2 files the 3 files are scanned as two native scans.
+    monkeypatch.setattr(read, "_GROUP_FILES", group_files)
+
+    got = plhf.scan_bucket(glob).collect()
+    native = plhf.scan_bucket(glob, resolve="now").collect()
+
+    assert_frame_equal(got, native)
+    assert got["id"].to_list() == list(range(GLOB_ROWS))
+
+
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+@pytest.mark.parametrize(
+    "query",
+    [
+        lambda lf: lf.select(pl.len()),
+        lambda lf: lf.select("category", "id").head(150_000),
+        lambda lf: lf.filter(pl.col("id") >= 199_990).select("id", "text"),
+        lambda lf: lf.head(150_000).filter(pl.col("category") == "3"),
+        lambda lf: lf.tail(7),
+        lambda lf: lf.slice(99_995, 10),
+        lambda lf: lf.group_by("category").agg(pl.col("value").sum()).sort("category"),
+    ],
+    ids=["count", "head", "filter", "head-filter", "tail", "slice", "aggregate"],
+)
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_queries_equal_the_native_scan(
+    glob: str, monkeypatch: pytest.MonkeyPatch, query, engine: str
+) -> None:
+    from polars_hf import read
+
+    monkeypatch.setattr(read, "_GROUP_FILES", 2)
+
+    got = query(plhf.scan_bucket(glob)).collect(engine=engine)
+    native = query(plhf.scan_bucket(glob, resolve="now")).collect(engine=engine)
+
+    assert_frame_equal(got, native)
+
+
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+def test_mixed_schemas_equal_the_native_scan(
+    base: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polars_hf import read
+
+    # One file per group: the file with other columns starts its own group.
+    monkeypatch.setattr(read, "_GROUP_FILES", 1)
+    options = {"missing_columns": "insert", "extra_columns": "ignore"}
+    mixed = f"{base}/*.parquet"
+
+    got = plhf.scan_bucket(mixed, **options).collect()
+    native = plhf.scan_bucket(mixed, resolve="now", **options).collect()
+
+    assert_frame_equal(got, native)
+
+
+def test_include_file_paths_gives_bucket_uris(base: str) -> None:
+    uris = [f"{base}/bench/run_{run}.parquet" for run in range(GLOB_FILES)]
+
+    lf = plhf.scan_bucket(f"{base}/bench/", include_file_paths="file")
+    got = lf.select("id", "file").collect()
+    counts = got.group_by("file").len().sort("file")
+
+    # The hf:// URI of the file of every row, not the presigned URL.
+    assert counts["file"].to_list() == uris
+    assert counts["len"].to_list() == [100_000] * GLOB_FILES
+    one_file = lf.filter(pl.col("file") == uris[1]).select("id").collect()
+    assert one_file["id"].to_list() == list(range(100_000, 200_000))
+
+
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
+def test_now_mode_needs_the_acknowledgement_variable(
+    glob: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without the variable the mode is refused, and the default mode is not.
+    monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN")
+
+    with pytest.raises(ValueError, match="POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1"):
+        plhf.scan_bucket(glob, resolve="now")
+    assert plhf.scan_bucket(glob).head(1).collect().height == 1
+
+
+def test_odd_names_and_hive_directories_are_read(
+    staging_bucket: str, staging_api: HfApi
+) -> None:
+    names = [
+        "hive/year=2024/a b.parquet",
+        "hive/year=2025/ünï 50%.parquet",
+        "hive/#hash/q?.parquet",
+    ]
+    add = []
+    for name in names:
+        add.append((_parquet_bytes(pl.DataFrame({"name": [name]})), name))
+    _staging_retry(lambda: staging_api.batch_bucket_files(staging_bucket, add=add))
+    uri = f"hf://buckets/{staging_bucket}/hive/"
+
+    got = plhf.scan_bucket(uri, include_file_paths="file").collect().sort("name")
+
+    assert got["name"].to_list() == sorted(names)
+    assert got["file"].to_list() == [
+        f"hf://buckets/{staging_bucket}/{name}" for name in sorted(names)
+    ]
+
+
+def test_plan_is_resolved_again_for_every_query(single: str) -> None:
+    lf = plhf.scan_bucket(single)
+
+    first = lf.collect()
+    second = lf.select("id").collect()
+
+    assert_frame_equal(second, first.select("id"))
+
+
+def test_file_deleted_after_the_listing(
+    staging_bucket: str, staging_api: HfApi
+) -> None:
+    from conftest import raises_at_collect
+
+    add = []
+    for name in ("a", "b", "c"):
+        frame = pl.DataFrame({"name": [name]})
+        add.append((_parquet_bytes(frame), f"gone/{name}.parquet"))
+    _staging_retry(lambda: staging_api.batch_bucket_files(staging_bucket, add=add))
+    lf = plhf.scan_bucket(f"hf://buckets/{staging_bucket}/gone/")
+    deleted = "gone/b.parquet"
+    _staging_retry(
+        lambda: staging_api.batch_bucket_files(staging_bucket, delete=[deleted])
+    )
+
+    # The error of the resolve request, raised by the query; no URL in it.
+    with raises_at_collect(FileNotFoundError, "no such file") as error:
+        lf.collect()
+
+    assert f"hf://buckets/{staging_bucket}/{deleted}" in str(error.value)
+    assert "https://" not in str(error.value)
+
+
+def test_count_rows_reads_no_column(base: str, glob: str, single: str) -> None:
+    # The count comes from the footers of freshly resolved URLs. The mixed
+    # glob has files with different columns: a count does not compare them.
+    assert plhf.count_rows(glob) == GLOB_ROWS
+    assert plhf.count_rows(f"{base}/bench/") == GLOB_ROWS
+    assert plhf.count_rows(single) == 500
+    assert plhf.count_rows(f"{base}/*.parquet") == 520
+    assert (
+        plhf.count_rows(glob)
+        == plhf.scan_bucket(glob).select(pl.len()).collect().item()
+    )
+    with pytest.raises(FileNotFoundError):
+        plhf.count_rows(f"{base}/nope/")
