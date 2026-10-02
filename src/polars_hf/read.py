@@ -43,7 +43,7 @@ import threading
 import time
 import warnings
 from collections.abc import Generator, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
@@ -326,13 +326,24 @@ def _request(
     """
     attempt = 0
     while True:
-        response = get_session().request(
-            method,
-            url,
-            headers=headers,
-            follow_redirects=False,
-            timeout=_REQUEST_TIMEOUT,
-        )
+        failure = None
+        try:
+            response = get_session().request(
+                method,
+                url,
+                headers=headers,
+                follow_redirects=False,
+                timeout=_REQUEST_TIMEOUT,
+            )
+        except Exception as error:
+            # The frames of the HTTP library can hold the Location of a
+            # redirect (a signed URL) in their local variables: the error
+            # keeps its type and message and loses these frames.
+            failure = error
+            for linked in _exception_chain(error):
+                linked.__traceback__ = None
+        if failure is not None:
+            raise failure
         if response.status_code not in _RETRY_STATUS_CODES:
             return response
         _wait_before_retry(response, attempt, budget, what)
@@ -710,9 +721,16 @@ def _signed_url(
                 same_origin = _origin(location) == hub_origin
             except ValueError:
                 # urlparse refuses the port of the location.
+                same_origin = None
+            if same_origin is None:
+                # The location can be a signed URL: it is not put into the
+                # message, and it does not stay in the frame of the error.
+                location = None
+                response = None
                 raise RuntimeError(
-                    f"the Hub redirected {uri!r} to an invalid URL: {location!r}"
-                ) from None
+                    f"the Hub redirected {uri!r} to a URL that cannot be parsed "
+                    "(the URL is not shown: it can hold a signature)"
+                )
             if not same_origin:
                 if response.headers.get("x-linked-size") == "0":
                     # The signed URL does not stay in the frame of the error.
@@ -979,6 +997,8 @@ class _BucketSource:
         # File index -> (signed URL, time it was resolved). At most one entry
         # per file, in the order of the times: the oldest entry is the first.
         self._urls: dict[int, tuple[str, float]] = {}
+        # File index -> the resolve of that file that another thread runs now.
+        self._resolving: dict[int, Future] = {}
         self._lock = threading.Lock()
         self._schema_lock = threading.Lock()
 
@@ -1035,45 +1055,72 @@ class _BucketSource:
         is used again; the other files are resolved, with their own retry
         budget (``_SCAN_DEADLINE`` from now). Returns the URLs and whether
         one of them was used again. Older URLs are forgotten.
+
+        A file is resolved by one thread at a time: a thread that needs a
+        file that another thread resolves now waits for that result.
         """
         now = time.monotonic()
         urls: dict[int, str] = {}
+        mine: dict[int, Future] = {}
+        theirs: dict[int, Future] = {}
         with self._lock:
             self._drop_old_urls(now)
             for index in range(start, stop):
                 cached = self._urls.get(index)
                 if cached is not None:
                     urls[index] = cached[0]
+                elif index in self._resolving:
+                    theirs[index] = self._resolving[index]
+                else:
+                    mine[index] = Future()
+                    self._resolving[index] = mine[index]
         reused = len(urls) > 0
 
-        missing = []
-        for index in range(start, stop):
-            if index not in urls:
-                missing.append(index)
-        if missing:
-            budget = _Budget(
-                self.bucket_id,
-                scope=scope,
-                files_total=len(self.paths),
-                files_resolved=start + len(urls),
-            )
-            paths = [self.paths[index] for index in missing]
-            try:
-                resolved = _signed_urls(
-                    self.endpoint, self._hub_headers(), paths, budget
-                )
-            except BaseException:
-                # The error is raised through this frame: no URL stays in it.
-                urls.clear()
-                raise
-            resolved_at = time.monotonic()
-            with self._lock:
-                for index, url in zip(missing, resolved, strict=True):
-                    urls[index] = url
-                    # Removed first, so that the new entry is the last one.
-                    self._urls.pop(index, None)
-                    self._urls[index] = (url, resolved_at)
+        try:
+            if mine:
+                self._resolve_mine(mine, urls, scope, start + len(urls))
+            for index, pending in theirs.items():
+                # The result, or the error, of the thread that resolves it.
+                urls[index] = pending.result()
+        except BaseException:
+            # The error is raised through this frame: no URL stays in it.
+            urls.clear()
+            raise
         return [urls[index] for index in range(start, stop)], reused
+
+    def _resolve_mine(
+        self, mine: dict[int, Future], urls: dict[int, str], scope: str, resolved: int
+    ) -> None:
+        """Resolve the files of ``mine`` into ``urls``; publish them to waiters."""
+        budget = _Budget(
+            self.bucket_id,
+            scope=scope,
+            files_total=len(self.paths),
+            files_resolved=resolved,
+        )
+        indexes = sorted(mine)
+        paths = [self.paths[index] for index in indexes]
+        try:
+            new_urls = _signed_urls(self.endpoint, self._hub_headers(), paths, budget)
+        except BaseException as error:
+            with self._lock:
+                for index in indexes:
+                    del self._resolving[index]
+            for index in indexes:
+                mine[index].set_exception(error)
+                # Read here, so that a result nobody waits for is not logged.
+                mine[index].exception()
+            raise
+        resolved_at = time.monotonic()
+        with self._lock:
+            for index, url in zip(indexes, new_urls, strict=True):
+                urls[index] = url
+                # Removed first, so that the new entry is the last one.
+                self._urls.pop(index, None)
+                self._urls[index] = (url, resolved_at)
+                del self._resolving[index]
+        for index, url in zip(indexes, new_urls, strict=True):
+            mine[index].set_result(url)
 
     # ---- schema ------------------------------------------------------------
 
@@ -1488,7 +1535,12 @@ def scan_bucket(
     second query within 5 minutes sends none, and a single-file scan sends
     none after the one of the call. If the CDN refuses a URL that was used
     again, the group is resolved and scanned once more, provided that it has
-    not returned rows yet.
+    not returned rows yet. A kept URL names the content that the file had
+    when it was resolved: if the file is replaced in the bucket, a later
+    query on the same LazyFrame reads the old content until the URL is 5
+    minutes old; after that, and from a new ``scan_bucket`` call, it reads
+    the new content. Queries of several threads on one LazyFrame resolve a
+    file once: a thread waits for the resolve that another thread runs.
 
     ``resolve`` requests count in the Hub's "resolvers" rate limit.
 
