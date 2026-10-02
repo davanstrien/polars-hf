@@ -8,7 +8,8 @@ homogeneous 100k-row files, and ``smoke/*.parquet`` has mixed schemas.
 ``scan_bucket`` resolves the presigned URLs when the query runs
 (``resolve="collect"``, the default), so these tests cover that mode. The last
 section compares it with ``resolve="now"``, which needs the variable
-``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1`` (conftest sets it for every test).
+``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1``: the tests that use that mode ask
+for the ``allow_signed_urls_in_plan`` fixture.
 """
 
 from __future__ import annotations
@@ -364,6 +365,7 @@ def test_multi_page_listing_equals_one_page(
     assert len(one_page) == 8
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_odd_names_are_listed_and_resolved(
     odd_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -401,6 +403,7 @@ def _signed_url_hosts(lf: pl.LazyFrame) -> set[str]:
     return {urlparse(url).netloc for url in urls}
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.filterwarnings("ignore:.*json.*:UserWarning")
 def test_default_plan_holds_no_signed_url(glob: str) -> None:
     from conftest import STAGING_ENDPOINT, STAGING_TOKEN
@@ -426,6 +429,7 @@ def test_default_plan_holds_no_signed_url(glob: str) -> None:
     assert "signature=" not in lf.serialize(format="json").lower()
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("group_files", [2, 64])
 def test_modes_return_the_same_rows_in_the_same_order(
     glob: str, monkeypatch: pytest.MonkeyPatch, group_files: int
@@ -442,6 +446,7 @@ def test_modes_return_the_same_rows_in_the_same_order(
     assert got["id"].to_list() == list(range(GLOB_ROWS))
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize(
     "query",
     [
@@ -469,6 +474,7 @@ def test_queries_equal_the_native_scan(
     assert_frame_equal(got, native)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_mixed_schemas_equal_the_native_scan(
     base: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -499,11 +505,11 @@ def test_include_file_paths_gives_bucket_uris(base: str) -> None:
     assert one_file["id"].to_list() == list(range(100_000, 200_000))
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_now_mode_needs_the_acknowledgement_variable(
     glob: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # conftest sets the variable for every test; without it the mode is
-    # refused, and the default mode is not.
+    # Without the variable the mode is refused, and the default mode is not.
     monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN")
 
     with pytest.raises(ValueError, match="POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1"):

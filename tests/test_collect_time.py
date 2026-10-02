@@ -143,6 +143,7 @@ def test_collect_is_the_default_mode(fake_hub: FakeHub, fake_bucket: str) -> Non
     assert_frame_equal(lf.collect(), expected)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_now_mode_needs_the_acknowledgement_variable(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -150,7 +151,8 @@ def test_now_mode_needs_the_acknowledgement_variable(
     uri = _uri(fake_bucket, "data/")
     fake_hub.reset_log()
 
-    for value in (None, "0", "true", ""):
+    # Only the exact value "1" enables the mode.
+    for value in (None, "0", "true", "yes", "True", " 1", "1 ", "11", ""):
         if value is None:
             monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN")
         else:
@@ -160,7 +162,7 @@ def test_now_mode_needs_the_acknowledgement_variable(
         message = str(error.value)
         assert "about 60 minutes" in message
         assert "explain(), serialize(), an error message or a log" in message
-        assert "POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1" in message
+        assert "set POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1" in message
     # Refused before any request; the default mode needs no variable.
     assert fake_hub.requests == []
     assert_frame_equal(plhf.scan_bucket(uri).collect(), expected)
@@ -171,6 +173,7 @@ def test_now_mode_needs_the_acknowledgement_variable(
     assert_frame_equal(lf.collect(), expected)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_environment_variable_selects_the_mode(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,6 +200,7 @@ def test_environment_variable_selects_the_mode(
     assert fake_hub.requests == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("path", ["data/p00.parquet", "data", "data/*.parquet"])
 def test_both_modes_return_the_same_rows(
     fake_hub: FakeHub, fake_bucket: str, path: str
@@ -237,6 +241,7 @@ def test_plan_holds_no_signed_url_and_no_token(
     assert b"data/p01.parquet" in binary
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_now_mode_plan_holds_the_signed_url(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -405,6 +410,7 @@ def test_group_bounds() -> None:
     assert bounds(130, limited=True, one_group=True) == [(0, 130)]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_files_are_resolved_and_scanned_group_by_group(
     fake_hub: FakeHub, fake_bucket: str, small_groups: int
 ) -> None:
@@ -455,6 +461,7 @@ def test_head_over_several_groups(
     assert sorted(_resolved(fake_hub)) == [f"p{i:02d}.parquet" for i in range(4)]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_now_mode_resolves_every_file_for_head(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -487,6 +494,7 @@ _QUERIES = {
 }
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("engine", ["in-memory", "streaming"])
 @pytest.mark.parametrize("name", list(_QUERIES))
 def test_queries_equal_the_native_scan(
@@ -528,6 +536,7 @@ def _bytes_of_both_modes(fake_hub: FakeHub, uri: str, query) -> tuple[int, int]:
     return served["collect"], served["now"]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize(
     ("query", "rows"),
     [
@@ -554,6 +563,7 @@ def test_query_reads_a_part_of_the_files(
     assert collect_bytes <= now_bytes * 1.1
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_row_count_reads_one_column(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,6 +620,7 @@ def test_later_groups_get_new_urls(
     assert_frame_equal(got, expected)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_plan_does_not_expire(fake_hub: FakeHub, fake_bucket: str) -> None:
     expected = _put_numbered(fake_hub, fake_bucket, 3)
     uri = _uri(fake_bucket, "data/")
@@ -714,11 +725,18 @@ def test_cdn_refusal_has_no_signed_url_in_the_chain(
 @pytest.mark.parametrize(
     "fault",
     [
-        {"status": 500},
-        {"status": 0, "action": "reset"},
-        {"status": 0, "action": "truncate"},
+        pytest.param({"status": 500}, id="500"),
+        pytest.param(
+            {"status": 0, "action": "reset"},
+            id="connection reset",
+            marks=pytest.mark.slow,
+        ),
+        pytest.param(
+            {"status": 0, "action": "truncate"},
+            id="truncated body",
+            marks=pytest.mark.slow,
+        ),
     ],
-    ids=["500", "connection reset", "truncated body"],
 )
 def test_cdn_failure_after_the_retries_of_polars_has_no_signed_url(
     fake_hub: FakeHub, fake_bucket: str, fault: dict
@@ -789,6 +807,40 @@ def test_scrub_removes_every_form_of_a_signed_url(text: str) -> None:
         assert name not in lowered
     for value in ("si-g_n~", "pol~icy", "k123", "abc", "tok"):
         assert value not in lowered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "MySignature=abc and SecurityPolicy=strict",
+        "Policy_Name=x, key_pair_id=7, a_Key-Pair-Id=K",
+        "the Signature of the file and the Policy: none",
+        "RX-Amz-Date=1 xX-Xet-Token=2",
+        "column 'Signature' = 3",
+    ],
+)
+def test_scrub_keeps_text_that_only_looks_like_a_parameter(text: str) -> None:
+    assert read._scrub_signed_urls(text, {SIGNED: SIGNED_URI}) == text
+    assert read._without_signed_urls(ValueError(text), {SIGNED: SIGNED_URI}) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "?Signature=abc",
+        "&Policy=abc",
+        " Key-Pair-Id=abc",
+        "(X-Amz-Signature=abc)",
+        "%3FSignature%3Dabc",
+        "a%3D1%26Policy%3Dabc",
+        "url='x?a=1&x-xet-signed=abc'",
+    ],
+)
+def test_scrub_removes_a_parameter_after_a_separator(text: str) -> None:
+    clean = read._scrub_signed_urls(text, {})
+
+    assert "abc" not in clean
+    assert "<removed>" in clean
 
 
 def test_scrub_names_the_bucket_file_and_keeps_other_text() -> None:
@@ -918,6 +970,7 @@ def _put_mixed_wide_first(fake_hub: FakeHub, bucket_id: str) -> str:
     return _uri(bucket_id, "wide_first/")
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("group_files", [1, 2, 64])
 @pytest.mark.parametrize(
     ("put", "scan_kwargs"),
@@ -957,6 +1010,7 @@ def test_mixed_schemas_equal_the_native_scan(
     assert_frame_equal(lf.collect(), native.collect())
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("group_files", [1, 64])
 @pytest.mark.parametrize(
     ("put", "scan_kwargs"),
@@ -986,6 +1040,7 @@ def test_mixed_schemas_raise_like_the_native_scan(
     assert_no_signed_url(str(error.value), fake_hub)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("group_files", [1, 64])
 def test_cast_options_equal_the_native_scan(
     fake_hub: FakeHub,
@@ -1049,6 +1104,7 @@ def test_include_file_paths_gives_bucket_uris(
     assert only_paths["file"].to_list() == uris
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_include_file_paths_in_now_mode_gives_signed_urls(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
@@ -1061,6 +1117,7 @@ def test_include_file_paths_in_now_mode_gives_signed_urls(
     assert all(SIGNATURE in value for value in got["file"].to_list())
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("scan_kwargs", [{"row_index_name": "row"}, {"n_rows": 25}])
 def test_options_over_all_rows_scan_one_group(
     fake_hub: FakeHub, fake_bucket: str, small_groups: int, scan_kwargs: dict
@@ -1079,6 +1136,7 @@ def test_options_over_all_rows_scan_one_group(
     assert resolves == [1, 7]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_row_index_with_offset_and_filter(
     fake_hub: FakeHub, fake_bucket: str, small_groups: int
 ) -> None:
@@ -1238,6 +1296,7 @@ def test_count_rows_has_the_path_rules_and_errors_of_scan_bucket(
 # ---- file counts, two scans, file names --------------------------------------
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("n_files", [1, 63, 64, 65, 129])
 def test_file_counts_around_the_group_size(
     fake_hub: FakeHub, fake_bucket: str, n_files: int
@@ -1258,6 +1317,7 @@ def test_file_counts_around_the_group_size(
         assert_frame_equal(got, plhf.scan_bucket(uri, resolve="now").collect())
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("engine", ["in-memory", "streaming"])
 def test_concat_and_join_of_two_scans(
     fake_hub: FakeHub, fake_bucket: str, small_groups: int, engine: str
@@ -1296,6 +1356,7 @@ _ODD_NAMES = [
 ]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_odd_file_names_and_hive_directories(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1323,3 +1384,237 @@ def test_odd_file_names_and_hive_directories(
     for mode in ("collect", "now"):
         hive = plhf.scan_bucket(uri, resolve=mode, hive_partitioning=True)
         assert hive.collect_schema().names() == ["name"]
+
+
+# ---- no signed URL in the frames of a traceback --------------------------------
+
+
+def _strings_in(value: object, depth: int = 0) -> list[str]:
+    """The strings in ``value``: itself, or the items of lists, tuples and dicts."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, bytes):
+        return [value.decode("latin-1")]
+    if depth > 6:
+        return []
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(_strings_in(key, depth + 1))
+            found.extend(_strings_in(item, depth + 1))
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            found.extend(_strings_in(item, depth + 1))
+    return found
+
+
+def _assert_no_signed_url_in_tracebacks(error: BaseException, fake_hub: FakeHub) -> int:
+    """No local variable of a frame of ``error`` (and its chain) holds a signed URL.
+
+    Returns the number of frames of ``polars_hf`` that were checked.
+    """
+    package_frames = 0
+    for linked in exception_chain(error):
+        assert_no_signed_url(str(linked), fake_hub)
+        traceback = linked.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if "polars_hf" in frame.f_code.co_filename:
+                package_frames += 1
+            for name, value in frame.f_locals.items():
+                if name in ("fake_hub", "hub"):
+                    continue
+                for text in _strings_in(value):
+                    assert_no_signed_url(text, fake_hub)
+            traceback = traceback.tb_next
+    return package_frames
+
+
+_CDN_FAULTS = [
+    pytest.param({"status": 403, "body": b"expired"}, id="403"),
+    pytest.param({"status": 404, "body": b"gone"}, id="404"),
+    pytest.param({"status": 416}, id="416"),
+    pytest.param(
+        {"status": 302, "headers": {"Location": "/xet-bridge-us/loop"}},
+        id="redirect loop",
+    ),
+    pytest.param({"status": 500}, id="500", marks=pytest.mark.slow),
+    pytest.param(
+        {"status": 0, "action": "reset"}, id="connection reset", marks=pytest.mark.slow
+    ),
+    pytest.param(
+        {"status": 0, "action": "truncate"},
+        id="truncated body",
+        marks=pytest.mark.slow,
+    ),
+]
+
+
+def _fail_every_cdn_request(fake_hub: FakeHub, fault: dict) -> None:
+    for method in ("HEAD", "GET"):
+        fake_hub.add_fault(CDN, method, r"^/xet-bridge-us/", times=100_000, **fault)
+
+
+@pytest.mark.parametrize("fault", _CDN_FAULTS)
+@pytest.mark.parametrize("step", ["schema", "scan", "scan with kept URLs", "count"])
+def test_traceback_of_a_read_error_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int, fault: dict, step: str
+) -> None:
+    # Tools that record the local variables of the frames of a traceback
+    # (error reporters, verbose tracebacks) must not find a signed URL.
+    _put_numbered(fake_hub, fake_bucket, 4)
+    source = _source(fake_bucket, 4, include_file_paths="file")
+    if step == "scan":
+        source.schema()
+        source._forget_urls(0, 4)
+    if step == "scan with kept URLs":
+        assert sum(frame.height for frame in source(None, None, None, None)) == 40
+    _fail_every_cdn_request(fake_hub, fault)
+
+    with pytest.raises(READ_ERRORS) as error:
+        if step == "schema":
+            source.schema()
+        elif step == "count":
+            plhf.count_rows(_uri(fake_bucket, "data/"))
+        else:
+            list(source(["id", "file"], pl.col("id") >= 0, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 1
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+def test_traceback_of_a_schema_mismatch_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # An error of polars whose message has no URL: the frames of the package
+    # in its traceback hold none either.
+    fake_hub.put_parquet(fake_bucket, "data/p00.parquet", pl.DataFrame({"id": [1]}))
+    fake_hub.put_parquet(fake_bucket, "data/p01.parquet", pl.DataFrame({"x": ["a"]}))
+    source = _source(fake_bucket, 2)
+
+    with pytest.raises(pl.exceptions.PolarsError) as error:
+        list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 1
+
+
+def test_traceback_of_a_resolve_error_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # A group with kept URLs and one file that is gone: the error of the
+    # resolve request passes through frames that had the kept URLs.
+    _put_numbered(fake_hub, fake_bucket, 3)
+    source = _source(fake_bucket, 3)
+    source.schema()
+    fake_hub.delete(fake_bucket, "data/p02.parquet")
+
+    with pytest.raises(FileNotFoundError) as error:
+        list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+
+
+def test_traceback_helper_finds_a_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # The check itself: a frame with a signed URL in a list is found.
+    _put_numbered(fake_hub, fake_bucket, 1)
+    source = _source(fake_bucket, 1)
+
+    def fails() -> None:
+        kept = {"urls": [source._resolve(0, 1, "test")[0]]}
+        raise ValueError(f"{len(kept)} URL in this frame")
+
+    with pytest.raises(ValueError) as error:
+        fails()
+    with pytest.raises(AssertionError):
+        _assert_no_signed_url_in_tracebacks(error.value, fake_hub)
+
+
+def test_found_files_repr_has_no_url_and_no_token(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from conftest import STAGING_TOKEN
+
+    clock = _moving_clock(monkeypatch)
+    _put_numbered(fake_hub, fake_bucket, 1)
+
+    found = read._find_files(_uri(fake_bucket, "data/p00.parquet"), None)
+
+    # The URL of a single-file URI, with the time of its resolve request.
+    assert found.first_url[1] == clock.now
+    assert SIGNATURE in found.first_url[0]
+    assert_no_signed_url(repr(found), fake_hub)
+    assert STAGING_TOKEN not in repr(found)
+
+
+# ---- kept URLs are dropped when they are old -------------------------------------
+
+
+def test_old_urls_are_dropped_from_the_source(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    small_groups: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _moving_clock(monkeypatch)
+    _put_numbered(fake_hub, fake_bucket, 8)
+    source = _source(fake_bucket, 8)
+    assert sum(frame.height for frame in source(None, None, None, None)) == 80
+    assert sorted(source._urls) == list(range(8))
+
+    # A query on the first group, after the window: the URLs of all groups
+    # are dropped, and only the files that are read are resolved again.
+    clock.now += read._URL_REUSE_SECONDS + 1
+    assert sum(frame.height for frame in source(None, None, 5, None)) == 5
+    assert sorted(source._urls) == [0]
+
+    # Within the window nothing is dropped.
+    clock.now += read._URL_REUSE_SECONDS
+    assert sum(frame.height for frame in source(None, None, 5, None)) == 5
+    assert sorted(source._urls) == [0]
+    clock.now += 1
+    source._resolve(4, 6, "test")
+    assert sorted(source._urls) == [4, 5]
+
+
+# ---- count_rows over several groups ---------------------------------------------
+
+
+def test_count_rows_resolves_group_by_group(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 8)
+
+    count = plhf.count_rows(_uri(fake_bucket, "data/"))
+
+    assert count == 8 * ROWS
+    # Groups of 3, 3 and 2 files: each is resolved after the footers of the
+    # group before it were read.
+    runs = _request_runs(fake_hub)
+    assert [kind for kind, _ in runs] == ["resolve", "cdn"] * 3
+    assert [number for kind, number in runs if kind == "resolve"] == [3, 3, 2]
+    assert sorted(_resolved(fake_hub)) == [f"p{i:02d}.parquet" for i in range(8)]
+
+
+def test_count_rows_error_names_the_group_and_stops(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 8)
+    headers = {
+        "ratelimit": '"resolvers";r=0;t=900',
+        "ratelimit-policy": '"fixed window";"resolvers";q=5000;w=300',
+    }
+    fake_hub.add_fault(
+        HUB, "HEAD", r"/resolve/data/p04\.parquet$", 429, headers=headers
+    )
+
+    with pytest.raises(HfHubHTTPError) as error:
+        plhf.count_rows(_uri(fake_bucket, "data/"))
+
+    message = str(error.value)
+    assert "of 8 files were resolved" in message
+    assert "allowed for one group of files of a count_rows call" in message
+    # The third group was not started.
+    assert "p06.parquet" not in _resolved(fake_hub)
+    assert "p07.parquet" not in _resolved(fake_hub)

@@ -230,14 +230,22 @@ def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _allow_signed_urls_in_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests use ``resolve="now"`` as the reference: the plain native scan.
+def _no_mode_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mode or an acknowledgement of the developer's shell must not reach a test."""
+    monkeypatch.delenv("POLARS_HF_RESOLVE", raising=False)
+    monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", raising=False)
 
-    The mode needs this acknowledgement. The tests of the refusal remove it.
-    A mode from the developer's environment must not reach the tests.
+
+@pytest.fixture
+def allow_signed_urls_in_plan(
+    monkeypatch: pytest.MonkeyPatch, _no_mode_from_the_environment: None
+) -> None:
+    """Acknowledge ``resolve="now"`` for one test.
+
+    Tests use that mode as the reference (the plain native scan) and must ask
+    for this fixture. A test without it cannot pass through the gated mode.
     """
     monkeypatch.setenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", "1")
-    monkeypatch.delenv("POLARS_HF_RESOLVE", raising=False)
 
 
 @pytest.fixture(autouse=True)

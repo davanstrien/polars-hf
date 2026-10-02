@@ -75,6 +75,7 @@ def test_directory_scan_is_recursive(fake_hub: FakeHub, fake_bucket: str) -> Non
     assert_frame_equal(got.sort("id"), _numbered_frame(0, 20))
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_scan_is_lazy_and_resolves_one_head_per_file(
     fake_hub: FakeHub, fake_bucket: str, mode: str
@@ -302,6 +303,7 @@ def _hub_calls(fake_hub: FakeHub) -> list[tuple[str, str, int]]:
     return calls
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_single_parquet_file_is_one_request(
     fake_hub: FakeHub, fake_bucket: str, mode: str
@@ -314,6 +316,7 @@ def test_single_parquet_file_is_one_request(
     assert fake_hub.matching(origin=CDN) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_directory_of_n_files_is_one_listing_and_n_resolves(
     fake_hub: FakeHub, fake_bucket: str, mode: str
@@ -341,6 +344,7 @@ def test_directory_of_n_files_is_one_listing_and_n_resolves(
     assert len({request.path for request in resolved}) == n_files + 1
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_glob_is_one_listing_and_one_resolve_per_match(
     fake_hub: FakeHub, fake_bucket: str, mode: str
@@ -360,6 +364,7 @@ def test_glob_is_one_listing_and_one_resolve_per_match(
     assert listing.query == "recursive=false"
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("path", ["data", "data/**/*.parquet"])
 def test_directory_and_recursive_glob_list_the_subtree(
     fake_hub: FakeHub, fake_bucket: str, path: str
@@ -445,6 +450,7 @@ def test_file_without_parquet_extension_is_one_request(
     assert _hub_calls(fake_hub) == [("HEAD", "resolve", 302)]
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("path", ["data/", ""])
 def test_trailing_slash_and_whole_bucket_skip_the_file_request(
@@ -503,6 +509,7 @@ def test_invalid_glob_makes_no_request(fake_hub: FakeHub, fake_bucket: str) -> N
     assert fake_hub.matching(origin=HUB) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_directory_named_like_a_file_costs_one_extra_resolve(
     fake_hub: FakeHub, fake_bucket: str, mode: str
@@ -717,6 +724,7 @@ def test_file_served_without_redirect_is_rejected(
     assert fake_hub.matching(origin=CDN) == []
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 @pytest.mark.parametrize("mode", MODES)
 def test_expired_signed_url_fails_at_collect(
     fake_hub: FakeHub, fake_bucket: str, mode: str

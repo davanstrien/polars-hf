@@ -608,6 +608,7 @@ def test_warnings_as_errors_do_not_abort_the_scan(
     assert any("waiting 21 s" in record.message for record in caplog.records)
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_threads_of_one_scan_warn_once(
     fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
 ) -> None:
@@ -702,6 +703,7 @@ def _put(fake_hub: FakeHub, bucket_id: str, path: str) -> None:
     fake_hub.put_parquet(bucket_id, path, pl.DataFrame({"a": [1]}))
 
 
+@pytest.mark.usefixtures("allow_signed_urls_in_plan")
 def test_rate_limited_scan_reports_the_files_resolved(
     fake_hub: FakeHub, fake_bucket: str, clock: FakeClock
 ) -> None:
