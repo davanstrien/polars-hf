@@ -22,9 +22,10 @@ mechanism upstream's `hf://` reader uses; we just resolve the signed URL in Pyth
 Polars can't attach a bearer token to a generic `https://` URL.)
 
 A presigned URL holds a signature and is valid for about one hour. `scan_bucket` therefore does not
-put the URLs in the query plan. By default the plan holds URLs of a small server in your own
-process (`http://127.0.0.1:PORT/...`) that redirects Polars to the presigned URLs, so the scan node
-stays the native one. See [Read modes](#read-modes).
+put the URLs in the query plan: it returns a LazyFrame over a Polars
+[IO-plugin source](https://docs.pola.rs/user-guide/plugins/io_plugins/) that resolves the URLs when
+the query runs and delegates to the native scan. See
+[When the URLs are resolved](#when-the-urls-are-resolved).
 
 > [!NOTE]
 > **This may be a stopgap.** Native `hf://buckets/...` support is proposed upstream in Polars —
@@ -85,101 +86,63 @@ df = (
 
 `scan_bucket` returns a lazy `LazyFrame` and works with the streaming engine.
 
-### Read modes
+### When the URLs are resolved
 
-A presigned URL gives read access to one file for about 60 minutes to anyone who has it.
-`scan_bucket(uri, resolve=...)` has three modes; they differ in where these URLs are.
+`scan_bucket(uri, resolve=...)` has two modes:
 
-| | `"redirect"` (default) | `"collect"` | `"now"` |
-| --- | --- | --- | --- |
-| LazyFrame | native `scan_parquet` node over `http://127.0.0.1:PORT/...` URLs | Polars IO-plugin node that holds the bucket paths | native `scan_parquet` node over the presigned URLs |
-| In `explain()`, `serialize()`, error messages, `POLARS_VERBOSE` log | the local URL | the bucket paths (the verbose log of Polars prints the presigned URLs) | the presigned URLs, with their signature |
-| Row count, `tail()`, slices | native: footers only | a row count reads one whole column of every file; `tail()` and offset slices scan all files | native: footers only |
-| `scan_bucket()` sends | the listing | the listing | the listing and one `resolve` request per file |
-| The plan is valid | while the process that made it runs, on its machine | in any process with a token (`cloudpickle` needed to serialize) | ~60 minutes, anywhere |
-| Needs | a local server in the process; loopback not behind a proxy | nothing | `POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` |
-| `include_file_paths=` | `hf://` URIs | `hf://` URIs | presigned URLs |
-| `hive_partitioning=` | works (the local URL has the bucket path) | finds no keys | finds no keys |
+| | `resolve="collect"` (default) | `resolve="now"` |
+| --- | --- | --- |
+| LazyFrame | a Polars IO-plugin node that holds the bucket paths | the native `scan_parquet` node over the presigned URLs |
+| Needs | nothing | the environment variable `POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` |
+| `scan_bucket()` does | the listing (see [Hub requests](#hub-requests)) | the listing and one `resolve` request per file |
+| Presigned URLs in `explain()`, `serialize()`, error messages | no | yes, with their signature |
+| Validity | a URL is resolved shortly before it is used; the LazyFrame does not expire | ~1 hour from the `scan_bucket` call; call it again for a new plan |
+| `head(5)` on N files | resolves 1 file | resolves N files |
+| `include_file_paths="col"` | the `hf://buckets/...` URI of the file | the presigned URL |
+| `select(pl.len())` | reads one whole column of every file | reads the footers only |
+| `tail(n)`, `slice(offset, n)` | scan all files | read only the files they need |
 
 Without `resolve=`, the mode is the value of the environment variable `POLARS_HF_RESOLVE` if it is
-set, else `"redirect"`.
+set (`collect` or `now`), else `"collect"`.
 
-#### `resolve="redirect"`
+**`resolve="now"` is an opt-in.** It is the faster path for metadata-heavy work (row counts,
+`tail()`, slices with an offset). It puts a read-only URL of every file, valid for about 60
+minutes, into `explain()`, `serialize()`, the messages of read errors, logs and an
+`include_file_paths=` column: anyone who sees one can read that file until it expires. The mode is
+therefore refused with a `ValueError`, before any request, unless the environment variable
+`POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` is set. Nothing falls back to it. Collect within the
+hour, and treat the plan and its logs as secrets.
 
-`scan_bucket` gives Polars one URL per file on a small HTTP server that runs in your process:
+Polars prints the URLs it scans to stderr when `POLARS_VERBOSE=1` is set, in both modes. The
+package cannot prevent that: treat verbose logs as secrets for an hour.
 
-```
-http://127.0.0.1:{port}/{random id}/valid-only-while-pid-{pid}-runs/{bucket path}
-```
+**What the default mode costs.** Full scans, `head()` and selective queries take about as long as
+on the native node. A row count through the LazyFrame and `tail()` do not.
 
-Polars scans these URLs natively. The server answers each request with `302 Location: <presigned
-URL>`, and Polars follows the redirect and reads the bytes from the CDN itself, with its `Range`
-header. No file data passes through Python. The server resolves the presigned URL of a file with
-one `resolve` request (also when many requests for the file arrive together), keeps it, and
-resolves it again when it is older than 30 minutes, so a LazyFrame does not expire. Every
-`scan_bucket` call gets new URLs: a file that was replaced is read anew by the next call.
+Measured on HF Jobs (`cpu-performance`, Polars 2.0.0rc2, 12 files, 28 GB, job
+`6abec96b404719ba3761a56b`):
 
-Measured on HF Jobs (`cpu-performance`, Polars 2.0.0rc2, 12 files, 28 GB, jobs
-`6abf69f8fbc85ba682369709` and `6abf6c26fbc85ba6823699c8`; selective queries were noisy in both
-arms):
-
-| Query | `resolve="redirect"` | presigned URLs read directly |
+| Query | `resolve="collect"` | `resolve="now"` (native node) |
 | --- | --- | --- |
-| row count, `select(pl.len())` | 0.5–0.6 s | 0.5–0.6 s |
-| `head(5)` | 0.6–0.9 s | 0.5 s |
-| `tail(5)` | 0.6–0.8 s | 0.6 s |
-| full scan of four columns | 48.2–50.6 s | 46.8–48.1 s |
-| one small column | 5.9–9.0 s | 8.6–22.1 s |
-| filter and two columns | 4.1–13.2 s | 5.5–7.1 s |
+| row count, `select(pl.len())` | 30–33 s, 27.7 GB downloaded | 1.1 s, 0.07 GB downloaded |
+| `tail(5)` | 19 GB peak memory | 2.6 GB peak memory |
+| one small column | 3.3–4.8 s | 2.1–2.9 s |
+| `head(5)` | 0.8 s | 0.7 s |
+| full scan of four columns | 22 s | 24 s |
 
-**Security notes.**
+**Row counts.** In the default mode `lf.select(pl.len())` is not a metadata query: Polars asks an
+IO source for one column to count its rows. The package does not choose that column, and it can be
+the largest one (in the measurement above it was nearly all of the data). Use
+`plhf.count_rows(uri)` for a row count: it reads the parquet footers only and returns an `int`.
 
-- The server listens on `127.0.0.1` only, on a port that the operating system chooses, and starts
-  with the first redirect-mode `scan_bucket` call of the process.
-- The random id in a local URL is a capability: another local process (or user of the machine) that
-  learns a local URL can get the presigned URL of that one file while your process runs. It gives
-  nothing on another machine and nothing after your process has exited. Treat a plan of this mode
-  like a local file path of data you can read, not like a secret.
-- The server serves only the exact file paths of a `scan_bucket` call. It never resolves a path
-  that a request names; a path outside the scan gets `404`.
-- A request whose `Host` header is not `127.0.0.1:PORT` or `localhost:PORT` gets `403`, so a web
-  page cannot reach the server through DNS rebinding.
-- The token is used by the resolver in your process. It is not in a URL, in the plan or in an
-  answer of the server.
+```python
+plhf.count_rows("hf://buckets/my-namespace/my-bucket/data/*.parquet")
+```
 
-**Limits of the mode.**
+`count_rows` has the path rules and the errors of `scan_bucket`. It sends one `resolve` request per
+file and keeps nothing. It does not compare the schemas of the files.
 
-- **Proxy variables.** The HTTP client of Polars sends requests for `127.0.0.1` to a proxy when
-  `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy` is set and `NO_PROXY` / `no_proxy` does
-  not cover the loopback address. `scan_bucket` raises a `RuntimeError` in that case, before any
-  request. Set `NO_PROXY=127.0.0.1,localhost` (with the entries you already have) or use
-  `resolve="collect"`. The package does not change the environment.
-- **Other processes.** A plan works only while the process that made it runs, on the same machine.
-  Polars runs the plan itself, so the package gets no control when a plan is used elsewhere (a
-  serialized plan in a new process, a worker on another machine, a child process after its parent
-  has exited). Polars then cannot connect, retries for 5 to 15 s and raises an `OSError` that
-  names the local URL; the `valid-only-while-pid-...-runs` part of the URL is there for that
-  message. Use `resolve="collect"` for a plan that another process runs. After a `fork`, a new
-  `scan_bucket` call in the child starts a server of the child.
-- **Many LazyFrames.** The server keeps the file lists of the 1,024 `scan_bucket` calls that were
-  used last. Polars copies plans freely, so the package cannot tell when a LazyFrame is no longer
-  used; the bound is by count. A LazyFrame of an older call then fails with a `404` that says to
-  call `scan_bucket` again.
-- **A URL that the CDN refuses early.** The server does not see the answers of the CDN. If the CDN
-  refuses a presigned URL that is less than 30 minutes old, queries on that LazyFrame fail until
-  the URL is 30 minutes old; a new `scan_bucket` call resolves new URLs.
-- **Rate limits.** The `resolve` requests of a query are sent while Polars waits for the answer of
-  the local server, so a retry wait is made only if it ends within 20 s. A rate limit with a
-  longer reset fails the query (see [Errors](#errors)). `resolve="collect"` waits up to 10 minutes
-  per group of files.
-- **Replaced files.** A LazyFrame reads a file through the URL it resolved first for up to 30
-  minutes, also if the file is replaced in between.
-
-#### `resolve="collect"`
-
-The LazyFrame is a Polars [IO-plugin source](https://docs.pola.rs/user-guide/plugins/io_plugins/)
-that holds the bucket paths and resolves the presigned URLs when the query runs. It needs no local
-server, and its serialized plan runs in any process that has a token. A query runs like this:
+With `resolve="collect"` a query runs like this:
 
 1. **Schema.** When Polars first needs the schema (`collect()`, `collect_schema()`, `explain()`),
    the first file is resolved and its footer is read: one `resolve` request and one to three CDN
@@ -199,62 +162,29 @@ server, and its serialized plan runs in any process that has a token. A query ru
    request. An older URL is resolved again. If the CDN refuses a URL that was used again, the group
    is resolved and scanned once more, provided that it has not returned rows yet.
 
-What the IO-plugin node costs. Polars pushes a projection, a predicate and `head(n)` into an IO
-source, and nothing else. Measured on HF Jobs (`cpu-performance`, Polars 2.0.0rc2, 12 files,
-28 GB, job `6abec96b404719ba3761a56b`):
+A consumer that stops reading a `collect_batches()` iterator does not stop the query: Polars keeps
+running it, so the following groups are still resolved and scanned.
 
-| Query | `resolve="collect"` | native node |
-| --- | --- | --- |
-| row count, `select(pl.len())` | 30–33 s, 27.7 GB downloaded | 1.1 s, 0.07 GB downloaded |
-| `tail(5)` | 19 GB peak memory | 2.6 GB peak memory |
-| one small column | 3.3–4.8 s | 2.1–2.9 s |
-| `head(5)` | 0.8 s | 0.7 s |
-| full scan of four columns | 22 s | 24 s |
+All files are one group (all URLs are resolved at the start of the query) with `row_index_name=` or
+`n_rows=`, and for a row limit *before* a predicate (`lf.head(n).filter(...)`).
 
-- **Row counts.** `lf.select(pl.len())` is not a metadata query in this mode: Polars asks an IO
-  source for one column to count its rows. The package does not choose that column, and it can be
-  the largest one (in the measurement above it was nearly all of the data). Use
-  `plhf.count_rows(uri)`, or the default mode.
-- `tail()` and slices with an offset scan all files.
-- All files are one group (all URLs are resolved at the start of the query) with `row_index_name=`
-  or `n_rows=`, and for a row limit *before* a predicate (`lf.head(n).filter(...)`).
-- Every group is scanned with the schema of the first file of the scan (passed to the native scan
-  as `schema=`), unless you give `schema=` yourself. `missing_columns=`, `extra_columns=` and
-  `cast_options=` then apply to every file as in one native scan; the tests compare both on files
-  with different columns and types. One difference remains for such files without these options:
-  a row count, or a slice that lies outside of the rows, can be answered by the native node from
-  the footers and raises a schema error in this mode, because this mode reads a column of every
-  file.
-- A consumer that stops reading a `collect_batches()` iterator does not stop the query: Polars
-  keeps running it, so the following groups are still resolved and scanned.
-- Polars prints the presigned URLs it scans to stderr when `POLARS_VERBOSE=1` is set. The package
-  cannot prevent that in this mode: treat a verbose log as a secret for an hour.
-- `LazyFrame.serialize()` needs the `cloudpickle` package (Polars pickles an IO source with it).
-  The serialized plan holds the endpoint, the bucket paths and the scan options except
-  `storage_options=` and `credential_provider=`, which can hold credentials. It does not hold the
-  token or a presigned URL. A deserialized query therefore uses the token of its own environment,
-  also if `token=` was given to `scan_bucket`, and runs without these two options.
+Every group is scanned with the schema of the first file of the scan (passed to the native scan as
+`schema=`), unless you give `schema=` yourself. `missing_columns=`, `extra_columns=` and
+`cast_options=` then apply to every file as in one native scan; the tests compare both modes on
+files with different columns and types. One difference remains for files with different columns or
+types and no such option: a row count, or a slice that lies outside of the rows, is answered by the
+native node from the footers and raises a schema error in the default mode, because the default
+mode reads a column of every file.
 
-#### `resolve="now"`
+`LazyFrame.serialize()` of the default mode needs the `cloudpickle` package (Polars pickles an IO
+source with it). The serialized plan holds the endpoint, the bucket paths and the scan options
+except `storage_options=` and `credential_provider=`, which can hold credentials. It does not hold
+the token or a presigned URL. A deserialized query therefore uses the token of its own
+environment, also if `token=` was given to `scan_bucket`, and runs without `storage_options` and
+`credential_provider`.
 
-`scan_bucket` resolves every file and returns the native `scan_parquet` node over the presigned
-URLs. The URLs, with their signature, are then in `explain()`, in `serialize()`, in the messages
-of read errors, in the verbose log of Polars and in an `include_file_paths=` column. Each one
-gives read access to one file for about 60 minutes to anyone who sees it. The mode is therefore
-refused with a `ValueError` unless the environment variable
-`POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` is set. Nothing falls back to this mode. Collect within
-the hour, and treat the plan and its logs as secrets.
-
-#### Row counts
-
-```python
-plhf.count_rows("hf://buckets/my-namespace/my-bucket/data/*.parquet")
-```
-
-`count_rows` returns the number of rows as an `int`, from the parquet footers, in every mode and
-Polars version. It has the path rules and the errors of `scan_bucket`, sends one `resolve` request
-per file and keeps nothing. It does not compare the schemas of the files. In the default mode
-`lf.select(pl.len())` reads the footers too.
+Use `resolve="now"` (with its acknowledgement variable) when a query needs the native node:
+`tail()`, a slice with an offset, or tooling that inspects the scan node.
 
 ### Writing
 
@@ -480,19 +410,8 @@ A glob whose only glob segment is the last one (`data/*.parquet`) lists that dir
 globs list the subtree below the text before their first glob character. An invalid glob raises
 before any request.
 
-With `resolve="now"` the call then sends one `resolve` request for each of the N files. In the
-other modes these requests are sent when a query runs.
-
-`resolve="redirect"` (default): one `resolve` request for a file when Polars first asks the local
-server for it, and one more when its URL is older than 30 minutes.
-
-| Query on N files | `resolve` requests |
-| --- | --- |
-| a full scan, a projection, a filter, a row count | N (N - 1 for a single-file URI: the call resolved it) |
-| `head(n)`, `tail(n)` | the files that Polars opens: 1 for `head(5)` on Polars 1.40; most of the files on Polars 1.44 and 2.0, which read footers ahead |
-| a second query on the same LazyFrame within 30 minutes | 0 |
-
-`resolve="collect"`:
+With `resolve="now"` the call then sends one `resolve` request for each of the N files. With the
+default `resolve="collect"` these requests are sent when a query runs:
 
 | Query on N files | `resolve` requests |
 | --- | --- |
@@ -500,13 +419,12 @@ server for it, and one more when its URL is older than 30 minutes.
 | a full scan, a projection, a filter | N - 1: the URL of the first file is known from the schema |
 | `head(n)` | the files of the groups it reads: 1, then 4, 16, 64 |
 | a second query on the same LazyFrame | 0 for the files whose URL is less than 5 minutes old; 1 for each other file |
+| `count_rows(uri)` | N, in the call |
 
-`count_rows(uri)` sends N, in the call.
-
-`resolve` requests count in the Hub's "resolvers" rate limit. In the redirect mode Polars decides
-when it opens a file, and the local server sends at most 32 `resolve` requests at once. In the
-collect mode a query sends at most 64 at once, and the next 64 only when the group before is read
-(except in its one-group cases, see [Read modes](#read-modes)).
+`resolve` requests count in the Hub's "resolvers" rate limit. A scan of N files uses N of them,
+and N again when it runs more than 5 minutes later. A query sends at most 64 at once, and the next
+64 only when the group before is read (except in the one-group cases of
+[When the URLs are resolved](#when-the-urls-are-resolved)).
 
 **Retries.** A `408`, `429` or `5xx` answer to a `resolve` request or to a listing page is retried
 up to 5 times; only the failed request is sent again. `scan_bucket` sends the listing requests
@@ -548,38 +466,15 @@ A private bucket that the token cannot see is reported by the Hub as "not found"
 `FileNotFoundError`, not `PermissionError`.
 
 **Which call raises.** `scan_bucket()` raises the errors of the URI, of the listing and of a
-single-file URI: an invalid URI or glob, an unknown `resolve` mode, a missing bucket or path,
-nothing matched, an empty file found in the listing, no access. With `resolve="now"` it raises all
-errors of the table. In the other modes the `resolve` requests of the listed files are sent by the
-query, so `collect()` reports their failures.
+single-file URI: an invalid URI or glob, a missing bucket or path, nothing matched, an empty file
+found in the listing, no access, an unknown `resolve` mode, and `resolve="now"` without its
+acknowledgement variable. With `resolve="now"` it raises all errors of the table.
 
-**Errors of a query, `resolve="redirect"`.** Polars reads through the local server, so every
-failure is an `OSError` of Polars' HTTP client (`object-store error: ...`) that names the local
-URL of the file, on Polars 1.40, 1.44 and 2.0.0rc2 alike. The status in the message tells the
-cause. Polars 2 also prints the text that the local server sends (`polars-hf: ...`); Polars 1.x
-asks with `HEAD` first and prints no text. In every version the reason is logged with the logger
-`polars_hf._redirect` at level `WARNING`.
-
-| Situation | What `collect()` raises |
-| --- | --- |
-| A file was deleted after the listing | `OSError`, `404 Not Found`, at once; the log names the `hf://` URI |
-| The token lost access (`401` / `403` from the Hub) | `OSError`, `403 Forbidden`, at once |
-| The Hub rate limit, with a reset later than 20 s | `OSError`, `424 Failed Dependency`, at once; the log has the quota (Polars would retry a `429`) |
-| An empty file, or a file that the Hub does not redirect | `OSError`, `424 Failed Dependency`, at once |
-| The Hub answers `5xx` / `408`, or cannot be reached, after the package's retries | `OSError`, `503 Service Unavailable`, after the 10 retries of Polars (10 to 30 s) |
-| The CDN refuses the presigned URL (`403`, `416`) | `OSError` with that status, at once |
-| The CDN fails (`5xx`, dropped connection, truncated body) | `OSError`, after the retries of Polars (5 to 20 s) |
-| The plan is used after its process has exited | `OSError`, `error sending request`, after 5 to 15 s |
-| The LazyFrame is older than the 1,024 scans used last | `OSError`, `404 Not Found`, at once |
-
-None of these messages holds a presigned URL: Polars names the URL it was given, not the redirect
-target. The tests check this for each case above, and for the verbose log of Polars.
-
-**Errors of a query, `resolve="collect"`.** `collect()` raises the errors of the table at the top:
-a file that was deleted after the listing (`FileNotFoundError`), a `401` / `403`
-(`PermissionError`), a rate limit or server error that the retries did not clear
-(`HfHubHTTPError`), a file that the Hub does not redirect (`RuntimeError`). The messages are the
-same. How the exception arrives depends on Polars:
+With the default `resolve="collect"`, the `resolve` requests of the listed files are sent by the
+query, so `collect()` raises their errors: a file that was deleted after the listing
+(`FileNotFoundError`), a `401` / `403` (`PermissionError`), a rate limit or server error that the
+retries did not clear (`HfHubHTTPError`), a file that the Hub does not redirect (`RuntimeError`).
+The messages are the same. How the exception arrives depends on Polars:
 
 - Polars 2 (tested with 2.0.0rc2) raises the exception itself.
 - Polars 1.x wraps every exception of an IO source: `collect()` raises
@@ -589,25 +484,22 @@ same. How the exception arrives depends on Polars:
   in a `ComputeError` that starts with `schema callable failed`.
 
 A read error of Polars itself (a presigned URL that the CDN refuses, a file that is not parquet)
-keeps its type. Its message names the `hf://` URI of the file; the presigned URL is removed from
-the message, and the exception has no `__cause__` or `__context__` that holds it.
+keeps its type. In the default mode its message names the `hf://` URI of the file; the presigned
+URL is removed from the message, and the exception has no `__cause__` or `__context__` that holds
+it. (Polars' own verbose log, `POLARS_VERBOSE=1`, still prints the URLs.)
 
 ## Performance
 
 Bucket reads fetch range requests from the XET CDN.
 
-- **The default mode is the native scan.** The local redirect adds one request to `127.0.0.1` per
-  request of Polars. On HF Jobs (12 files, 28 GB, Polars 2.0.0rc2) a full scan of four columns
-  took 48.2–50.6 s through the redirect and 46.8–48.1 s on the presigned URLs directly, and a row
-  count 0.5–0.6 s in both; [Read modes](#read-modes) has the table. The server must accept many
-  connections at once: a prototype with a listen backlog of 5 took 165–264 s for the selective
-  queries, so the server is an `asyncio` server with a backlog of 4,096.
-- **The IO-plugin node (`resolve="collect"`).** The native scan runs inside an IO source, and whole
+- **The IO-plugin node.** In the default mode the native scan runs inside an IO source, and whole
   DataFrames cross into Python. On HF Jobs (`cpu-performance`, Polars 2.0.0rc2, 54 files, 126.7 GB,
   four columns, CDN-warm, one run each) a prototype of this wrapper took 244 s and the native node
   301 s, with the same result: no overhead was measured for a full scan. Queries that Polars does
-  not push into an IO source cost more: a row count reads a whole column, and `tail()` and slices
-  with an offset scan all files.
+  not push into an IO source cost more: a row count reads a whole column (use `plhf.count_rows`),
+  and `tail()` and slices with an offset scan all files (`resolve="now"` reads only what they
+  need). The table in
+  [When the URLs are resolved](#when-the-urls-are-resolved) has the measured numbers.
 - **Download, then scan.** In the same run, downloading the files with `hf_xet` in a rolling window
   and scanning them from local disk took 114 s (7.3 GB peak RSS, 15.1 GB of staging disk).
   `polars-hf` does not do this; [`benchmarks/read_paths.py`](benchmarks/read_paths.py) has that arm
@@ -628,8 +520,8 @@ tables with their job ids.
 
 ## Scan options
 
-Extra keyword arguments to `scan_bucket` are forwarded to `pl.scan_parquet` (in the collect mode:
-to the native scan of every group) — e.g. heterogeneous schemas across globbed files:
+Extra keyword arguments to `scan_bucket` are forwarded to `pl.scan_parquet` (to the native scan of
+every group in the default mode) — e.g. heterogeneous schemas across globbed files:
 
 ```python
 plhf.scan_bucket(uri, missing_columns="insert", extra_columns="ignore")
@@ -639,25 +531,24 @@ or `storage_options={"max_retries": 5}` for flaky connections (this replaces the
 `retries=` option of Polars; it applies to the data requests Polars makes, not to the Hub requests
 above).
 
-`include_file_paths="file"` adds the `hf://buckets/...` URI of the file of every row, in the
-redirect and the collect mode. (With `resolve="now"` the column holds the presigned URL, signature
-included.) In the collect mode the URI is found from the presigned URL of the file: if two files
-with the same content get the same URL and are in the same group of 64 files, their rows show the
-URI of one of them.
-
-`hive_partitioning=True` reads `key=value` directories of the bucket path in the redirect mode,
-because the path of a local URL is the bucket path. In the other modes Polars sees the presigned
-URLs, which do not have the bucket path, and finds no partition columns.
+`include_file_paths="file"` adds the `hf://buckets/...` URI of the file of every row. (With
+`resolve="now"` the column holds the presigned URL, signature included.) The URI is found from
+the presigned URL of the file: if two files with the same content get the same URL and are in the
+same group of 64 files, their rows show the URI of one of them. In different groups each shows its
+own URI. `hive_partitioning=` sees
+the presigned CDN URLs, not the bucket paths, so it finds no partition columns in either mode.
 
 ## Limitations
 
 - Reads cover parquet; writes cover parquet/csv/ipc/ndjson. Delta/Iceberg are out of scope.
-- The default read mode needs a local HTTP server in the process and a loopback address that is
-  not behind a proxy, and its plans are valid only while the process runs. `resolve="collect"` has
-  neither limit, but it is a Polars IO-plugin node: a row count reads one whole column
-  (`plhf.count_rows` reads the footers), `tail()` and slices with an offset scan all files, hive
-  partition columns are not inferred, and on Polars 1.x an error of a query is a `ComputeError`
-  that quotes the original exception. See [Read modes](#read-modes) and [Errors](#errors).
+- Hive-style partition columns are not inferred from paths on read (the presigned CDN URLs don't
+  preserve the bucket paths) — but partitioned writes include the key columns in the files by
+  default, so round-trips keep the data.
+- The default read mode is a Polars IO-plugin node. Polars pushes a projection, a predicate and
+  `head(n)` into it, nothing else: a row count reads one whole column (`plhf.count_rows` reads the
+  footers), `tail()` and slices with an offset scan all files, and on Polars 1.x an error of a query is a `ComputeError` that quotes
+  the original exception. `resolve="now"` gives the native node, with the presigned URLs in the
+  plan, and needs `POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1`. See [When the URLs are resolved](#when-the-urls-are-resolved) and [Errors](#errors).
 
 ## Development
 

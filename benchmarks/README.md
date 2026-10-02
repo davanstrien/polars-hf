@@ -16,13 +16,12 @@ options.
 
 ## `read_paths.py`
 
-Compares four ways to run the same query over the parquet files of one bucket directory:
+Compares three ways to run the same query over the parquet files of one bucket directory:
 
 | Arm | What it does |
 | --- | --- |
-| `redirect` | `scan_bucket(uri)`, the default: the native `scan_parquet` node over URLs of a local server that redirects to the presigned URLs |
-| `collect` | `scan_bucket(uri, resolve="collect")`: the URLs are resolved when the query runs, group by group, behind an IO-plugin node |
-| `now` | `scan_bucket(uri, resolve="now")`: every presigned URL is resolved first, then the native node reads them directly. The arm sets `POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` for its own process |
+| `collect` | `scan_bucket(uri)`, the default: the URLs are resolved when the query runs, group by group, behind an IO-plugin node |
+| `now` | `scan_bucket(uri, resolve="now")`: every presigned URL is resolved first, then the query runs on the native `scan_parquet` node. The arm sets `POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` for its own process |
 | `download` | `HfApi.download_bucket_files` (`hf_xet`) downloads a few files at a time into a staging directory; each batch is scanned from local disk and deleted, while the next batch is downloaded |
 
 and two queries: `full` (an aggregate that decodes every value of `--columns`; all columns by
@@ -38,7 +37,7 @@ hf jobs uv run --flavor cpu-performance --secrets HF_TOKEN \
 
 # locally, with arguments:
 uv run benchmarks/read_paths.py --input hf://buckets/<namespace>/<bucket>/<directory> \
-    --arms redirect,now --queries full --columns text,url --warmup
+    --arms collect,now --queries full --columns text,url --warmup
 ```
 
 Options (each has a `BENCH_...` environment variable; `--help` lists them): `--input`, `--arms`,
@@ -66,7 +65,7 @@ The first read of bucket data that was written or copied recently is slower than
 bytes are not at the CDN edge yet. An arm that runs first on cold data pays for the arms after it.
 Two ways to keep the comparison fair:
 
-- `--warmup` reads every input once (all columns, `redirect` arm) before the arms. All arms then read
+- `--warmup` reads every input once (all columns, default mode) before the arms. All arms then read
   warm data. The warm-up run is in the output with `"warmup": true`.
 - Give `--input` one directory per arm, separated by commas (as many as arms). Each arm then reads
   its own files, cold or warm alike. The directories must hold comparable data.
@@ -107,8 +106,7 @@ The `staged` backend needs free local disk of the size of the output. Every run 
 These numbers are from the ad-hoc scripts that the two scripts above were made from. They were
 measured before the collect-time read path was merged: the "IO-plugin wrapper" row is a prototype
 that resolved all URLs in one group when the query ran, which is what the `collect` arm does for up
-to 64 files, and "native presigned" is what the `now` arm does. The scripts in this directory have
-not been run on Jobs yet. Every row is one run, on
+to 64 files, and "native presigned scan" is what the `now` arm does. The scripts in this directory have not been run on Jobs yet. Every row is one run, on
 HF Jobs `cpu-performance` (32 vCPU). GB is 10^9 bytes.
 
 ### Read: full scan of four columns, 54 files, 126.7 GB
@@ -128,26 +126,10 @@ from 301 s: read it as "the wrapper showed no overhead for a full scan", not as 
 On a 3-file fixture, a row count took 2.5 s through the wrapper and 1.8 s on the native node: an IO
 source is asked for one column to count rows, the native node answers from the footers.
 
-### Read: redirect mode and presigned URLs read directly, 12 files, 28 GB
+### Read: default mode and native node, 12 files, 28 GB
 
-Jobs `6abf69f8fbc85ba682369709` and `6abf6c26fbc85ba6823699c8`, Polars 2.0.0rc2, with a prototype
-of the redirect server (`asyncio`, backlog 4,096). Selective queries were noisy in both arms.
-
-| Query | `resolve="redirect"` | presigned URLs read directly |
-| --- | --- | --- |
-| row count, `select(pl.len())` | 0.5–0.6 s | 0.5–0.6 s |
-| `head(5)` | 0.6–0.9 s | 0.5 s |
-| `tail(5)` | 0.6–0.8 s | 0.6 s |
-| full scan of four columns | 48.2–50.6 s | 46.8–48.1 s |
-| one small column | 5.9–9.0 s | 8.6–22.1 s |
-| filter and two columns | 4.1–13.2 s | 5.5–7.1 s |
-
-With a server from `http.server` (listen backlog 5) the selective queries took 165–264 s.
-
-### Read: collect mode and native node, 12 files, 28 GB
-
-Job `6abec96b404719ba3761a56b`, Polars 2.0.0rc2, with the IO-plugin source of this repository
-(`resolve="collect"`) and the native node over presigned URLs (`resolve="now"`).
+Job `6abec96b404719ba3761a56b`, Polars 2.0.0rc2, with the collect-time read path of this
+repository (`resolve="collect"`) and its native node (`resolve="now"`).
 
 | Query | `resolve="collect"` | `resolve="now"` (native node) |
 | --- | --- | --- |
@@ -158,8 +140,8 @@ Job `6abec96b404719ba3761a56b`, Polars 2.0.0rc2, with the IO-plugin source of th
 | full scan of four columns | 22 s | 24 s |
 
 Polars asks an IO source for one column to count rows; here it was nearly all of the data.
-`polars_hf.count_rows` and the default mode read the footers instead. `tail()` is not pushed into an
-IO source, so the collect mode scans all files for it.
+`polars_hf.count_rows` reads the footers instead. `tail()` is not pushed into an IO source, so the
+default mode scans all files for it.
 
 ### `POLARS_CONCURRENCY_BUDGET`
 
