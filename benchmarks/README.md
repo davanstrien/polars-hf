@@ -126,6 +126,32 @@ from 301 s: read it as "the wrapper showed no overhead for a full scan", not as 
 On a 3-file fixture, a row count took 2.5 s through the wrapper and 1.8 s on the native node: an IO
 source is asked for one column to count rows, the native node answers from the footers.
 
+### Read: default mode and native node, 12 files, 28 GB
+
+Job `6abec96b404719ba3761a56b`, Polars 2.0.0rc2, with the collect-time read path of this
+repository (`resolve="collect"`) and its native node (`resolve="now"`).
+
+| Query | `resolve="collect"` | `resolve="now"` (native node) |
+| --- | --- | --- |
+| row count, `select(pl.len())` | 30–33 s, 27.7 GB downloaded | 1.1 s, 0.07 GB downloaded |
+| `tail(5)` | 19 GB peak memory | 2.6 GB peak memory |
+| one small column | 3.3–4.8 s | 2.1–2.9 s |
+| `head(5)` | 0.8 s | 0.7 s |
+| full scan of four columns | 22 s | 24 s |
+
+Polars asks an IO source for one column to count rows; here it was nearly all of the data.
+`polars_hf.count_rows` reads the footers instead. `tail()` is not pushed into an IO source, so the
+default mode scans all files for it.
+
+### `POLARS_CONCURRENCY_BUDGET`
+
+A presigned scan of 14 GB with `POLARS_CONCURRENCY_BUDGET=64` and without it.
+
+| Polars | Job | With the variable | Without |
+| --- | --- | --- | --- |
+| 2.0.0rc2 | `6abe4f2e404719ba376181f0` | 31.0 s, 32.1 s | 29.1 s, 33.6 s |
+| 1.44.2 | `6abe4d4cfbc85ba682361f8b` | about 8% faster | |
+
 ### Write: bucket-to-bucket copy
 
 Job `6abe7042404719ba37618a7f`.
