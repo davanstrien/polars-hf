@@ -117,6 +117,16 @@ hour, and treat the plan and its logs as secrets.
 Polars prints the URLs it scans to stderr when `POLARS_VERBOSE=1` is set, in both modes. The
 package cannot prevent that: treat verbose logs as secrets for an hour.
 
+The same holds for DEBUG logging of the HTTP client that `huggingface_hub` uses (logger `httpcore`
+or `httpcore2`): it logs response headers, and the Hub's redirect answer carries the presigned URL
+in its `Location` header. With DEBUG logging enabled for that logger, presigned URLs are printed in
+every mode.
+
+The Hub token itself is held in memory by the package while it talks to the Hub, as in
+`huggingface_hub`, so a tool that captures the local variables of traceback frames can record it
+on a Hub error. What this section promises is about presigned URLs: none in plans, messages,
+exception chains and traceback frames of the default mode.
+
 **What the default mode costs.** Full scans, `head()` and selective queries take about as long as
 on the native node. A row count through the LazyFrame and `tail()` do not.
 

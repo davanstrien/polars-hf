@@ -1517,7 +1517,18 @@ def scan_bucket(
     schema read in a ``ComputeError`` ("schema callable failed"). A read
     error of polars names the ``hf://`` URI of the file, not its signed URL,
     and has no cause or context that holds the URL. With ``POLARS_VERBOSE=1``
-    polars itself prints the URLs it scans to stderr, in both modes.
+    polars itself prints the URLs it scans to stderr, in both modes. The HTTP
+    client of ``huggingface_hub`` logs response headers at DEBUG level
+    (logger ``httpcore`` / ``httpcore2``), and the redirect answer of the Hub
+    has the signed URL in its ``Location`` header: DEBUG logging of that
+    logger prints signed URLs in both modes. The package cannot prevent
+    either.
+
+    The token is held in memory while the package talks to the Hub, as in
+    ``huggingface_hub``: a tool that records the local variables of
+    traceback frames can record it on a Hub error. The statements above are
+    about signed URLs in plans, messages, exception chains and traceback
+    frames.
 
     **What the IO-plugin node changes for a query** (``resolve="collect"``):
 
