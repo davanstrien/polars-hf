@@ -171,7 +171,11 @@ With `resolve="collect"` a query runs like this:
    most one per file). A group uses the URL of a file again if it is less than 5 minutes old when
    the scan of the group starts, so a second query right after the first one sends no `resolve`
    request. An older URL is resolved again. If the CDN refuses a URL that was used again, the group
-   is resolved and scanned once more, provided that it has not returned rows yet.
+   is resolved and scanned once more, provided that it has not returned rows yet. A kept URL
+   names the content that the file had when it was resolved: if a file is replaced in the bucket,
+   a later query on the same LazyFrame reads the old content until the URL is 5 minutes old; after
+   that, and from a new `scan_bucket` call, it reads the new content. Queries of several threads on
+   one LazyFrame resolve a file once.
 
 A consumer that stops reading a `collect_batches()` iterator does not stop the query: Polars keeps
 running it, so the following groups are still resolved and scanned.

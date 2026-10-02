@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import pickle
+import threading
 import types
 from urllib.parse import quote
 
@@ -1618,3 +1619,209 @@ def test_count_rows_error_names_the_group_and_stops(
     # The third group was not started.
     assert "p06.parquet" not in _resolved(fake_hub)
     assert "p07.parquet" not in _resolved(fake_hub)
+
+
+# ---- a Location that cannot be parsed ---------------------------------------------
+
+_BAD_LOCATION = "https://cdn.example:port/xet/file?X-Amz-Signature=secretsig&a=1"
+
+
+def _assert_no_bad_location(text: str) -> None:
+    assert "secretsig" not in text
+    assert "cdn.example" not in text
+    assert "X-Amz" not in text
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+@pytest.mark.parametrize("schema_first", [False, True])
+def test_unparsable_location_is_not_in_the_error(
+    fake_hub: FakeHub, fake_bucket: str, schema_first: bool, engine: str
+) -> None:
+    # The Hub redirects a file to a URL whose port is not a number. The URL
+    # can be a signed one: no error may show it. The HTTP library refuses
+    # such a Location itself (its error is not retried); if it returns the
+    # answer, _signed_url raises RuntimeError.
+    _put_numbered(fake_hub, fake_bucket, 3)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    name = "p01" if schema_first else "p00"
+    if schema_first:
+        lf.collect_schema()
+    fake_hub.add_fault(
+        HUB,
+        "HEAD",
+        rf"/resolve/data/{name}\.parquet$",
+        302,
+        times=1,
+        headers={"Location": _BAD_LOCATION},
+    )
+
+    with pytest.raises(Exception) as error:  # noqa: B017, PT011
+        lf.collect(engine=engine)
+
+    for linked in exception_chain(error.value):
+        _assert_no_bad_location(str(linked))
+        _assert_no_bad_location(repr(linked))
+    # The answer was scripted once: the plan can be explained again.
+    for text in (lf.explain(), lf.explain(optimized=False)):
+        _assert_no_bad_location(text)
+        assert_no_signed_url(text, fake_hub)
+
+
+def _assert_no_bad_location_in_tracebacks(error: BaseException) -> int:
+    """No message and no frame local of ``error`` holds ``_BAD_LOCATION``."""
+    package_frames = 0
+    for linked in exception_chain(error):
+        _assert_no_bad_location(str(linked))
+        traceback = linked.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if "polars_hf" in frame.f_code.co_filename:
+                package_frames += 1
+            for value in frame.f_locals.values():
+                for text in _strings_in(value):
+                    _assert_no_bad_location(text)
+            traceback = traceback.tb_next
+    return package_frames
+
+
+@pytest.mark.parametrize("call", ["scan_bucket", "count_rows", "source"])
+def test_unparsable_location_is_not_in_the_traceback_frames(
+    fake_hub: FakeHub, fake_bucket: str, call: str
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 2)
+    fake_hub.add_fault(
+        HUB,
+        "HEAD",
+        r"/resolve/data/p00\.parquet$",
+        302,
+        times=10,
+        headers={"Location": _BAD_LOCATION},
+    )
+
+    with pytest.raises(Exception) as error:  # noqa: B017, PT011
+        if call == "scan_bucket":
+            plhf.scan_bucket(_uri(fake_bucket, "data/p00.parquet"))
+        elif call == "count_rows":
+            plhf.count_rows(_uri(fake_bucket, "data/"))
+        else:
+            list(_source(fake_bucket, 2)(None, None, None, None))
+
+    assert _assert_no_bad_location_in_tracebacks(error.value) >= 2
+
+
+@pytest.mark.parametrize("call", ["scan_bucket", "count_rows", "source"])
+def test_location_that_the_package_cannot_parse_is_not_shown(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    # The branch of _signed_url for a Location that urlparse refuses, with a
+    # real signed URL of the fake Hub as the Location.
+    _put_numbered(fake_hub, fake_bucket, 2)
+    origin = read._origin
+
+    def refuse_the_cdn(url: str):
+        if url.startswith(fake_hub.cdn_endpoint):
+            raise ValueError("Port could not be cast to integer value")
+        return origin(url)
+
+    monkeypatch.setattr(read, "_origin", refuse_the_cdn)
+
+    with pytest.raises(RuntimeError, match="cannot be parsed") as error:
+        if call == "scan_bucket":
+            plhf.scan_bucket(_uri(fake_bucket, "data/p00.parquet"))
+        elif call == "count_rows":
+            plhf.count_rows(_uri(fake_bucket, "data/"))
+        else:
+            list(_source(fake_bucket, 2)(None, None, None, None))
+
+    assert _uri(fake_bucket, "data/p00.parquet") in str(error.value)
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+# ---- a file that is replaced; several threads --------------------------------------
+
+
+def test_replaced_file_is_read_stale_within_the_reuse_window(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _moving_clock(monkeypatch)
+    uri = _uri(fake_bucket, "data/")
+    old = _numbered_frame(0, 5)
+    new = _numbered_frame(100, 7)
+    fake_hub.put_parquet(fake_bucket, "data/p00.parquet", old)
+    lf = plhf.scan_bucket(uri)
+    assert_frame_equal(lf.collect(), old)
+
+    fake_hub.put_parquet(fake_bucket, "data/p00.parquet", new)
+
+    # The kept URL names the old content. A new call reads the new content.
+    clock.now += read._URL_REUSE_SECONDS
+    assert_frame_equal(lf.collect(), old)
+    assert_frame_equal(plhf.scan_bucket(uri).collect(), new)
+    # After the window the same LazyFrame reads the new content.
+    clock.now += 1
+    assert_frame_equal(lf.collect(), new)
+
+
+def test_threads_resolve_every_file_once(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int
+) -> None:
+    n_files = 10
+    n_threads = 8
+    expected = _put_numbered(fake_hub, fake_bucket, n_files)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    fake_hub.reset_log()
+    start = threading.Barrier(n_threads)
+    frames: list[pl.DataFrame] = []
+    errors: list[BaseException] = []
+
+    def collect() -> None:
+        try:
+            start.wait(timeout=10)
+            frames.append(lf.collect())
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=collect) for _ in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    assert len(frames) == n_threads
+    for frame in frames:
+        assert_frame_equal(frame, expected)
+    # One resolve request per file, not one per thread and file.
+    assert sorted(_resolved(fake_hub)) == [f"p{i:02d}.parquet" for i in range(n_files)]
+
+
+def test_threads_that_wait_get_the_error_of_the_resolve(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    n_threads = 4
+    _put_numbered(fake_hub, fake_bucket, 3)
+    source = _source(fake_bucket, 3)
+    fake_hub.delete(fake_bucket, "data/p02.parquet")
+    start = threading.Barrier(n_threads)
+    errors: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            start.wait(timeout=10)
+            source._resolve(0, 3, "test")
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=resolve) for _ in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert len(errors) == n_threads
+    assert all(isinstance(error, FileNotFoundError) for error in errors)
+    # Nothing is left in flight: the next call asks the Hub again.
+    assert source._resolving == {}
+    fake_hub.put_parquet(fake_bucket, "data/p02.parquet", _numbered_frame(20, 10))
+    assert len(source._resolve(0, 3, "test")[0]) == 3
