@@ -33,8 +33,10 @@ not bounded and differ between huggingface_hub versions.
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -55,6 +57,7 @@ from huggingface_hub.utils import (
 )
 from polars.io.plugins import register_io_source
 
+from polars_hf import _redirect
 from polars_hf._glob import glob_to_regex, has_glob, literal_prefix
 from polars_hf._uri import BucketPath, parse_bucket_uri
 
@@ -63,7 +66,20 @@ logger = logging.getLogger(__name__)
 # The signed URL carries its own expiry (an ``Expires`` query parameter, about
 # one hour after the resolve request), so URLs are resolved at scan time.
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
-_RESOLVE_MODES = ("collect", "now")
+_RESOLVE_MODES = ("redirect", "collect", "now")
+# The mode of a scan_bucket call without resolve=, if this variable is set.
+RESOLVE_ENV_VAR = "POLARS_HF_RESOLVE"
+# resolve="now" puts presigned URLs into the query plan. It is refused unless
+# this variable is "1".
+ALLOW_SIGNED_URLS_ENV_VAR = "POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN"
+# A resolve request of the redirect mode is made while polars waits for the
+# answer of the local server: a retry wait is made only if it ends within
+# this many seconds.
+_REDIRECT_RESOLVE_DEADLINE = 20.0
+# Variables that make the HTTP client of polars use a proxy for http:// URLs,
+# and those that exempt hosts from it.
+_PROXY_ENV_VARS = ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+_NO_PROXY_ENV_VARS = ("NO_PROXY", "no_proxy")
 # A collect-time scan resolves and scans the files in groups of this size: one
 # group is one burst of resolve requests and one native multi-file scan. The
 # URLs of a group are resolved when the group before it is exhausted, so a URL
@@ -159,11 +175,14 @@ class _Budget:
         scope: str | None = None,
         files_total: int = 0,
         files_resolved: int = 0,
+        allowed: float | None = None,
     ) -> None:
         self.bucket_id = bucket_id
         self.operation = operation
         self.scope = scope if scope is not None else f"{operation} call"
-        self.deadline = time.monotonic() + _SCAN_DEADLINE
+        # Seconds from now in which a retry wait must end.
+        self.allowed = _SCAN_DEADLINE if allowed is None else allowed
+        self.deadline = time.monotonic() + self.allowed
         self.files_total = files_total
         # A total given by the caller is the total of the scan: a resolve of
         # some of its files does not replace it.
@@ -270,7 +289,7 @@ def _wait_before_retry(response, attempt: int, budget: _Budget, what: str) -> No
         asked = "the Hub asks to wait" if hint is not None else "the next retry is in"
         reason = (
             f"{asked} {wait:.0f} s, but only {left:.0f} s are left of the "
-            f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.scope}; "
+            f"{budget.allowed:.0f} s allowed for one {budget.scope}; "
             "try again later"
         )
         raise _retry_error(response, budget, what, reason)
@@ -474,7 +493,7 @@ def _iter_tree_pages(
         if time.monotonic() > budget.deadline:
             raise TimeoutError(
                 f"the listing of {uri!r} did not finish within the "
-                f"{_SCAN_DEADLINE:.0f} s allowed for one {budget.scope} "
+                f"{budget.allowed:.0f} s allowed for one {budget.scope} "
                 f"({listed} entries were listed)"
             )
         requested.add(url)
@@ -1200,6 +1219,149 @@ def _all_signed_urls(found: _Found) -> list[str]:
     return _signed_urls(found.endpoint, found.headers, found.paths, found.budget)
 
 
+# ---- redirect mode ----------------------------------------------------------
+
+
+def _no_proxy_covers_loopback(value: str) -> bool:
+    """Whether a ``NO_PROXY`` value exempts ``127.0.0.1`` from the proxy."""
+    loopback = ipaddress.ip_address("127.0.0.1")
+    for entry in value.split(","):
+        entry = entry.strip()
+        if entry in ("*", "127.0.0.1"):
+            return True
+        if "/" in entry:
+            try:
+                if loopback in ipaddress.ip_network(entry, strict=False):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _check_loopback_is_not_proxied() -> None:
+    """Raise if polars would send requests for ``127.0.0.1`` to a proxy.
+
+    The HTTP client of polars reads the proxy variables of the environment.
+    With a proxy for ``http://`` URLs and no exemption for the loopback
+    address, the requests for the local redirect server go to the proxy and
+    the scan fails after several seconds with an error that does not say why.
+    """
+    proxy_variable = None
+    for name in _PROXY_ENV_VARS:
+        if os.environ.get(name):
+            proxy_variable = name
+            break
+    if proxy_variable is None:
+        return
+    for name in _NO_PROXY_ENV_VARS:
+        if _no_proxy_covers_loopback(os.environ.get(name, "")):
+            return
+    raise RuntimeError(
+        f"scan_bucket: the environment variable {proxy_variable} sends the "
+        "requests of polars for the local redirect server (http://127.0.0.1) to "
+        "a proxy, and NO_PROXY does not exempt 127.0.0.1. Set "
+        "NO_PROXY=127.0.0.1,localhost (keep the entries you have), or use "
+        'resolve="collect", which needs no local server.'
+    )
+
+
+class _RedirectResolver:
+    """Resolves the files of one redirect-mode scan for the local server.
+
+    The token is in the request headers of this object only: it is not part
+    of a local URL, of the query plan or of an answer of the server.
+    """
+
+    def __init__(self, endpoint: str, headers: dict[str, str], bucket_id: str) -> None:
+        self.endpoint = endpoint
+        self.headers = headers
+        self.bucket_id = bucket_id
+
+    def resolve(self, path: str) -> str:
+        """The presigned URL of ``path``: one ``resolve`` request, with retries.
+
+        Polars waits for the answer, so a retry wait is made only if it ends
+        within ``_REDIRECT_RESOLVE_DEADLINE``.
+        """
+        budget = _Budget(
+            self.bucket_id,
+            scope="resolve request of a scan_bucket query",
+            allowed=_REDIRECT_RESOLVE_DEADLINE,
+        )
+        return _signed_url(
+            _resolve_url(self.endpoint, self.bucket_id, path),
+            self.headers,
+            uri=_file_uri(self.bucket_id, path),
+            budget=budget,
+        )
+
+    def describe(self, error: Exception) -> tuple[int, str]:
+        """The HTTP status and the text that the local server answers.
+
+        Polars retries a 5xx answer for several seconds and does not retry a
+        4xx answer. Only a failure that can clear in seconds is a 503.
+        """
+        message = _scrub_signed_urls(str(error), {})
+        if isinstance(error, FileNotFoundError):
+            return 404, message
+        if isinstance(error, PermissionError):
+            return 403, message
+        if isinstance(error, HfHubHTTPError):
+            status = _status_code(error)
+            if status == 429:
+                # Not 429: polars would ask again ten times.
+                hint = ' (resolve="collect" waits for the rate limit)'
+                return 424, message + hint
+            if status in _RETRY_STATUS_CODES:
+                return 503, message
+            return 424, message
+        if isinstance(error, (ValueError, RuntimeError)):
+            # An empty file, or a file that the Hub does not redirect.
+            return 424, message
+        # A timeout or a connection error of the request to the Hub.
+        return 503, f"{type(error).__name__}: {message}"
+
+
+def _redirect_scan(found: _Found, scan_kwargs: dict[str, object]) -> pl.LazyFrame:
+    """The LazyFrame of a redirect-mode scan: the native node over local URLs."""
+    _check_loopback_is_not_proxied()
+    resolver = _RedirectResolver(found.endpoint, found.headers, found.bucket_id)
+    local_urls = _redirect.register(
+        found.paths, resolver.resolve, resolver.describe, first_url=found.first_url
+    )
+    lf = pl.scan_parquet(local_urls, **scan_kwargs)
+    path_column = scan_kwargs.get("include_file_paths")
+    if path_column is not None:
+        # Polars fills the column with the local URLs.
+        uris_by_url = {}
+        for path, url in zip(found.paths, local_urls, strict=True):
+            uris_by_url[url] = _file_uri(found.bucket_id, path)
+        bucket_uri = pl.col(path_column).replace_strict(
+            uris_by_url, return_dtype=pl.String
+        )
+        lf = lf.with_columns(bucket_uri)
+    return lf
+
+
+def _resolve_mode(resolve: str | None) -> str:
+    """The mode of a ``scan_bucket`` call; raises for one that is not allowed."""
+    source = "resolve"
+    if resolve is None:
+        resolve = os.environ.get(RESOLVE_ENV_VAR) or "redirect"
+        source = f"the environment variable {RESOLVE_ENV_VAR}"
+    if resolve not in _RESOLVE_MODES:
+        raise ValueError(f"{source} must be one of {_RESOLVE_MODES}, not {resolve!r}")
+    if resolve == "now" and os.environ.get(ALLOW_SIGNED_URLS_ENV_VAR) != "1":
+        raise ValueError(
+            'resolve="now" puts presigned URLs into the query plan: each one '
+            "gives read access to one file for about 60 minutes to anyone who "
+            "sees it in explain(), serialize(), an error message or a log. To "
+            f"accept that, set the environment variable {ALLOW_SIGNED_URLS_ENV_VAR}=1; "
+            'else use resolve="redirect" (the default) or resolve="collect".'
+        )
+    return resolve
+
+
 def _collect_time_scan(source: _BucketSource, uri: str) -> pl.LazyFrame:
     """The LazyFrame of a collect-time scan: an IO-plugin node over ``source``."""
     options = {}
@@ -1215,7 +1377,7 @@ def scan_bucket(
     uri: str,
     *,
     token: str | None = None,
-    resolve: str = "collect",
+    resolve: str | None = None,
     **scan_kwargs: object,
 ) -> pl.LazyFrame:
     """Lazily scan parquet file(s) from a Hugging Face bucket.
@@ -1393,11 +1555,15 @@ def scan_bucket(
     >>> lf = plhf.scan_bucket("hf://buckets/me/data/*.parquet")  # doctest: +SKIP
     >>> lf.filter(pl.col("label") == 1).head(5).collect()  # doctest: +SKIP
     """
-    if resolve not in _RESOLVE_MODES:
-        raise ValueError(f"resolve must be one of {_RESOLVE_MODES}, not {resolve!r}")
+    mode = _resolve_mode(resolve)
+    if mode == "redirect":
+        # Before any request: the environment decides whether the mode works.
+        _check_loopback_is_not_proxied()
     found = _find_files(uri, token)
-    if resolve == "now":
+    if mode == "now":
         return pl.scan_parquet(_all_signed_urls(found), **scan_kwargs)
+    if mode == "redirect":
+        return _redirect_scan(found, scan_kwargs)
 
     source = _BucketSource(
         endpoint=found.endpoint,

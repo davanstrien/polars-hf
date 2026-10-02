@@ -230,6 +230,19 @@ def fast_resolve_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _allow_signed_urls_in_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests use ``resolve="now"`` as the reference: the plain native scan.
+
+    The mode needs this acknowledgement. The tests of the refusal remove it.
+    A proxy of the developer's environment must not reach the tests.
+    """
+    monkeypatch.setenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", "1")
+    monkeypatch.delenv("POLARS_HF_RESOLVE", raising=False)
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_sleep(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

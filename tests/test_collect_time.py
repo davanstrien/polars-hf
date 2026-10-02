@@ -108,6 +108,14 @@ def _source(bucket_id: str, n_files: int, **scan_kwargs: object) -> read._Bucket
     )
 
 
+@pytest.fixture(autouse=True)
+def _collect_is_the_mode_of_this_module(
+    monkeypatch: pytest.MonkeyPatch, _allow_signed_urls_in_plan: None
+) -> None:
+    """A ``scan_bucket`` call without ``resolve=`` uses ``resolve="collect"`` here."""
+    monkeypatch.setenv("POLARS_HF_RESOLVE", "collect")
+
+
 @pytest.fixture
 def small_groups(monkeypatch: pytest.MonkeyPatch) -> int:
     """Groups of 3 files, so a few small files make several groups."""

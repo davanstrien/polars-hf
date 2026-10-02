@@ -637,7 +637,7 @@ def test_query_warns_once_for_the_schema_and_once_per_group(
     n_files = 6
     for i in range(n_files):
         _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
-    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"), resolve="collect")
     # One rate-limited answer for every file.
     for i in range(n_files):
         route = rf"/resolve/data/p{i}\.parquet$"
@@ -658,7 +658,7 @@ def test_deadline_of_a_query_starts_with_each_group(
 ) -> None:
     for i in range(3):
         _put(fake_hub, fake_bucket, f"data/p{i}.parquet")
-    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"), resolve="collect")
     # The query runs long after the call: the 600 s of the call are over.
     clock.now += 10 * read._SCAN_DEADLINE
     fake_hub.add_fault(
