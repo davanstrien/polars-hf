@@ -15,6 +15,10 @@ Every request is recorded (:attr:`FakeHub.requests`) and faults can be scripted
 per route (:meth:`FakeHub.add_fault`), so tests can assert on request counts,
 bytes transferred and error handling without any network access.
 
+A fault can also break the connection instead of answering
+(``add_fault(..., action="reset")``: the socket is reset before any answer;
+``action="truncate"``: the normal answer is cut after half of its body).
+
 A presigned URL carries the number of the signing period it was made in
 (``X-Fake-Period``). :meth:`FakeHub.expire_signed_urls` starts a new period:
 the cdn server then answers 403 to every URL made before, like the real one
@@ -81,6 +85,9 @@ import io
 import json
 import posixpath
 import re
+import socket
+import struct
+import sys
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -147,6 +154,7 @@ class _Fault:
     remaining: int
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    action: str = "reply"
 
 
 @dataclass
@@ -154,6 +162,8 @@ class _Reply:
     status: int
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    # "reply", or how the connection is broken: "reset" / "truncate".
+    action: str = "reply"
 
 
 def _json_reply(payload: object, status: int = 200) -> _Reply:
@@ -308,14 +318,14 @@ class FakeHub:
         self._blobs: dict[str, bytes] = {}
         self._faults: list[_Fault] = []
         self._lock = threading.Lock()
-        self._servers: dict[str, ThreadingHTTPServer] = {}
+        self._servers: dict[str, _QuietServer] = {}
         self._threads: list[threading.Thread] = []
 
     # ---- lifecycle ---------------------------------------------------------
 
     def start(self) -> FakeHub:
         for origin in (HUB, CDN):
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self, origin))
+            server = _QuietServer(("127.0.0.1", 0), _make_handler(self, origin))
             server.daemon_threads = True
             # A short poll interval keeps shutdown (once per test) fast.
             thread = threading.Thread(
@@ -441,8 +451,14 @@ class FakeHub:
         times: int = 1,
         headers: dict[str, str] | None = None,
         body: bytes = b"",
+        action: str = "reply",
     ) -> None:
         """Answer the next ``times`` matching requests with ``status``.
+
+        With ``action="reset"`` the connection is reset instead (``status``
+        is only recorded). With ``action="truncate"`` the normal answer of
+        the route is sent with half of its body, then the connection is
+        closed.
 
         ``pattern`` is a regular expression searched in the percent-decoded
         request path. Faults are consumed in the order they were added, so
@@ -457,6 +473,7 @@ class FakeHub:
             remaining=times,
             headers=headers or {},
             body=body,
+            action=action,
         )
         with self._lock:
             self._faults.append(fault)
@@ -829,8 +846,15 @@ class FakeHub:
             accepted = {f"Bearer {token}" for token in self._tokens}
 
         fault = self._take_fault(origin, method, decoded_path)
+        if fault is not None and fault.action == "truncate":
+            fault = None
+            truncate = True
+        else:
+            truncate = False
         if fault is not None:
-            reply = _Reply(fault.status, dict(fault.headers), fault.body)
+            reply = _Reply(
+                fault.status, dict(fault.headers), fault.body, action=fault.action
+            )
         elif origin == HUB and authorization not in accepted:
             reply = _error_reply(401, "Unauthorized", "Invalid username or password.")
         elif origin == HUB:
@@ -840,6 +864,8 @@ class FakeHub:
         else:
             reply = _Reply(405)
 
+        if truncate:
+            reply.action = "truncate"
         sent = 0 if method == "HEAD" else len(reply.body)
         record = RecordedRequest(
             origin=origin,
@@ -857,6 +883,16 @@ class FakeHub:
         return reply
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """Does not print the traceback of a connection that the client dropped."""
+
+    def handle_error(self, request, client_address) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def _make_handler(hub: FakeHub, origin: str) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -869,11 +905,24 @@ def _make_handler(hub: FakeHub, origin: str) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
             reply = hub._handle(origin, self.command, self.path, self.headers, body)
+            if reply.action == "reset":
+                # SO_LINGER with a zero timeout: close() sends a reset.
+                linger = struct.pack("ii", 1, 0)
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+                self.close_connection = True
+                return
             self.send_response(reply.status)
             for name, value in reply.headers.items():
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(reply.body)))
             self.end_headers()
+            if reply.action == "truncate":
+                # The announced length is not sent: the client sees the end
+                # of the stream in the middle of the body.
+                self.wfile.write(reply.body[: len(reply.body) // 2])
+                self.wfile.flush()
+                self.close_connection = True
+                return
             if self.command != "HEAD":
                 self.wfile.write(reply.body)
             self.wfile.flush()
