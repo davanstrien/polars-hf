@@ -13,13 +13,20 @@ Stock polars cannot authenticate a generic ``https://`` URL itself (bearer-token
 injection is gated behind the ``hf://`` scheme), which is why we resolve the
 signed URL here rather than passing the ``resolve`` URL directly.
 
-A signed URL holds a signature and is valid for about one hour. By default
-(``resolve="collect"``) ``scan_bucket`` therefore returns a LazyFrame over a
-polars IO-plugin source (:class:`_BucketSource`): the plan holds no URL, and
-the URLs are resolved when the query runs, for one group of files at a time.
-Each group is one native ``scan_parquet``; its output crosses into Python as
-whole DataFrames. ``resolve="now"`` resolves every URL in ``scan_bucket`` and
-returns the native scan node itself.
+A signed URL holds a signature and is valid for about one hour, so it does
+not belong in a query plan. ``scan_bucket`` has three modes:
+
+* ``resolve="redirect"`` (default): the native scan node over URLs of a local
+  server (``_redirect.py``) that redirects polars to the signed URLs. The
+  plan holds ``http://127.0.0.1:...`` URLs.
+* ``resolve="collect"``: a LazyFrame over a polars IO-plugin source
+  (:class:`_BucketSource`). The plan holds no URL, and the URLs are resolved
+  when the query runs, for one group of files at a time. Each group is one
+  native ``scan_parquet``; its output crosses into Python as whole
+  DataFrames.
+* ``resolve="now"``: every URL is resolved in ``scan_bucket`` and the native
+  scan node over the signed URLs is returned. Refused unless the environment
+  variable ``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN`` is ``1``.
 
 All Hub requests (the bucket listing and the ``resolve`` requests) are sent
 with the shared ``huggingface_hub`` session
@@ -1384,7 +1391,8 @@ def scan_bucket(
 
     The files are read by native :func:`polars.scan_parquet` scans over
     presigned URLs, so only the column chunks a query needs are transferred.
-    ``scan_bucket`` itself finds the files and reads no file data.
+    ``scan_bucket`` itself finds the files and reads no file data. By default
+    the presigned URLs are not part of the query plan.
 
     Parameters
     ----------
@@ -1407,30 +1415,39 @@ def scan_bucket(
         Hugging Face token. If ``None``, resolved by ``huggingface_hub`` (the
         ``HF_TOKEN`` env var or cached login).
     resolve
-        When the presigned URLs of the files are resolved:
+        Where the presigned URLs of the files are. A presigned URL gives read
+        access to one file for about 60 minutes to anyone who has it.
 
-        * ``"collect"`` (default): when the query runs. The LazyFrame is a
-          polars IO-plugin source that holds the bucket paths. The plan
-          (``explain()``, ``serialize()``) holds no signed URL, and a URL is
-          resolved shortly before it is used, so the plan does not expire.
-        * ``"now"``: in ``scan_bucket``. The LazyFrame is the native
-          ``scan_parquet`` node over the signed URLs: the URLs (with their
-          signature) are visible in the plan and are valid for ~1 hour from
-          the call.
+        * ``"redirect"``: the LazyFrame is the native ``scan_parquet`` node
+          over ``http://127.0.0.1:{port}/...`` URLs. A server in this process
+          answers each request of polars with a redirect to the presigned
+          URL, which it resolves when it is first needed and again after 30
+          minutes. The plan, the errors and the verbose log of polars name
+          the local URL only. The plan works while this process runs.
+        * ``"collect"``: the LazyFrame is a polars IO-plugin source that
+          holds the bucket paths and resolves the URLs when the query runs.
+          Its plan can be serialized and run in another process. A row count
+          reads a whole column, and ``tail()`` scans all files.
+        * ``"now"``: the URLs are resolved in ``scan_bucket`` and the
+          LazyFrame is the native ``scan_parquet`` node over them. The URLs,
+          with their signature, are in ``explain()``, ``serialize()``, error
+          messages and logs. Refused unless the environment variable
+          ``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN`` is ``1``.
+        * ``None`` (default): the value of the environment variable
+          ``POLARS_HF_RESOLVE`` if it is set, else ``"redirect"``.
 
-        See Notes for what differs between the two.
+        See Notes for what differs between the modes.
     **scan_kwargs
         Forwarded to :func:`polars.scan_parquet` — e.g.
         ``storage_options={"max_retries": 5}`` for flaky connections,
         ``missing_columns="insert"`` / ``extra_columns="ignore"`` for
         heterogeneous schemas across globbed files, ``schema=``, or
         ``cast_options=``. ``include_file_paths="col"`` gives the
-        ``hf://buckets/...`` URI of the file of every row with
-        ``resolve="collect"``, and the signed URL with ``resolve="now"``.
-        (Two files with the same content that get the same URL and are in
-        the same group show one URI.)
-        ``hive_partitioning=`` sees the presigned URLs, not the bucket paths,
-        so it finds no partition columns.
+        ``hf://buckets/...`` URI of the file of every row in the redirect and
+        the collect mode, and the signed URL with ``resolve="now"``.
+        ``hive_partitioning=True`` finds the ``key=value`` directories of
+        the bucket path in the redirect mode only: in the other modes polars
+        sees the presigned URLs, which do not have the bucket path.
 
     Returns
     -------
@@ -1440,8 +1457,10 @@ def scan_bucket(
     ------
     ValueError
         The URI is not a valid bucket URI, a glob ends with ``/`` or uses
-        ``**`` inside a path segment, ``resolve`` is not a known mode, or a
-        matched file is empty (0 bytes).
+        ``**`` inside a path segment, ``resolve`` (or ``POLARS_HF_RESOLVE``)
+        is not a known mode, ``resolve="now"`` is used without
+        ``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1``, or a matched file is empty
+        (0 bytes).
     FileNotFoundError
         The bucket does not exist, or no file matches ``uri``.
     PermissionError
@@ -1450,7 +1469,9 @@ def scan_bucket(
     RuntimeError
         The Hub serves a file itself instead of redirecting to a presigned
         URL (a file that is not Xet-backed), or a listing answer is not what
-        the Hub API documents.
+        the Hub API documents. In the redirect mode: a proxy variable
+        (``HTTP_PROXY``, ``ALL_PROXY``) is set and ``NO_PROXY`` does not
+        exempt ``127.0.0.1``, or the local server cannot start.
     TimeoutError
         A listing with many pages did not finish within 10 minutes.
     huggingface_hub.errors.HfHubHTTPError
@@ -1473,10 +1494,64 @@ def scan_bucket(
       character.
 
     With ``resolve="now"`` it then sends one ``resolve`` request for each of
-    the N files.
+    the N files. In the other modes the files are resolved by the query.
 
-    **Hub requests of a query** (``resolve="collect"``). The schema is read
-    when polars first needs it (``collect()``, ``collect_schema()``,
+    ``resolve`` requests count in the Hub's "resolvers" rate limit.
+
+    The requests go through the shared HTTP session of ``huggingface_hub``, so
+    ``HF_HUB_OFFLINE=1`` and a custom client factory
+    (``huggingface_hub.set_client_factory``) apply to them.
+
+    **Retries.** A 408, 429 or 5xx answer to any Hub request (every listing
+    page, every ``resolve``) is retried up to 5 times. The wait is the one
+    the Hub asks for (rate-limit reset, ``Retry-After``), else 1 s doubling
+    up to 8 s; a wait of more than 5 s that the Hub asks for is announced
+    with one warning (logged instead if warnings are turned into errors). A
+    wait is made only if it ends within a limit; else the error is raised.
+    The limit is 10 minutes from the start of the ``scan_bucket`` call for
+    its own requests; 10 minutes from the first request of the schema read
+    and of every group in the collect mode; 20 seconds for a ``resolve``
+    request of the redirect mode, because polars waits for its answer.
+    Timeouts and connection errors are not retried.
+
+    **The redirect mode** (``resolve="redirect"``). The local URLs are
+    ``http://127.0.0.1:{port}/{random id}/valid-only-while-pid-{pid}-runs/``
+    followed by the bucket path. One server per process answers them; it
+    starts with the first redirect-mode call, listens on the loopback
+    interface only, serves only the files of a ``scan_bucket`` call, and
+    refuses a request whose ``Host`` header is not the loopback address. The
+    random id is a capability: a local process that knows a local URL can
+    get the presigned URL of that file while this process runs. The token
+    stays in the resolver of this process.
+
+    * A file is resolved by one ``resolve`` request when polars first asks
+      for it, and again when its URL is older than 30 minutes. A second query
+      on the LazyFrame within 30 minutes sends no ``resolve`` request. Every
+      ``scan_bucket`` call has its own URLs.
+    * The queries are those of the native node: a row count and ``tail()``
+      read the footers, and the scan options behave as in polars.
+    * ``collect()`` reports every failure as the ``OSError`` of polars' HTTP
+      client, with the local URL and the status that the local server
+      answered: 404 for a file that was deleted after the listing, 403 for a
+      token without access, 424 for a rate limit whose reset is later than
+      20 s and for a file that the Hub does not redirect, 503 (after the
+      retries of polars, 10 to 30 s) for a Hub that keeps failing. The
+      reason is logged (logger ``polars_hf._redirect``, level WARNING);
+      polars 2 also prints it.
+    * A proxy for ``http://`` URLs that also covers ``127.0.0.1`` breaks the
+      mode: ``scan_bucket`` raises (see Raises).
+    * The plan is valid while this process runs, on this machine. Used after
+      that (a serialized plan, a worker on another machine), polars fails to
+      connect, retries for 5 to 15 s and raises an ``OSError`` that names
+      the local URL. Use ``resolve="collect"`` for such plans.
+    * The server keeps the file lists of the 1,024 calls used last; a
+      LazyFrame of an older call fails with a 404.
+    * The server does not see the answers of the CDN. A URL that the CDN
+      refuses before it is 30 minutes old is served until then; a new
+      ``scan_bucket`` call resolves new URLs.
+
+    **The collect mode** (``resolve="collect"``). The schema is read when
+    polars first needs it (``collect()``, ``collect_schema()``,
     ``explain()``), once per LazyFrame: one ``resolve`` request for the first
     file and the footer of that file. A query then scans the files in path
     order in groups of 64. The URLs of a group are resolved (one ``resolve``
@@ -1494,47 +1569,30 @@ def scan_bucket(
     again, the group is resolved and scanned once more, provided that it has
     not returned rows yet.
 
-    ``resolve`` requests count in the Hub's "resolvers" rate limit.
+    An error of a ``resolve`` request of a query (a file that was deleted
+    after the listing, a 401 or 403, a rate limit that the retries did not
+    clear) is raised by ``collect()``, not by ``scan_bucket``. Polars 2
+    raises the exception of the list above. Polars 1.x wraps an exception of
+    an IO source: it raises ``polars.exceptions.ComputeError`` whose message
+    holds the type name and the message of that exception. All polars
+    versions wrap an error of the schema read in a ``ComputeError`` ("schema
+    callable failed"). A read error of polars names the ``hf://`` URI of the
+    file, not its signed URL, and has no cause or context that holds the
+    URL. With ``POLARS_VERBOSE=1`` polars itself prints the URLs it scans to
+    stderr.
 
-    The requests go through the shared HTTP session of ``huggingface_hub``, so
-    ``HF_HUB_OFFLINE=1`` and a custom client factory
-    (``huggingface_hub.set_client_factory``) apply to them.
-
-    **Retries.** A 408, 429 or 5xx answer to any of these requests (every
-    listing page, every ``resolve``) is retried up to 5 times. The wait is
-    the one the Hub asks for (rate-limit reset, ``Retry-After``), else 1 s
-    doubling up to 8 s; a wait of more than 5 s that the Hub asks for is
-    announced with one warning (logged instead if warnings are turned into
-    errors). A wait is made only if it ends within 10 minutes; else the error
-    is raised. The 10 minutes start with the ``scan_bucket`` call for its own
-    requests, and with the first request of the schema read and of every
-    group for the requests of a query. Timeouts and connection errors are not
-    retried.
-
-    **Errors of a query** (``resolve="collect"``). An error of a ``resolve``
-    request of a query (a file that was deleted after the listing, a 401 or
-    403, a rate limit that the retries did not clear) is raised by
-    ``collect()``, not by ``scan_bucket``. Polars 2 raises the exception of
-    the list above. Polars 1.x wraps an exception of an IO source: it raises
-    ``polars.exceptions.ComputeError`` whose message holds the type name and
-    the message of that exception. All polars versions wrap an error of the
-    schema read in a ``ComputeError`` ("schema callable failed"). A read
-    error of polars names the ``hf://`` URI of the file, not its signed URL,
-    and has no cause or context that holds the URL. With ``POLARS_VERBOSE=1``
-    polars itself prints the URLs it scans to stderr, in both modes.
-
-    **What the IO-plugin node changes for a query** (``resolve="collect"``):
+    What the IO-plugin node changes for a query:
 
     * polars pushes the projection, the predicate and ``head(n)`` into the
       source. It does not push ``tail()`` or a slice with an offset: these
-      scan all files. ``resolve="now"`` reads only the last files for them;
+      scan all files;
     * ``select(pl.len())`` reads one whole column of every file, because
       polars asks an IO source for one column to count the rows. Polars
       chooses the column; it can be the largest one. :func:`count_rows`
       reads the footers only;
     * on files with different columns or types, a row count or a slice
-      outside of the rows raises a schema error; ``resolve="now"`` answers
-      them from the footers;
+      outside of the rows raises a schema error where the native node can
+      answer from the footers;
     * a consumer that stops reading a ``collect_batches()`` iterator does
       not stop the query, so the following groups are still resolved;
     * a group must be scanned within the ~1 hour that its URLs are valid;
@@ -1543,6 +1601,8 @@ def scan_bucket(
       their URLs are resolved at the start of the query;
     * every group is scanned with the schema of the first file of the scan
       (as ``schema=``), unless ``schema=`` is given;
+    * ``include_file_paths``: two files with the same content that get the
+      same URL and are in the same group show one URI;
     * ``LazyFrame.serialize()`` needs the ``cloudpickle`` package. The
       serialized plan holds the bucket paths and the scan options without
       ``storage_options`` and ``credential_provider``, and not the token:
@@ -1580,9 +1640,9 @@ def count_rows(uri: str, *, token: str | None = None) -> int:
     """Count the rows of parquet file(s) in a Hugging Face bucket.
 
     The count is read from the parquet footers: no column data is
-    transferred. Use it instead of ``scan_bucket(uri).select(pl.len())``,
-    which reads one column of every file (see the Notes of
-    :func:`scan_bucket`).
+    transferred. ``scan_bucket(uri).select(pl.len())`` reads the footers
+    too in the default mode; with ``resolve="collect"`` it reads one column
+    of every file (see the Notes of :func:`scan_bucket`).
 
     Parameters
     ----------
