@@ -7,14 +7,17 @@
 #     "hf_xet>=1.6.0",
 # ]
 # ///
-"""Compare three ways to read the parquet files of a bucket directory.
+"""Compare four ways to read the parquet files of a bucket directory.
 
 Arms (``--arms``):
 
-* ``native``: ``scan_bucket(uri, resolve="now")``. Every presigned URL is
-  resolved first; the query runs on the native ``scan_parquet`` node.
-* ``collect``: ``scan_bucket(uri)``, the default. The URLs are resolved when
-  the query runs, group by group, behind an IO-plugin node.
+* ``redirect``: ``scan_bucket(uri)``, the default. The native ``scan_parquet``
+  node over URLs of a local server that redirects to the presigned URLs.
+* ``collect``: ``scan_bucket(uri, resolve="collect")``. The URLs are resolved
+  when the query runs, group by group, behind an IO-plugin node.
+* ``now``: ``scan_bucket(uri, resolve="now")``. Every presigned URL is
+  resolved first; the native ``scan_parquet`` node reads them directly. The
+  arm sets ``POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1`` for its own process.
 * ``download``: the files are downloaded with ``hf_xet``
   (``HfApi.download_bucket_files``) into a staging directory, a few files at a
   time, and each batch is scanned from the local disk and deleted. The next
@@ -63,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-ARMS = ("native", "collect", "download")
+ARMS = ("redirect", "collect", "now", "download")
 QUERIES = ("full", "selective")
 RESULT_PREFIX = "RESULT "
 
@@ -260,10 +263,16 @@ def run_child(spec: dict) -> None:
 
     received_before = network_bytes_received()
     started = time.perf_counter()
-    if spec["arm"] == "native":
-        lf = plhf.scan_bucket(directory_uri, resolve="now")
+    if spec["arm"] == "redirect":
+        lf = plhf.scan_bucket(directory_uri, resolve="redirect")
     elif spec["arm"] == "collect":
-        lf = plhf.scan_bucket(directory_uri)
+        lf = plhf.scan_bucket(directory_uri, resolve="collect")
+    elif spec["arm"] == "now":
+        # The arm measures the scan of presigned URLs that are in the plan.
+        # polars-hf refuses that mode without this acknowledgement; the plan
+        # of this process is not printed, serialized or logged.
+        os.environ["POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN"] = "1"
+        lf = plhf.scan_bucket(directory_uri, resolve="now")
     else:
         # The schema: one resolve request and the footer of the first file.
         first_file = f"hf://buckets/{bucket_id}/{files[0].path}"
@@ -465,7 +474,7 @@ def main() -> None:
     if arguments.warmup:
         for uri in dict.fromkeys(inputs):
             # Every column and no predicate: every byte of the files.
-            warmup = spec_for("collect", "full", uri, warmup=True)
+            warmup = spec_for("redirect", "full", uri, warmup=True)
             warmup["columns"] = None
             warmup["filter_column"] = None
             specs.append(warmup)
