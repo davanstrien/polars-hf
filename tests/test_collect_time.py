@@ -108,14 +108,6 @@ def _source(bucket_id: str, n_files: int, **scan_kwargs: object) -> read._Bucket
     )
 
 
-@pytest.fixture(autouse=True)
-def _collect_is_the_mode_of_this_module(
-    monkeypatch: pytest.MonkeyPatch, _allow_signed_urls_in_plan: None
-) -> None:
-    """A ``scan_bucket`` call without ``resolve=`` uses ``resolve="collect"`` here."""
-    monkeypatch.setenv("POLARS_HF_RESOLVE", "collect")
-
-
 @pytest.fixture
 def small_groups(monkeypatch: pytest.MonkeyPatch) -> int:
     """Groups of 3 files, so a few small files make several groups."""
@@ -126,14 +118,82 @@ def small_groups(monkeypatch: pytest.MonkeyPatch) -> int:
 # ---- the keyword -----------------------------------------------------------
 
 
+@pytest.mark.parametrize("mode", ["later", "redirect", ""])
 def test_unknown_resolve_mode_is_rejected_without_a_request(
-    fake_hub: FakeHub, fake_bucket: str
+    fake_hub: FakeHub, fake_bucket: str, mode: str
 ) -> None:
     fake_hub.put_parquet(fake_bucket, "one.parquet", _numbered_frame(0, 5))
 
-    with pytest.raises(ValueError, match="resolve must be one of"):
-        plhf.scan_bucket(_uri(fake_bucket, "one.parquet"), resolve="later")
+    with pytest.raises(ValueError, match="resolve must be one of") as error:
+        plhf.scan_bucket(_uri(fake_bucket, "one.parquet"), resolve=mode)
 
+    # The message names the two modes.
+    assert "('collect', 'now')" in str(error.value)
+    assert fake_hub.requests == []
+
+
+def test_collect_is_the_default_mode(fake_hub: FakeHub, fake_bucket: str) -> None:
+    expected = _put_numbered(fake_hub, fake_bucket, 2)
+
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+
+    # The IO-plugin node: no URL in the plan, nothing resolved by the call.
+    assert "PYTHON" in lf.explain(optimized=False)
+    assert "http" not in lf.explain(optimized=False)
+    assert_frame_equal(lf.collect(), expected)
+
+
+def test_now_mode_needs_the_acknowledgement_variable(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = _put_numbered(fake_hub, fake_bucket, 2)
+    uri = _uri(fake_bucket, "data/")
+    fake_hub.reset_log()
+
+    for value in (None, "0", "true", ""):
+        if value is None:
+            monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN")
+        else:
+            monkeypatch.setenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", value)
+        with pytest.raises(ValueError) as error:
+            plhf.scan_bucket(uri, resolve="now")
+        message = str(error.value)
+        assert "about 60 minutes" in message
+        assert "explain(), serialize(), an error message or a log" in message
+        assert "POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1" in message
+    # Refused before any request; the default mode needs no variable.
+    assert fake_hub.requests == []
+    assert_frame_equal(plhf.scan_bucket(uri).collect(), expected)
+
+    monkeypatch.setenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN", "1")
+    lf = plhf.scan_bucket(uri, resolve="now")
+    assert SIGNATURE in lf.explain()
+    assert_frame_equal(lf.collect(), expected)
+
+
+def test_environment_variable_selects_the_mode(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 2)
+    uri = _uri(fake_bucket, "data/")
+
+    monkeypatch.setenv("POLARS_HF_RESOLVE", "now")
+    assert SIGNATURE in plhf.scan_bucket(uri).explain()
+    # resolve= has priority over the variable.
+    assert "PYTHON" in plhf.scan_bucket(uri, resolve="collect").explain()
+    monkeypatch.delenv("POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN")
+    with pytest.raises(ValueError, match="POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1"):
+        plhf.scan_bucket(uri)
+
+    for value in ("collect", ""):
+        monkeypatch.setenv("POLARS_HF_RESOLVE", value)
+        assert "PYTHON" in plhf.scan_bucket(uri).explain()
+
+    fake_hub.reset_log()
+    for value in ("redirect", "later"):
+        monkeypatch.setenv("POLARS_HF_RESOLVE", value)
+        with pytest.raises(ValueError, match="POLARS_HF_RESOLVE must be one of"):
+            plhf.scan_bucket(uri)
     assert fake_hub.requests == []
 
 
@@ -586,6 +646,9 @@ def test_url_of_the_first_file_is_resolved_again_when_it_is_old(
     assert _resolved(fake_hub) == ["p00.parquet", "p00.parquet"]
 
 
+READ_ERRORS = (pl.exceptions.PolarsError, OSError)
+
+
 def _refuse_every_cdn_request(fake_hub: FakeHub) -> None:
     for method in ("HEAD", "GET"):
         fake_hub.add_fault(
@@ -616,6 +679,64 @@ def test_read_error_names_the_bucket_file_in_the_whole_chain(
         assert_no_signed_url(repr(linked), fake_hub)
     # The URL was tried, dropped, resolved again and tried once more.
     assert _resolved(fake_hub) == ["p00.parquet", "p00.parquet"]
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+@pytest.mark.parametrize("schema_first", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"status": 416},
+        {"status": 302, "headers": {"Location": "/xet-bridge-us/loop"}},
+        {"status": 404, "body": b"gone"},
+    ],
+    ids=["416", "redirect loop", "404"],
+)
+def test_cdn_refusal_has_no_signed_url_in_the_chain(
+    fake_hub: FakeHub, fake_bucket: str, fault: dict, schema_first: bool, engine: str
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 2)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    if schema_first:
+        lf.collect_schema()
+    for method in ("HEAD", "GET"):
+        fake_hub.add_fault(CDN, method, r"^/xet-bridge-us/", times=1000, **fault)
+
+    with pytest.raises(READ_ERRORS) as error:
+        lf.collect(engine=engine)
+
+    for linked in exception_chain(error.value):
+        assert_no_signed_url(str(linked), fake_hub)
+        assert_no_signed_url(repr(linked), fake_hub)
+    assert len(fake_hub.matching(origin=CDN)) > 0
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"status": 500},
+        {"status": 0, "action": "reset"},
+        {"status": 0, "action": "truncate"},
+    ],
+    ids=["500", "connection reset", "truncated body"],
+)
+def test_cdn_failure_after_the_retries_of_polars_has_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str, fault: dict
+) -> None:
+    # Polars retries these for several seconds (the retries cannot be turned
+    # off for http URLs), then raises; here in the schema read.
+    _put_numbered(fake_hub, fake_bucket, 1)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    for method in ("HEAD", "GET"):
+        fake_hub.add_fault(CDN, method, r"^/xet-bridge-us/", times=100_000, **fault)
+
+    with pytest.raises(READ_ERRORS) as error:
+        lf.collect()
+
+    assert _uri(fake_bucket, "data/p00.parquet") in str(error.value)
+    for linked in exception_chain(error.value):
+        assert_no_signed_url(str(linked), fake_hub)
+        assert_no_signed_url(repr(linked), fake_hub)
 
 
 def test_clean_error_is_raised_without_context(
@@ -1112,3 +1233,93 @@ def test_count_rows_has_the_path_rules_and_errors_of_scan_bucket(
         plhf.count_rows(_uri(fake_bucket, "text/*"))
     for linked in exception_chain(error.value):
         assert_no_signed_url(str(linked), fake_hub)
+
+
+# ---- file counts, two scans, file names --------------------------------------
+
+
+@pytest.mark.parametrize("n_files", [1, 63, 64, 65, 129])
+def test_file_counts_around_the_group_size(
+    fake_hub: FakeHub, fake_bucket: str, n_files: int
+) -> None:
+    frames = []
+    for i in range(n_files):
+        frame = _numbered_frame(i * 2, 2)
+        fake_hub.put_parquet(fake_bucket, f"many/f{i:03d}.parquet", frame)
+        frames.append(frame)
+    uri = _uri(fake_bucket, "many/")
+
+    got = plhf.scan_bucket(uri).collect()
+
+    # The rows of the files in file order; one resolve request per file.
+    assert_frame_equal(got, pl.concat(frames))
+    assert len(_resolved(fake_hub)) == n_files
+    if n_files == 65:
+        assert_frame_equal(got, plhf.scan_bucket(uri, resolve="now").collect())
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_concat_and_join_of_two_scans(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int, engine: str
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 5)
+    fake_hub.put_parquet(
+        fake_bucket,
+        "names/n.parquet",
+        pl.DataFrame({"id": [1, 12, 43], "name": ["a", "b", "c"]}),
+    )
+
+    def query(mode: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+        data = plhf.scan_bucket(_uri(fake_bucket, "data/"), resolve=mode)
+        names = plhf.scan_bucket(_uri(fake_bucket, "names/"), resolve=mode)
+        joined = data.join(names, on="id").sort("id").collect(engine=engine)
+        both = pl.concat([data, data.head(4)]).collect(engine=engine)
+        return joined, both
+
+    joined, both = query("collect")
+    native_joined, native_both = query("now")
+
+    assert joined["name"].to_list() == ["a", "b", "c"]
+    assert_frame_equal(joined, native_joined)
+    assert both.height == 5 * ROWS + 4
+    assert_frame_equal(both, native_both)
+
+
+_ODD_NAMES = [
+    "odd/with space/a b.parquet",
+    "odd/ünï/日本.parquet",
+    "odd/100%/50%25.parquet",
+    "odd/#hash/q?.parquet",
+    "odd/plus+and&/x=1;y.parquet",
+    "odd/a%2Fb.parquet",
+    "odd/year=2024/kind=a b/part.parquet",
+]
+
+
+def test_odd_file_names_and_hive_directories(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(read, "_GROUP_FILES", 2)
+    for name in _ODD_NAMES:
+        fake_hub.put_parquet(fake_bucket, name, pl.DataFrame({"name": [name]}))
+    uri = _uri(fake_bucket, "odd/")
+
+    lf = plhf.scan_bucket(uri, include_file_paths="file")
+    got = lf.collect().sort("name")
+
+    # Every file is listed, resolved and read under its own name; the path
+    # column has the hf:// URI.
+    assert got["name"].to_list() == sorted(_ODD_NAMES)
+    assert got["file"].to_list() == [_uri(fake_bucket, n) for n in sorted(_ODD_NAMES)]
+    assert_frame_equal(
+        plhf.scan_bucket(uri).collect().sort("name"),
+        plhf.scan_bucket(uri, resolve="now").collect().sort("name"),
+    )
+    for name in _ODD_NAMES:
+        single = plhf.scan_bucket(_uri(fake_bucket, name)).collect()
+        assert single["name"].to_list() == [name]
+    # Polars sees presigned URLs, which have no key=value directories: no
+    # partition column in either mode.
+    for mode in ("collect", "now"):
+        hive = plhf.scan_bucket(uri, resolve=mode, hive_partitioning=True)
+        assert hive.collect_schema().names() == ["name"]

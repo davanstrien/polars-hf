@@ -1,10 +1,9 @@
 """Offline read tests: ``scan_bucket`` against the fake Hub (no network).
 
-The tests of the requests of ``scan_bucket()`` run in every ``resolve`` mode:
-``"now"`` resolves every file in the call; ``"redirect"`` (the default) and
-``"collect"`` resolve none of the listed files before the query runs.
-``test_redirect.py`` and ``test_collect_time.py`` have the tests of what a
-query requests in these two modes.
+The tests of the requests of ``scan_bucket()`` run in both ``resolve`` modes:
+``"now"`` resolves every file in the call, ``"collect"`` (the default) resolves
+none of the listed files before the query runs. ``test_collect_time.py`` has
+the tests of what a query requests.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ def _numbered_frame(start: int, rows: int) -> pl.DataFrame:
     return pl.DataFrame({"id": ids, "label": (ids % 3).cast(pl.String)})
 
 
-MODES = ("redirect", "collect", "now")
+MODES = ("collect", "now")
 
 
 def _resolves_in_the_call(mode: str, n_files: int) -> int:
