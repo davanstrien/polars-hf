@@ -101,7 +101,7 @@ Things worth knowing:
   tracebacks. Two things are outside the package's control: `POLARS_VERBOSE=1` makes Polars print
   the URLs it reads, and DEBUG logging of the HTTP client prints them too.
 - **Use `count_rows` for counts.** In the default mode Polars asks for a whole column to count
-  rows. On 28 GB that was 31 s and 27.7 GB downloaded, against under a second from the footers.
+  rows, which can mean downloading most of the data. `count_rows` reads only the footers.
 - **Errors show up when the query runs.** A file deleted after the listing, or a token that lost
   access, raises from `collect()`. On Polars 1.x these arrive as a `ComputeError` that quotes the
   original error; Polars 2.0 raises the original.
@@ -182,23 +182,21 @@ hf jobs uv run --secrets HF_TOKEN --flavor cpu-upgrade my_script.py
 
 ## How fast is it
 
-Measured on HF Jobs, `cpu-performance` flavor (32 vCPU, 256 GB RAM, $1.90/hour), Polars 2.0.0rc2,
-one run each, on FineWeb-Edu parquet shards of about 2.3 GB that had been read before (a first read
-of new data is slower).
+I've only run a handful of benchmarks so far, so treat these as a rough guide rather than a
+promise. On a 32-vCPU Hugging Face Job (`cpu-performance`), with Polars 2.0.0rc2 and parquet shards
+of about 2 GB:
 
-| What | Size | Time | Peak memory | Local disk |
-| --- | --- | --- | --- | --- |
-| Scan 12 files, decode four columns | 28 GB read | 21 s | 6 GB | none |
-| Scan and write one parquet file | 14 GB read, 8.8 GB written | 45 s | 17.8 GB | none |
-| Scan and write one parquet file | 127 GB read, 79.2 GB written | 308 s | 24.0 GB | none |
-| Scan and write 96 files of about 1 GB | 56 GB read, 35.0 GB written | 126 s | 21.8 GB | none |
+- Scanning ran at somewhere between a few hundred MB/s and a bit over 1 GB/s. It varied a lot from
+  day to day, and the first read of new data is slower than later ones.
+- A scan, filter and write of roughly 100 GB took a few minutes, with no local disk used.
+- Memory during large writes stayed in the low tens of GB in these runs. That is what I observed,
+  not a guaranteed bound.
 
-Two things I'd take from these. Reading is limited by the network path, not by Polars: a scan uses
-a fraction of the 32 cores. And memory for writes levelled off (24 GB for a 79 GB file), though
-that is an observation from these runs, not a guarantee. Read times also moved a lot between days:
-the same 127 GB scan took 85 s on one day and 301 s on another.
+Reading looks limited by the network path rather than by Polars: a scan used only a fraction of the
+cores.
 
-The scripts and the full tables with job ids are in [benchmarks/](benchmarks/README.md).
+The scripts, the exact numbers and their job ids are in [benchmarks/](benchmarks/README.md), so you
+can rerun them on your own data.
 
 ## What to know before relying on it
 
