@@ -17,6 +17,8 @@ env:
   # Pushes and pull requests run the derandomized Hypothesis profile (the same
   # examples every time); the weekly run draws new examples.
   HYPOTHESIS_PROFILE: ${{ github.event_name == 'schedule' && 'random' || 'polars-hf' }}
+  # The weekly run also runs the offline tests marked "slow".
+  OFFLINE_TESTS: ${{ github.event_name == 'schedule' && 'not staging' || 'not staging and not slow' }}
 
 jobs:
   # Lint + offline tests with the committed lock. No network access to the Hub:
@@ -41,7 +43,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run --locked ruff check .
       - run: uv run --locked ruff format --check .
-      - run: uv run --locked pytest -q -m "not staging"
+      - run: uv run --locked pytest -q -m "$OFFLINE_TESTS"
 
   # Offline tests against the edges of the supported dependency range. These
   # jobs resolve without the lock, so they install with `uv pip` and run with
@@ -91,7 +93,7 @@ jobs:
       - run: ${{ matrix.install }}
       # Make the versions under test visible in the log.
       - run: uv pip list | grep -Ei 'polars|huggingface|httpx|hf-xet'
-      - run: uv run --no-sync pytest -q -m "not staging"
+      - run: uv run --no-sync pytest -q -m "$OFFLINE_TESTS"
 
   # Live round-trips against the Hub CI staging instance, on every push and
   # pull request and in the weekly run. Each test creates its own uniquely

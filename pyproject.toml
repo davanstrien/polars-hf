@@ -51,8 +51,10 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Live staging tests are opt-in: `pytest -m staging` (a later -m replaces this one).
-addopts = "-m 'not staging'"
+# Slow offline tests run with `pytest -m slow`, and in the weekly CI run.
+addopts = "-m 'not staging and not slow'"
 xfail_strict = true
 markers = [
     "staging: live tests against the Hub CI instance (hub-ci.huggingface.co)",
+    "slow: offline tests that wait for the retries of polars (several seconds each)",
 ]

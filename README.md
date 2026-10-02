@@ -110,7 +110,8 @@ set (`collect` or `now`), else `"collect"`.
 minutes, into `explain()`, `serialize()`, the messages of read errors, logs and an
 `include_file_paths=` column: anyone who sees one can read that file until it expires. The mode is
 therefore refused with a `ValueError`, before any request, unless the environment variable
-`POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` is set. Nothing falls back to it. Collect within the
+`POLARS_HF_ALLOW_SIGNED_URLS_IN_PLAN=1` is set. Only the exact value `1` enables it (`true`, `yes`
+or an empty value do not). Nothing falls back to it. Collect within the
 hour, and treat the plan and its logs as secrets.
 
 Polars prints the URLs it scans to stderr when `POLARS_VERBOSE=1` is set, in both modes. The
@@ -559,7 +560,9 @@ uv run pytest                 # offline suite (the default)
 uv run pytest -m staging      # live tests against the Hub CI staging instance
 ```
 
-`addopts` in `pyproject.toml` deselects the staging tests by default. A command such as
+`addopts` in `pyproject.toml` deselects the staging tests and the tests marked `slow` by default.
+The `slow` tests are offline tests that wait for the retries of Polars' HTTP client (several
+seconds each); `uv run pytest -m slow` runs them, and so does the weekly CI run. A command such as
 `uv run pytest tests/test_read.py` therefore selects nothing: add `-m staging`.
 
 **Offline tests** need no network and no token. `tests/fakehub.py` runs a local fake Hub: one HTTP
