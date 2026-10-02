@@ -529,3 +529,18 @@ def test_file_deleted_after_the_listing(
 
     assert f"hf://buckets/{staging_bucket}/{deleted}" in str(error.value)
     assert "https://" not in str(error.value)
+
+
+def test_count_rows_reads_no_column(base: str, glob: str, single: str) -> None:
+    # The count comes from the footers of freshly resolved URLs. The mixed
+    # glob has files with different columns: a count does not compare them.
+    assert plhf.count_rows(glob) == GLOB_ROWS
+    assert plhf.count_rows(f"{base}/bench/") == GLOB_ROWS
+    assert plhf.count_rows(single) == 500
+    assert plhf.count_rows(f"{base}/*.parquet") == 520
+    assert (
+        plhf.count_rows(glob)
+        == plhf.scan_bucket(glob).select(pl.len()).collect().item()
+    )
+    with pytest.raises(FileNotFoundError):
+        plhf.count_rows(f"{base}/nope/")
