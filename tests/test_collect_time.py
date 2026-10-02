@@ -10,11 +10,13 @@ each mode requests and when, that both return the same rows, and what differs.
 from __future__ import annotations
 
 import io
+import pickle
 import types
+from urllib.parse import quote
 
 import polars as pl
 import pytest
-from conftest import raises_at_collect
+from conftest import assert_no_signed_url, exception_chain, raises_at_collect
 from fakehub import CDN, HUB, SIGNATURE, FakeHub
 from huggingface_hub.errors import HfHubHTTPError
 from polars.testing import assert_frame_equal
@@ -92,6 +94,20 @@ def _request_runs(fake_hub: FakeHub) -> list[tuple[str, int]]:
     return runs
 
 
+def _source(bucket_id: str, n_files: int, **scan_kwargs: object) -> read._BucketSource:
+    """The IO source of ``data/p00.parquet``, ..., to call it like polars does."""
+    from huggingface_hub import constants
+    from huggingface_hub.utils import build_hf_headers
+
+    return read._BucketSource(
+        endpoint=constants.ENDPOINT,
+        headers=build_hf_headers(),
+        bucket_id=bucket_id,
+        paths=[f"data/p{i:02d}.parquet" for i in range(n_files)],
+        scan_kwargs=scan_kwargs,
+    )
+
+
 @pytest.fixture
 def small_groups(monkeypatch: pytest.MonkeyPatch) -> int:
     """Groups of 3 files, so a few small files make several groups."""
@@ -144,13 +160,11 @@ def test_plan_holds_no_signed_url_and_no_token(
 
     binary = lf.serialize(format="binary")
     for text in (lf.explain(), lf.explain(optimized=False)):
-        assert SIGNATURE not in text
-        assert fake_hub.cdn_endpoint not in text
+        assert_no_signed_url(text, fake_hub)
         assert token not in text
-    assert SIGNATURE.encode() not in binary
-    assert fake_hub.cdn_endpoint.encode() not in binary
+    assert_no_signed_url(binary, fake_hub)
     assert token.encode() not in binary
-    assert SIGNATURE not in lf.serialize(format="json")
+    assert_no_signed_url(lf.serialize(format="json"), fake_hub)
     # What the serialized plan holds: the bucket paths.
     assert b"data/p01.parquet" in binary
 
@@ -228,18 +242,78 @@ def test_single_file_is_resolved_once(fake_hub: FakeHub, fake_bucket: str) -> No
     assert fake_hub.matching(origin=HUB, method="GET") == []
 
 
-def test_every_collect_resolves_again(fake_hub: FakeHub, fake_bucket: str) -> None:
-    _put_numbered(fake_hub, fake_bucket, 3)
+def test_second_query_within_the_window_resolves_nothing(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int
+) -> None:
+    expected = _put_numbered(fake_hub, fake_bucket, 8)
     lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    assert_frame_equal(lf.collect(), expected)
+    assert len(_resolved(fake_hub)) == 8
+    fake_hub.reset_log()
 
-    lf.collect()
+    # The source keeps the URLs of all files, not of the first one only.
+    assert_frame_equal(lf.collect(), expected)
+    assert lf.select("id").head(25).collect().height == 25
+    assert lf.filter(pl.col("id") > 70).collect().height == 9
+
+    assert _resolved(fake_hub) == []
+    assert len(fake_hub.matching(origin=CDN)) > 0
+
+
+def test_query_after_the_window_resolves_again(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _moving_clock(monkeypatch)
+    expected = _put_numbered(fake_hub, fake_bucket, 3)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
     lf.collect()
 
-    # The first file: once (its URL is recent). The others: once per query.
-    names = _resolved(fake_hub)
-    assert names.count("p00.parquet") == 1
-    assert names.count("p01.parquet") == 2
-    assert names.count("p02.parquet") == 2
+    # At the limit a URL is used again; one second later it is not.
+    clock.now += read._URL_REUSE_SECONDS
+    fake_hub.reset_log()
+    lf.collect()
+    assert _resolved(fake_hub) == []
+
+    clock.now += 1
+    # The old URLs must not be used: the cdn refuses them from now on.
+    fake_hub.expire_signed_urls()
+    assert_frame_equal(lf.collect(), expected)
+    assert sorted(_resolved(fake_hub)) == [f"p{i:02d}.parquet" for i in range(3)]
+
+
+def test_kept_urls_are_not_more_than_the_files(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 8)
+    source = _source(fake_bucket, 8)
+
+    for _ in range(3):
+        assert sum(frame.height for frame in source(None, None, None, None)) == 80
+
+    assert sorted(source._urls) == list(range(8))
+    restored = pickle.loads(pickle.dumps(source))
+    assert restored._urls == {}
+    assert restored.paths == source.paths
+
+
+@pytest.mark.parametrize("schema_first", [False, True])
+def test_refused_url_is_resolved_again_once(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int, schema_first: bool
+) -> None:
+    # The cdn refuses the kept URLs before they are 5 minutes old: a group
+    # that fails before its first batch is resolved again, once.
+    expected = _put_numbered(fake_hub, fake_bucket, 8)
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"))
+    if schema_first:
+        lf.collect_schema()
+    lf.collect()
+    fake_hub.reset_log()
+
+    fake_hub.expire_signed_urls()
+    got = lf.collect()
+
+    assert_frame_equal(got, expected)
+    assert sorted(_resolved(fake_hub)) == [f"p{i:02d}.parquet" for i in range(8)]
 
 
 def test_group_bounds() -> None:
@@ -504,26 +578,111 @@ def test_url_of_the_first_file_is_resolved_again_when_it_is_old(
     assert _resolved(fake_hub) == ["p00.parquet", "p00.parquet"]
 
 
+def _refuse_every_cdn_request(fake_hub: FakeHub) -> None:
+    for method in ("HEAD", "GET"):
+        fake_hub.add_fault(
+            CDN, method, r"^/xet-bridge-us/", 403, times=1000, body=b"refused"
+        )
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
 @pytest.mark.parametrize("schema_first", [False, True])
-def test_expired_url_error_names_the_bucket_file(
-    fake_hub: FakeHub, fake_bucket: str, schema_first: bool
+def test_read_error_names_the_bucket_file_in_the_whole_chain(
+    fake_hub: FakeHub, fake_bucket: str, schema_first: bool, engine: str
 ) -> None:
-    # The URL of the first file is used again within 5 minutes. If the CDN
-    # refuses it, the error of polars is raised without the signed URL.
+    # The cdn refuses every request: the error of polars is raised without
+    # the signed URL, and no exception linked to it (cause, context) has it.
     _put_numbered(fake_hub, fake_bucket, 1)
     uri = _uri(fake_bucket, "data/p00.parquet")
     lf = plhf.scan_bucket(uri)
     if schema_first:
         lf.collect_schema()
 
-    fake_hub.expire_signed_urls()
+    _refuse_every_cdn_request(fake_hub)
     with pytest.raises((pl.exceptions.PolarsError, OSError)) as error:
-        lf.collect()
+        lf.collect(engine=engine)
 
-    message = str(error.value)
-    assert uri in message
-    assert SIGNATURE not in message
-    assert "X-Amz" not in message
+    assert uri in str(error.value)
+    for linked in exception_chain(error.value):
+        assert_no_signed_url(str(linked), fake_hub)
+        assert_no_signed_url(repr(linked), fake_hub)
+    # The URL was tried, dropped, resolved again and tried once more.
+    assert _resolved(fake_hub) == ["p00.parquet", "p00.parquet"]
+
+
+def test_clean_error_is_raised_without_context(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # Called as polars calls it: the exception that leaves the source has
+    # no cause and no context, so no chain walker finds the original error.
+    _put_numbered(fake_hub, fake_bucket, 2)
+    source = _source(fake_bucket, 2)
+    source.schema()
+    _refuse_every_cdn_request(fake_hub)
+
+    with pytest.raises((pl.exceptions.PolarsError, OSError)) as error:
+        list(source(None, None, None, None))
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert _uri(fake_bucket, "data/p00.parquet") in str(error.value)
+    assert_no_signed_url(str(error.value), fake_hub)
+
+
+SIGNED = (
+    "https://us.aws.cdn.hf.co/xet-bridge-us/abc/def"
+    "?Expires=1&Policy=pol~icy&Signature=si-g_n~&Key-Pair-Id=K123"
+)
+SIGNED_URI = "hf://buckets/ns/name/data/a.parquet"
+_SIGNED_NAMES = ("signature", "policy", "key-pair-id", "x-amz-", "x-xet-")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"cannot read {SIGNED}: 403",
+        f"cannot read {SIGNED[:60]}... (truncated)",
+        f"cannot read '{quote(SIGNED, safe='')}'",
+        f"cannot read {SIGNED.replace('&', '&amp;')}",
+        f"cannot read {SIGNED.upper()}",
+        f'path: "{SIGNED.replace("https://", "")}"',
+        "request to another.host/x?X-Amz-Signature=abc&X-Amz-Credential=c&a=1 failed",
+        "x-amz-security-token=tok x-xet-signed-range=0-5 key-pair-id=K123 policy=p",
+        "query X-Amz-Signature%3Dabc%26X-Amz-Date%3D2026 was refused",
+    ],
+)
+def test_scrub_removes_every_form_of_a_signed_url(text: str) -> None:
+    clean = read._scrub_signed_urls(text, {SIGNED: SIGNED_URI})
+
+    lowered = clean.lower()
+    assert "cdn.hf.co" not in lowered
+    for name in _SIGNED_NAMES:
+        assert name not in lowered
+    for value in ("si-g_n~", "pol~icy", "k123", "abc", "tok"):
+        assert value not in lowered
+
+
+def test_scrub_names_the_bucket_file_and_keeps_other_text() -> None:
+    text = f"error reading {SIGNED} at offset 4, see https://example.com/a?b=1"
+
+    clean = read._scrub_signed_urls(text, {SIGNED: SIGNED_URI})
+
+    assert clean == (
+        f"error reading {SIGNED_URI} at offset 4, see https://example.com/a?b=1"
+    )
+    assert read._without_signed_urls(ValueError("no url here"), {SIGNED: "x"}) is None
+
+
+def test_scrub_finds_a_signed_url_in_a_linked_exception() -> None:
+    inner = OSError(f"GET {SIGNED} failed")
+    outer = RuntimeError("the scan failed")
+    outer.__cause__ = inner
+
+    clean = read._without_signed_urls(outer, {SIGNED: SIGNED_URI})
+
+    assert type(clean) is RuntimeError
+    assert str(clean) == "the scan failed"
+    assert clean.__cause__ is None and clean.__context__ is None
 
 
 # ---- errors of a query -----------------------------------------------------
@@ -540,8 +699,7 @@ def test_file_deleted_after_the_listing(fake_hub: FakeHub, fake_bucket: str) -> 
 
     message = str(error.value)
     assert missing in message
-    assert SIGNATURE not in message
-    assert fake_hub.cdn_endpoint not in message
+    assert_no_signed_url(message, fake_hub)
 
 
 def test_first_file_deleted_after_the_listing(
@@ -604,7 +762,7 @@ def test_non_parquet_file_error_names_the_bucket_file(
 
     with pytest.raises(pl.exceptions.PolarsError) as error:
         lf.collect()
-    assert SIGNATURE not in str(error.value)
+    assert_no_signed_url(str(error.value), fake_hub)
 
 
 # ---- schemas ---------------------------------------------------------------
@@ -696,7 +854,7 @@ def test_mixed_schemas_raise_like_the_native_scan(
     with pytest.raises(pl.exceptions.PolarsError) as error:
         plhf.scan_bucket(uri, **scan_kwargs).collect()
 
-    assert SIGNATURE not in str(error.value)
+    assert_no_signed_url(str(error.value), fake_hub)
 
 
 @pytest.mark.parametrize("group_files", [1, 64])
@@ -806,3 +964,143 @@ def test_row_index_with_offset_and_filter(
 
     assert got["row"].to_list() == list(range(155, 163))
     assert_frame_equal(got, query(plhf.scan_bucket(uri, resolve="now", **options)))
+
+
+# ---- what a pickled plan holds ---------------------------------------------
+
+
+def _secret_provider():  # pragma: no cover - never called
+    raise AssertionError("the credential provider of a test was called")
+
+
+@pytest.mark.filterwarnings("ignore:.*json.*:UserWarning")
+def test_serialized_plan_has_no_storage_options(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    expected = _put_numbered(fake_hub, fake_bucket, 2)
+    secret = "storage-option-secret-value"
+    options = {"max_retries": 2, "aws_secret_access_key": secret}
+    lf = plhf.scan_bucket(_uri(fake_bucket, "data/"), storage_options=options)
+    # The options reach the native scans.
+    assert_frame_equal(lf.collect(), expected)
+
+    binary = lf.serialize(format="binary")
+
+    assert secret.encode() not in binary
+    assert b"aws_secret_access_key" not in binary
+    assert b"storage_options" not in binary
+    assert secret not in lf.serialize(format="json")
+    # The plan that is read back runs without them.
+    restored = pl.LazyFrame.deserialize(io.BytesIO(binary), format="binary")
+    assert_frame_equal(restored.collect(), expected)
+
+
+def test_pickled_source_has_no_credentials(fake_bucket: str) -> None:
+    secret = "storage-option-secret-value"
+    source = _source(
+        fake_bucket,
+        2,
+        storage_options={"aws_secret_access_key": secret},
+        credential_provider=_secret_provider,
+        missing_columns="insert",
+    )
+
+    pickled = pickle.dumps(source)
+    restored = pickle.loads(pickled)
+
+    assert secret.encode() not in pickled
+    assert b"_secret_provider" not in pickled
+    assert b"storage_options" not in pickled
+    assert b"credential_provider" not in pickled
+    assert restored.scan_kwargs == {"missing_columns": "insert"}
+    # The source that was pickled keeps its options.
+    assert sorted(source.scan_kwargs) == [
+        "credential_provider",
+        "missing_columns",
+        "storage_options",
+    ]
+
+
+# ---- an empty projection ---------------------------------------------------
+
+
+@pytest.mark.parametrize("n_rows", [None, 25])
+def test_empty_projection_keeps_the_row_count(
+    fake_hub: FakeHub, fake_bucket: str, small_groups: int, n_rows: int | None
+) -> None:
+    # A frame without columns has no rows. If polars asks for no column, the
+    # source reads one, so that the heights of its frames are right.
+    _put_numbered(fake_hub, fake_bucket, 8)
+    source = _source(fake_bucket, 8)
+
+    frames = list(source([], None, n_rows, None))
+
+    assert sum(frame.height for frame in frames) == (n_rows or 8 * ROWS)
+    assert {tuple(frame.columns) for frame in frames} == {("id",)}
+
+
+def test_narrowest_column() -> None:
+    schema = pl.Schema(
+        {"text": pl.String, "big": pl.Int64, "flag": pl.Boolean, "small": pl.Int16}
+    )
+
+    assert read._narrowest_column(schema) == "flag"
+    assert read._narrowest_column(pl.Schema({"a": pl.String, "b": pl.Int64})) == "b"
+    assert read._narrowest_column(pl.Schema({"a": pl.String, "b": pl.Binary})) == "a"
+
+
+# ---- count_rows ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["wide/", "wide/*.parquet", "wide/w1.parquet"])
+def test_count_rows_reads_the_footers_only(
+    fake_hub: FakeHub, fake_bucket: str, path: str
+) -> None:
+    total = _put_wide(fake_hub, fake_bucket, WIDE_FILES, WIDE_ROWS)
+    n_files = 1 if path.endswith("w1.parquet") else WIDE_FILES
+
+    count = plhf.count_rows(_uri(fake_bucket, path))
+
+    assert count == n_files * WIDE_ROWS
+    assert len(_resolved(fake_hub)) == n_files
+    gets = fake_hub.matching(origin=CDN, method="GET")
+    assert all(request.range is not None for request in gets)
+    assert len({request.path for request in gets}) == n_files
+    assert 0 < fake_hub.cdn_bytes_served < total / 4
+    # The same count as a scan, which reads a column.
+    assert count == plhf.scan_bucket(_uri(fake_bucket, path)).collect().height
+
+
+def test_count_rows_counts_files_with_different_columns(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    uri = _put_mixed(fake_hub, fake_bucket)
+    text = pl.DataFrame({"id": ["a", "b", "c"]})
+    fake_hub.put_parquet(fake_bucket, "mixed/d.parquet", text)
+
+    # A scan of these files raises without options; a count does not.
+    assert plhf.count_rows(uri) == 8
+
+
+def test_count_rows_has_the_path_rules_and_errors_of_scan_bucket(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    _put_numbered(fake_hub, fake_bucket, 2)
+    fake_hub.put(fake_bucket, "empty/e.parquet", b"")
+    fake_hub.put(fake_bucket, "text/notes.txt", b"these bytes are not parquet")
+
+    assert plhf.count_rows(_uri(fake_bucket, "data")) == 2 * ROWS
+    with pytest.raises(FileNotFoundError, match="no parquet files matched"):
+        plhf.count_rows(_uri(fake_bucket, "nope"))
+    with pytest.raises(FileNotFoundError, match="not found"):
+        plhf.count_rows("hf://buckets/fake-user/no-such-bucket/data")
+    with pytest.raises(ValueError, match="a glob cannot end with"):
+        plhf.count_rows(_uri(fake_bucket, "data/*/"))
+    with pytest.raises(ValueError, match="is empty"):
+        plhf.count_rows(_uri(fake_bucket, "empty/"))
+    with pytest.raises(PermissionError, match="lacks access"):
+        plhf.count_rows(_uri(fake_bucket, "data/"), token="unknown-token")
+    with pytest.raises((pl.exceptions.PolarsError, OSError)) as error:
+        plhf.count_rows(_uri(fake_bucket, "text/*"))
+    for linked in exception_chain(error.value):
+        assert_no_signed_url(str(linked), fake_hub)

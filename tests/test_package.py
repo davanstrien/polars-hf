@@ -18,6 +18,7 @@ def test_public_api() -> None:
     assert sorted(plhf.__all__) == [
         "BucketPath",
         "BucketRegistrationError",
+        "count_rows",
         "parse_bucket_uri",
         "scan_bucket",
         "sink_bucket",

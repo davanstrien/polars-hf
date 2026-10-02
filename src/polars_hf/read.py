@@ -73,13 +73,16 @@ _GROUP_FILES = 64
 # up to _GROUP_FILES: head(5) resolves one file, not a full group.
 _LIMITED_FIRST_GROUP = 1
 _LIMITED_GROUP_GROWTH = 4
-# The signed URL of the first file is resolved for the schema (and, for a
-# single-file URI, by scan_bucket itself). The scan uses that URL again if it
-# is not older than this many seconds.
+# A collect-time source keeps the signed URLs it resolved. A group uses the
+# URL of a file again if it is not older than this many seconds when the scan
+# of the group starts; an older URL is resolved again.
 _URL_REUSE_SECONDS = 300.0
 # scan_parquet options whose result depends on the rows of all earlier files.
 # With one of them the files are scanned as one group.
 _ONE_GROUP_OPTIONS = ("row_index_name", "n_rows")
+# scan_parquet options that can hold credentials. They are passed to the
+# native scans and left out of a pickled source.
+_UNPICKLED_OPTIONS = ("storage_options", "credential_provider")
 _MAX_RESOLVE_WORKERS = 16
 _MAX_REDIRECT_HOPS = 5
 # Entries per listing page (the ``limit`` query parameter). ``None`` leaves
@@ -783,30 +786,116 @@ def _group_bounds(
         size = min(size * _LIMITED_GROUP_GROWTH, _GROUP_FILES)
 
 
+# Names of query parameters that hold a signature or a credential of a
+# presigned URL (CloudFront, S3 and Xet forms), matched case-insensitively.
+_SIGNED_PARAMETER = (
+    r"(?:Signature|Policy|Key-Pair-Id|X-Amz-[A-Za-z0-9-]+|X-Xet-[A-Za-z0-9-]+)"
+)
+# One such parameter with its value, in plain or percent-encoded form
+# ("name=value" or "name%3Dvalue"; the value ends at "&" or "%26").
+_SIGNED_PARAMETER_VALUE = re.compile(
+    _SIGNED_PARAMETER + r"(?:=|%3D)(?:(?!%26)[^&\s\"'<>()\[\]])*", re.IGNORECASE
+)
+_REMOVED_URL = "<presigned URL removed>"
+_REMOVED_PARAMETER = "<removed>"
+
+
+def _scrub_signed_urls(text: str, uris_by_url: dict[str, str]) -> str:
+    """``text`` without the signed URLs of ``uris_by_url`` and their parts.
+
+    An exact URL is replaced by the ``hf://`` URI of its file. Any other text
+    on the host of one of the URLs (a truncated, percent-encoded or re-quoted
+    URL) and any signature-like query parameter is removed.
+    """
+    hosts = set()
+    # Longest first: a URL can be the start of another one.
+    for url in sorted(uris_by_url, key=len, reverse=True):
+        text = text.replace(url, uris_by_url[url])
+        host = urlparse(url).netloc
+        if host:
+            hosts.add(host)
+    for host in hosts:
+        # The host with an optional scheme ("https://" or "https%3A%2F%2F")
+        # and everything up to the next space, quote or bracket.
+        on_host = re.compile(
+            r"(?:[a-z][a-z0-9+.-]*(?::|%3A)(?://|%2F%2F))?"
+            + re.escape(host)
+            + r"[^\s\"'<>()\[\]]*",
+            re.IGNORECASE,
+        )
+        text = on_host.sub(_REMOVED_URL, text)
+    return _SIGNED_PARAMETER_VALUE.sub(_REMOVED_PARAMETER, text)
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """``error`` and every exception linked to it as cause or context."""
+    chain: list[BaseException] = []
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is seen for seen in chain):
+            continue
+        chain.append(current)
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return chain
+
+
 def _without_signed_urls(
     error: Exception, uris_by_url: dict[str, str]
 ) -> Exception | None:
     """A copy of ``error`` whose message names bucket files, not signed URLs.
 
     Polars puts the URL of a file in the message of a read error (an expired
-    URL, a file that is not parquet). Returns ``None`` if the message holds
-    none of the URLs.
+    URL, a file that is not parquet). Returns ``None`` if no message in the
+    exception chain of ``error`` holds a signed URL or a part of one.
+
+    The copy has no cause and no context. The caller must raise it outside
+    of the ``except`` block that caught ``error``: an exception raised inside
+    the block gets ``error`` as its ``__context__``, also with ``from None``.
     """
-    message = str(error)
-    clean = message
-    for url, uri in uris_by_url.items():
-        clean = clean.replace(url, uri)
-        # The query string holds the signature: remove it also where the URL
-        # is printed in another form.
-        query = urlparse(url).query
-        if query:
-            clean = clean.replace(query, "<signature removed>")
-    if clean == message:
+    changed = False
+    for linked in _exception_chain(error):
+        text = str(linked)
+        if _scrub_signed_urls(text, uris_by_url) != text:
+            changed = True
+    if not changed:
         return None
+    clean = _scrub_signed_urls(str(error), uris_by_url)
     try:
         return type(error)(clean)
     except Exception:
         return RuntimeError(clean)
+
+
+# Column types that are cheap to read, cheapest first.
+_NARROW_TYPES = (
+    pl.Boolean,
+    pl.Int8,
+    pl.UInt8,
+    pl.Int16,
+    pl.UInt16,
+    pl.Int32,
+    pl.UInt32,
+    pl.Float32,
+    pl.Date,
+)
+
+
+def _narrowest_column(schema: pl.Schema) -> str:
+    """The name of a column of ``schema`` that is cheap to read.
+
+    A column of the first type of ``_NARROW_TYPES`` that the schema has, else
+    the first numeric or temporal column, else the first column.
+    """
+    for narrow in _NARROW_TYPES:
+        for name, dtype in schema.items():
+            if dtype == narrow:
+                return name
+    for name, dtype in schema.items():
+        if dtype.is_numeric() or dtype.is_temporal():
+            return name
+    return schema.names()[0]
 
 
 class _BucketSource:
@@ -816,10 +905,14 @@ class _BucketSource:
     calls the object when the query runs. The object holds the bucket paths;
     no signed URL is part of the query plan.
 
+    The object keeps the signed URLs it resolved, to use them again in a
+    query that starts within ``_URL_REUSE_SECONDS``.
+
     A pickled source (``LazyFrame.serialize``) holds the endpoint, the bucket
-    id, the paths and the scan options. It does not hold the token, the
-    request headers or a signed URL: a source that was unpickled sends its
-    requests with the token that ``huggingface_hub`` finds in its environment.
+    id, the paths and the scan options without ``storage_options`` and
+    ``credential_provider``. It does not hold the token, the request headers
+    or a signed URL: a source that was unpickled sends its requests with the
+    token that ``huggingface_hub`` finds in its environment.
     """
 
     def __init__(
@@ -838,22 +931,27 @@ class _BucketSource:
         self.scan_kwargs = scan_kwargs
         self._init_unpickled_state(headers)
         if first_url is not None:
-            self._first_url = (first_url, time.monotonic())
+            self._urls[0] = (first_url, time.monotonic())
 
     def _init_unpickled_state(self, headers: dict[str, str] | None) -> None:
         self._headers = headers
         self._schema: pl.Schema | None = None
-        # The signed URL of the first file and the time it was resolved.
-        self._first_url: tuple[str, float] | None = None
+        # File index -> (signed URL, time it was resolved). At most one entry
+        # per file.
+        self._urls: dict[int, tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._schema_lock = threading.Lock()
 
     def __getstate__(self) -> dict[str, object]:
+        scan_kwargs = {}
+        for name, value in self.scan_kwargs.items():
+            if name not in _UNPICKLED_OPTIONS:
+                scan_kwargs[name] = value
         return {
             "endpoint": self.endpoint,
             "bucket_id": self.bucket_id,
             "paths": self.paths,
-            "scan_kwargs": self.scan_kwargs,
+            "scan_kwargs": scan_kwargs,
         }
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -871,40 +969,53 @@ class _BucketSource:
     def _uri(self, index: int) -> str:
         return _file_uri(self.bucket_id, self.paths[index])
 
-    def _recent_first_url(self) -> str | None:
-        with self._lock:
-            cached = self._first_url
-        if cached is None:
-            return None
-        url, resolved_at = cached
-        if time.monotonic() - resolved_at > _URL_REUSE_SECONDS:
-            return None
-        return url
+    def _uris_by_url(self, start: int, urls: list[str]) -> dict[str, str]:
+        uris_by_url = {}
+        for offset, url in enumerate(urls):
+            uris_by_url[url] = self._uri(start + offset)
+        return uris_by_url
 
-    def _resolve(self, start: int, stop: int, scope: str) -> list[str]:
+    def _forget_urls(self, start: int, stop: int) -> None:
+        with self._lock:
+            for index in range(start, stop):
+                self._urls.pop(index, None)
+
+    def _resolve(self, start: int, stop: int, scope: str) -> tuple[list[str], bool]:
         """The signed URLs of the files ``start`` to ``stop - 1``.
 
-        The requests have their own retry budget (``_SCAN_DEADLINE`` from
-        now). The first file is not resolved again if its URL is recent.
+        A URL that this object resolved less than ``_URL_REUSE_SECONDS`` ago
+        is used again; the other files are resolved, with their own retry
+        budget (``_SCAN_DEADLINE`` from now). Returns the URLs and whether
+        one of them was used again.
         """
-        urls: list[str] = []
-        if start == 0:
-            first_url = self._recent_first_url()
-            if first_url is not None:
-                urls.append(first_url)
-        first_missing = start + len(urls)
-        budget = _Budget(
-            self.bucket_id,
-            scope=scope,
-            files_total=len(self.paths),
-            files_resolved=first_missing,
-        )
-        paths = self.paths[first_missing:stop]
-        urls.extend(_signed_urls(self.endpoint, self._hub_headers(), paths, budget))
-        if start == 0 and first_missing == 0:
+        now = time.monotonic()
+        urls: dict[int, str] = {}
+        with self._lock:
+            for index in range(start, stop):
+                cached = self._urls.get(index)
+                if cached is not None and now - cached[1] <= _URL_REUSE_SECONDS:
+                    urls[index] = cached[0]
+        reused = len(urls) > 0
+
+        missing = []
+        for index in range(start, stop):
+            if index not in urls:
+                missing.append(index)
+        if missing:
+            budget = _Budget(
+                self.bucket_id,
+                scope=scope,
+                files_total=len(self.paths),
+                files_resolved=start + len(urls),
+            )
+            paths = [self.paths[index] for index in missing]
+            resolved = _signed_urls(self.endpoint, self._hub_headers(), paths, budget)
+            resolved_at = time.monotonic()
             with self._lock:
-                self._first_url = (urls[0], time.monotonic())
-        return urls
+                for index, url in zip(missing, resolved, strict=True):
+                    urls[index] = url
+                    self._urls[index] = (url, resolved_at)
+        return [urls[index] for index in range(start, stop)], reused
 
     # ---- schema ------------------------------------------------------------
 
@@ -918,17 +1029,29 @@ class _BucketSource:
         """
         with self._schema_lock:
             if self._schema is None:
-                scope = "schema read of a scan_bucket query"
-                urls = self._resolve(0, 1, scope)
-                lf = pl.scan_parquet(urls, **self.scan_kwargs)
-                try:
-                    self._schema = lf.collect_schema()
-                except Exception as error:
-                    clean = _without_signed_urls(error, {urls[0]: self._uri(0)})
-                    if clean is None:
-                        raise
-                    raise clean from None
+                self._schema = self._read_schema()
             return self._schema
+
+    def _read_schema(self) -> pl.Schema:
+        scope = "schema read of a scan_bucket query"
+        # A second attempt only if the first one used a URL again: the CDN
+        # can refuse a URL before it is _URL_REUSE_SECONDS old.
+        for attempt in (0, 1):
+            urls, reused = self._resolve(0, 1, scope)
+            lf = pl.scan_parquet(urls, **self.scan_kwargs)
+            failure = None
+            try:
+                return lf.collect_schema()
+            except Exception as error:
+                self._forget_urls(0, 1)
+                if reused and attempt == 0:
+                    continue
+                failure = _without_signed_urls(error, self._uris_by_url(0, urls))
+                if failure is None:
+                    raise
+            # Raised outside of the except block: no __context__.
+            raise failure
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _file_schema(self) -> pl.Schema:
         """The columns of :meth:`schema` that are read from the files."""
@@ -984,37 +1107,97 @@ class _BucketSource:
             # The batches hold the rows after the predicate: they do not tell
             # how many rows of the limit a group used.
             one_group = True
+        if with_columns is not None and len(with_columns) == 0:
+            # A frame without columns has no rows. Read one cheap column, so
+            # that the frames have the row count of the files.
+            with_columns = [_narrowest_column(self.schema())]
         groups = _group_bounds(
             len(self.paths), limited=n_rows is not None, one_group=one_group
         )
         scope = "group of files of a scan_bucket query"
         remaining = n_rows
         for start, stop in groups:
-            urls = self._resolve(start, stop, scope)
-            uris_by_url = {}
-            for offset, url in enumerate(urls):
-                uris_by_url[url] = self._uri(start + offset)
+            # A second attempt only if the first one used a URL again and
+            # failed before its first batch: the CDN can refuse a URL before
+            # it is _URL_REUSE_SECONDS old.
+            for attempt in (0, 1):
+                urls, reused = self._resolve(start, stop, scope)
+                uris_by_url = self._uris_by_url(start, urls)
+                lf = self._scan_group(urls, uris_by_url)
+                if remaining is not None:
+                    lf = lf.head(remaining)
+                if predicate is not None:
+                    lf = lf.filter(predicate)
+                if with_columns is not None:
+                    lf = lf.select(with_columns)
 
-            lf = self._scan_group(urls, uris_by_url)
-            if remaining is not None:
-                lf = lf.head(remaining)
-            if predicate is not None:
-                lf = lf.filter(predicate)
-            if with_columns is not None:
-                lf = lf.select(with_columns)
-            try:
-                batches = lf.collect_batches(chunk_size=batch_size, engine="streaming")
-                for batch in batches:
-                    if remaining is not None:
-                        remaining -= batch.height
-                    yield batch
-            except Exception as error:
-                clean = _without_signed_urls(error, uris_by_url)
-                if clean is None:
-                    raise
-                raise clean from None
+                yielded = False
+                failure = None
+                try:
+                    batches = lf.collect_batches(
+                        chunk_size=batch_size, engine="streaming"
+                    )
+                    for batch in batches:
+                        if remaining is not None:
+                            remaining -= batch.height
+                        yielded = True
+                        yield batch
+                    break
+                except Exception as error:
+                    self._forget_urls(start, stop)
+                    if reused and not yielded and attempt == 0:
+                        continue
+                    failure = _without_signed_urls(error, uris_by_url)
+                    if failure is None:
+                        raise
+                # Raised outside of the except block: no __context__.
+                raise failure
             if remaining is not None and remaining <= 0:
                 return
+
+
+@dataclass
+class _Found:
+    """The files that a URI names, and what the requests for them need."""
+
+    endpoint: str
+    headers: dict[str, str]
+    bucket_id: str
+    paths: list[str]
+    budget: _Budget
+    # The signed URL of a single-file URI: the request that tells a file
+    # from a directory resolves it.
+    first_url: str | None = None
+
+
+def _find_files(uri: str, token: str | None) -> _Found:
+    """Parse ``uri`` and find its files: a single file, else a listing."""
+    bp = parse_bucket_uri(uri)
+    # Read at call time, like HfApi does when it is created.
+    endpoint = constants.ENDPOINT
+    headers = build_hf_headers(token=token)
+    budget = _Budget(bp.bucket_id)
+
+    if bp.path and not bp.is_glob and not bp.path.endswith("/"):
+        # A file needs no listing: ask for its signed URL directly. When the
+        # Hub answers "not found", the path can still be a directory.
+        try:
+            urls = _signed_urls(endpoint, headers, [bp.path], budget)
+        except FileNotFoundError:
+            pass
+        else:
+            return _Found(endpoint, headers, bp.bucket_id, [bp.path], budget, urls[0])
+
+    files = _list_files(endpoint, headers, bp, uri, budget)
+    paths = [file.path for file in files]
+    return _Found(endpoint, headers, bp.bucket_id, paths, budget)
+
+
+def _all_signed_urls(found: _Found) -> list[str]:
+    """The signed URL of every file of ``found``, within the budget of the call."""
+    if found.first_url is not None:
+        return [found.first_url]
+    return _signed_urls(found.endpoint, found.headers, found.paths, found.budget)
 
 
 def _collect_time_scan(source: _BucketSource, uri: str) -> pl.LazyFrame:
@@ -1082,6 +1265,8 @@ def scan_bucket(
         ``cast_options=``. ``include_file_paths="col"`` gives the
         ``hf://buckets/...`` URI of the file of every row with
         ``resolve="collect"``, and the signed URL with ``resolve="now"``.
+        (Two files with the same content that get the same URL and are in
+        the same group show one URI.)
         ``hive_partitioning=`` sees the presigned URLs, not the bucket paths,
         so it finds no partition columns.
 
@@ -1136,10 +1321,16 @@ def scan_bucket(
     request per file) when the group before it is exhausted, and the group is
     one native multi-file scan with the projection, the predicate and the row
     limit of the query. A query with a row limit (``head(n)``) uses groups of
-    1, 4, 16, then 64 files and stops when it has its rows. The signed URL of
-    the first file is used again if it is less than 5 minutes old, so a full
-    scan of N files sends N ``resolve`` requests, and a single-file scan
-    sends none after the one of the call.
+    1, 4, 16, then 64 files and stops when it has its rows.
+
+    The LazyFrame keeps the URLs it resolved, at most one per file. A group
+    uses the URL of a file again if it is less than 5 minutes old when the
+    scan of the group starts; an older URL is resolved again. So a full scan
+    of N files sends N ``resolve`` requests with the one of the schema, a
+    second query within 5 minutes sends none, and a single-file scan sends
+    none after the one of the call. If the CDN refuses a URL that was used
+    again, the group is resolved and scanned once more, provided that it has
+    not returned rows yet.
 
     ``resolve`` requests count in the Hub's "resolvers" rate limit.
 
@@ -1166,16 +1357,24 @@ def scan_bucket(
     ``polars.exceptions.ComputeError`` whose message holds the type name and
     the message of that exception. All polars versions wrap an error of the
     schema read in a ``ComputeError`` ("schema callable failed"). A read
-    error of polars names the ``hf://`` URI of the file, not its signed URL.
+    error of polars names the ``hf://`` URI of the file, not its signed URL,
+    and has no cause or context that holds the URL. With ``POLARS_VERBOSE=1``
+    polars itself prints the URLs it scans to stderr, in both modes.
 
     **What the IO-plugin node changes for a query** (``resolve="collect"``):
 
     * polars pushes the projection, the predicate and ``head(n)`` into the
       source. It does not push ``tail()`` or a slice with an offset: these
       scan all files. ``resolve="now"`` reads only the last files for them;
-    * ``select(pl.len())`` reads one column, because polars asks an IO source
-      for one column to count the rows. ``resolve="now"`` answers a row count
-      from the file footers;
+    * ``select(pl.len())`` reads one whole column of every file, because
+      polars asks an IO source for one column to count the rows. Polars
+      chooses the column; it can be the largest one. :func:`count_rows`
+      reads the footers only;
+    * on files with different columns or types, a row count or a slice
+      outside of the rows raises a schema error; ``resolve="now"`` answers
+      them from the footers;
+    * a consumer that stops reading a ``collect_batches()`` iterator does
+      not stop the query, so the following groups are still resolved;
     * a group must be scanned within the ~1 hour that its URLs are valid;
     * with ``row_index_name=`` or ``n_rows=``, and for a row limit before a
       predicate (``head(n).filter(...)``), all files are one group: all
@@ -1183,9 +1382,10 @@ def scan_bucket(
     * every group is scanned with the schema of the first file of the scan
       (as ``schema=``), unless ``schema=`` is given;
     * ``LazyFrame.serialize()`` needs the ``cloudpickle`` package. The
-      serialized plan holds the bucket paths and the scan options, not the
-      token: the query that is deserialized uses the token of its own
-      environment.
+      serialized plan holds the bucket paths and the scan options without
+      ``storage_options`` and ``credential_provider``, and not the token:
+      the query that is deserialized runs without these two options and
+      uses the token of its own environment.
 
     Examples
     --------
@@ -1195,40 +1395,83 @@ def scan_bucket(
     """
     if resolve not in _RESOLVE_MODES:
         raise ValueError(f"resolve must be one of {_RESOLVE_MODES}, not {resolve!r}")
-    bp = parse_bucket_uri(uri)
-    # Read at call time, like HfApi does when it is created.
-    endpoint = constants.ENDPOINT
-    headers = build_hf_headers(token=token)
-    budget = _Budget(bp.bucket_id)
-
-    paths = None
-    first_url = None
-    if bp.path and not bp.is_glob and not bp.path.endswith("/"):
-        # A file needs no listing: ask for its signed URL directly. When the
-        # Hub answers "not found", the path can still be a directory.
-        try:
-            urls = _signed_urls(endpoint, headers, [bp.path], budget)
-        except FileNotFoundError:
-            pass
-        else:
-            if resolve == "now":
-                return pl.scan_parquet(urls, **scan_kwargs)
-            paths = [bp.path]
-            first_url = urls[0]
-
-    if paths is None:
-        files = _list_files(endpoint, headers, bp, uri, budget)
-        paths = [file.path for file in files]
-        if resolve == "now":
-            urls = _signed_urls(endpoint, headers, paths, budget)
-            return pl.scan_parquet(urls, **scan_kwargs)
+    found = _find_files(uri, token)
+    if resolve == "now":
+        return pl.scan_parquet(_all_signed_urls(found), **scan_kwargs)
 
     source = _BucketSource(
-        endpoint=endpoint,
-        headers=headers,
-        bucket_id=bp.bucket_id,
-        paths=paths,
+        endpoint=found.endpoint,
+        headers=found.headers,
+        bucket_id=found.bucket_id,
+        paths=found.paths,
         scan_kwargs=scan_kwargs,
-        first_url=first_url,
+        first_url=found.first_url,
     )
     return _collect_time_scan(source, uri)
+
+
+def count_rows(uri: str, *, token: str | None = None) -> int:
+    """Count the rows of parquet file(s) in a Hugging Face bucket.
+
+    The count is read from the parquet footers: no column data is
+    transferred. Use it instead of ``scan_bucket(uri).select(pl.len())``,
+    which reads one column of every file (see the Notes of
+    :func:`scan_bucket`).
+
+    Parameters
+    ----------
+    uri
+        An ``hf://buckets/{namespace}/{name}/{path}`` URI, read as by
+        :func:`scan_bucket`: a glob, a single file, or a directory.
+    token
+        Hugging Face token. If ``None``, resolved by ``huggingface_hub``.
+
+    Returns
+    -------
+    int
+        The total number of rows of the files.
+
+    Raises
+    ------
+    ValueError, FileNotFoundError, PermissionError, RuntimeError, TimeoutError, \
+huggingface_hub.errors.HfHubHTTPError
+        As :func:`scan_bucket`, all from this call.
+    polars.exceptions.PolarsError, OSError
+        A file cannot be read as parquet. The message names the ``hf://`` URI
+        of the file, not its presigned URL.
+
+    Notes
+    -----
+    The call finds the files like ``scan_bucket``, sends one ``resolve``
+    request per file and reads the footer of every file with a native
+    ``scan_parquet(url).select(pl.len())``, in one query. It keeps nothing:
+    no URL, no LazyFrame. The schemas of the files are not compared: files
+    with different columns or types are counted.
+
+    Examples
+    --------
+    >>> import polars_hf as plhf
+    >>> plhf.count_rows("hf://buckets/me/data/*.parquet")  # doctest: +SKIP
+    1000000
+    """
+    found = _find_files(uri, token)
+    urls = _all_signed_urls(found)
+    uris_by_url = {}
+    for path, url in zip(found.paths, urls, strict=True):
+        uris_by_url[url] = _file_uri(found.bucket_id, path)
+
+    # One scan per file: a scan of all files compares their schemas.
+    counts = []
+    for url in urls:
+        counts.append(pl.scan_parquet(url).select(pl.len()))
+    total = pl.concat(counts).select(pl.col("len").cast(pl.UInt64).sum())
+
+    failure = None
+    try:
+        return total.collect().item()
+    except Exception as error:
+        failure = _without_signed_urls(error, uris_by_url)
+        if failure is None:
+            raise
+    # Raised outside of the except block: no __context__.
+    raise failure

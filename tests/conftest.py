@@ -94,6 +94,40 @@ else:
 
 POLARS_MAJOR = int(pl.__version__.split(".")[0])
 
+# A query parameter that holds a signature or a credential of a presigned URL
+# (CloudFront, S3 and Xet forms), plain or percent-encoded.
+_SIGNED_PARAMETER = re.compile(
+    r"(signature|policy|key-pair-id|x-amz-[a-z0-9-]+|x-xet-[a-z0-9-]+)(=|%3d)",
+    re.IGNORECASE,
+)
+
+
+def assert_no_signed_url(text: str | bytes, fake_hub: FakeHub) -> None:
+    """``text`` holds no presigned URL of the fake Hub and no part of one.
+
+    The check does not depend on the names the fake uses: the host of the cdn
+    server must not appear, and no signature-like query parameter.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("latin-1")
+    cdn_host = fake_hub.cdn_endpoint.partition("://")[2]
+    assert cdn_host not in text
+    assert _SIGNED_PARAMETER.search(text) is None
+
+
+def exception_chain(error: BaseException) -> list[BaseException]:
+    """``error`` and every exception linked to it as cause or context."""
+    chain: list[BaseException] = []
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is seen for seen in chain):
+            continue
+        chain.append(current)
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return chain
+
 
 @contextmanager
 def raises_at_collect(
