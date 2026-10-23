@@ -177,14 +177,25 @@ def test_glob_with_trailing_slash_is_rejected(pattern: str) -> None:
     assert api.calls == []
 
 
-@pytest.mark.parametrize("pattern", ["data/**.parquet", "data/a**/x.parquet", "**x"])
-def test_double_star_inside_a_segment_is_rejected(pattern: str) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "parent"),
+    [("data/**.parquet", "data"), ("data/a**/x.parquet", "data/a**"), ("**x", None)],
+)
+def test_double_star_inside_a_segment_is_rejected(
+    pattern: str, parent: str | None
+) -> None:
     api = _StubApi(_files("data/x.parquet"))
 
     with pytest.raises(ValueError, match="must be a whole path segment"):
         _list(api, pattern)
-    # The pattern is checked before any request.
-    assert api.calls == []
+    # One listing of the directory: no file has exactly this name.
+    assert api.calls == [("ns/name", parent, False)]
+
+
+def test_file_named_like_an_invalid_glob_is_read_literally() -> None:
+    api = _StubApi(_files("data/**.parquet", "data/x.parquet"))
+
+    assert _list(api, "data/**.parquet") == ["data/**.parquet"]
 
 
 def test_directory_entries_are_never_selected() -> None:

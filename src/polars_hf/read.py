@@ -600,11 +600,19 @@ def _glob_files(
     """The files that ``pattern`` names: an exact file name, else the matches.
 
     A file whose name is exactly ``pattern`` (``data[1].parquet``) is read
-    literally. Raises ``ValueError`` for an invalid pattern before any request.
+    literally. An invalid pattern (``data/**.parquet``) can still be the
+    exact name of a file: its directory is listed once, and ``ValueError`` is
+    raised when no file has that name.
     """
-    matcher = glob_to_regex(pattern)
-    if _glob_is_in_one_directory(pattern):
-        # A glob in the last segment only: list its directory, not the subtree.
+    invalid = None
+    try:
+        matcher = glob_to_regex(pattern)
+    except ValueError as error:
+        invalid = error
+        matcher = None
+    if matcher is None or _glob_is_in_one_directory(pattern):
+        # A glob in the last segment only, or an invalid one: list its
+        # directory, not the subtree.
         parent = pattern.rpartition("/")[0]
         entries = _list_tree(
             endpoint,
@@ -631,6 +639,8 @@ def _glob_files(
     selected = _exact_file(files, pattern)
     if selected:
         return selected
+    if invalid is not None:
+        raise invalid
     for file in files:
         if matcher.fullmatch(file.path):
             selected.append(file)

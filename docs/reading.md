@@ -166,8 +166,9 @@ Rules for the URI itself:
 | a path that does not exist | 1 `resolve` + 1 listing |
 
 A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. Other
-globs list the subtree below the text before their first glob character. An invalid glob raises
-before any request.
+globs list the subtree below the text before their first glob character. An invalid glob
+(`data/**.parquet`) lists its directory once, because a file can have exactly that name; it raises
+`ValueError` if none does.
 
 With `resolve="now"` the call then sends one `resolve` request for each of the N files. With the
 default `resolve="collect"` these requests are sent when a query runs:
