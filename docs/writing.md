@@ -101,10 +101,17 @@ Notes on the `"staged"` backend:
 
 - It stages in the directory named by `POLARS_HF_STAGING_DIR`, else in the system temporary
   directory, and removes the files when the write ends.
-- With `huggingface_hub` 1.x, `HfApi.batch_bucket_files` does not report files that the bucket
-  rejected. The backend then lists the destination once after the upload (one extra listing of the
-  file's string prefix, or of the base prefix, per write) and raises if a file is missing or has
-  another size. `huggingface_hub` 2.x reports rejected files itself, and no listing is made.
+- `HfApi.batch_bucket_files` does not always confirm the upload: `huggingface_hub` 1.x does not
+  report files that the bucket rejected, and 2.x returns normally for a `200` answer that confirms
+  nothing. The backend therefore checks the destination after the upload and raises
+  `BucketRegistrationError` if a file is missing, has another size, or has another Xet hash (a
+  rejected replacement keeps the old object, which can have the same size). The Xet hashes of the
+  staged files are computed with `hf_xet` (about 0.6–2.2 GiB/s on a laptop); without `hf_xet`,
+  only the sizes are compared.
+- The check is one HEAD request for a single file, and one listing of the base prefix for a
+  partitioned write. With `huggingface_hub` 2.x, a partitioned write checks only with
+  `mode="overwrite"`, which deletes the old files afterwards; `mode="error"` and `mode="append"`
+  make no listing, so a file that 2.x reports as uploaded is not checked.
 
 **Memory.** In laptop runs with outputs up to 4.5 GB, the `"stream"` backend used 0.5–1.8 GB more
 memory than Polars alone. A bound on its memory use is not proven. See

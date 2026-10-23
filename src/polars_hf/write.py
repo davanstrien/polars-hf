@@ -367,6 +367,7 @@ def sink_bucket(
         max_bytes_per_file=max_bytes_per_file,
         extension=_sinks.PARTITION_EXTENSION[fmt],
         suffix=suffix,
+        replaces=mode == "overwrite",
     )
     written = sink.write_partitioned(run_sink, prefix, spec)
     if not written:

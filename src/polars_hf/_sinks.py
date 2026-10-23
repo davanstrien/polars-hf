@@ -51,6 +51,7 @@ from huggingface_hub.utils import build_hf_headers, hf_raise_for_status, http_ba
 from polars_hf.read import (
     _REDIRECT_CODES,
     _Budget,
+    _Entry,
     _iter_tree_pages,
     _no_access_error,
     _request,
@@ -342,6 +343,9 @@ class PartitionSpec:
     extension: str
     # Appended to the file index of every file name; "" gives native names.
     suffix: str = ""
+    # mode="overwrite": the old files are deleted after the write, so the
+    # staged backend confirms the upload first.
+    replaces: bool = False
 
     def partition_by(self, base_path: str, file_path_provider: Any = None) -> Any:
         """Build the ``pl.PartitionBy`` target for this spec."""
@@ -403,10 +407,17 @@ class SinkBackend(ABC):
         bucket that cannot be read or does not exist.
         """
         files = {}
+        for path, entry in self._listed_files(prefix).items():
+            files[path] = entry.size
+        return files
+
+    def _listed_files(self, prefix: str) -> dict[str, Any]:
+        """The listing entries (``size``, ``xet_hash``) of :meth:`list_files`."""
+        files = {}
         for page in self._tree_pages(prefix):
             for entry in page:
                 if entry.type == "file" and entry.path.startswith(prefix):
-                    files[entry.path] = entry.size
+                    files[entry.path] = entry
         return files
 
     def _tree_pages(self, prefix: str) -> Iterator[list[Any]]:
@@ -438,20 +449,37 @@ class SinkBackend(ABC):
         The ``resolve`` endpoint answers a redirect (or 200) for a file and
         404 for a directory or a missing path.
         """
+        return self.file_entry(path) is not None
+
+    def file_entry(self, path: str) -> _Entry | None:
+        """The ``size`` and ``xet_hash`` of the file at exactly ``path``, if any.
+
+        One HEAD request, as :meth:`file_exists`; the answer for a file names
+        them in ``X-Linked-Size`` (``Content-Length`` for a 200) and
+        ``X-Xet-Hash``. A value the answer does not give is ``None``.
+        """
         uri = f"hf://buckets/{self.bucket_id}/{path}"
         url = _resolve_url(self.api.endpoint, self.bucket_id, path)
         budget = _Budget(self.bucket_id, operation="sink_bucket")
         response = _request("HEAD", url, self.headers, budget, "resolve")
         status = response.status_code
         if status in _REDIRECT_CODES or status == 200:
-            return True
+            size = response.headers.get("x-linked-size")
+            if size is None and status == 200:
+                size = response.headers.get("content-length")
+            return _Entry(
+                type="file",
+                path=path,
+                size=int(size) if size is not None and size.isdigit() else None,
+                xet_hash=response.headers.get("x-xet-hash"),
+            )
         if status == 404:
             if response.headers.get("x-error-code") == "RepoNotFound":
                 raise FileNotFoundError(
                     f"bucket {self.bucket_id!r} not found (or the token has no "
                     f"access to it): {uri!r}"
                 )
-            return False
+            return None
         if status in (401, 403):
             raise _no_access_error(self.bucket_id, uri, status)
         hf_raise_for_status(response)
@@ -481,6 +509,12 @@ class SinkBackend(ABC):
                 raise BucketRegistrationError(
                     f"the registration request to bucket {self.bucket_id!r} got "
                     f"no answer ({type(error).__name__}: {error}). {_UNKNOWN_STATE}."
+                ) from error
+            except HfHubHTTPError as error:
+                # The last of the retried 429 / 5xx answers.
+                raise BucketRegistrationError(
+                    f"the registration in bucket {self.bucket_id!r} failed after "
+                    f"retries: {error}. {_UNKNOWN_STATE}."
                 ) from error
             self._check_batch_response(response, sent=len(chunk))
 
@@ -519,6 +553,28 @@ class SinkBackend(ABC):
 # ---- staged backend ------------------------------------------------------------
 
 
+def local_xet_hashes(paths: list[str]) -> list[str] | None:
+    """The Xet hashes of local files, or ``None`` if ``hf_xet`` cannot compute them.
+
+    The hashes equal the ``xetHash`` of a bucket listing (checked on
+    huggingface.co, 2026-10-23). The offline tests replace this function with
+    the content hash of the fake Hub.
+    """
+    if not paths:
+        return []
+    try:
+        import hf_xet
+    except ImportError:
+        return None
+    hash_files = getattr(hf_xet, "hash_files", None)
+    if hash_files is None:
+        return None
+    try:
+        return [result.hash for result in hash_files(paths)]
+    except _API_SHAPE_ERRORS:
+        return None
+
+
 class StagedBackend(SinkBackend):
     """Stage the output on local disk, then upload it with the public API.
 
@@ -532,15 +588,22 @@ class StagedBackend(SinkBackend):
         super().__init__(bucket_id, token)
         self.staging_dir = os.environ.get(STAGING_DIR_ENV_VAR) or None
 
-    def _add(self, additions: list[tuple[str, str]], listing_prefix: str) -> None:
+    def _add(
+        self,
+        additions: list[tuple[str, str]],
+        listing_prefix: str | None,
+        confirm: bool,
+    ) -> None:
         """Upload ``(local path, bucket path)`` pairs with the public API.
 
-        ``listing_prefix`` is a string prefix of all the bucket paths; it is
-        used to check the result when the client does not report rejections.
+        ``listing_prefix`` is a string prefix of all the bucket paths, or
+        ``None`` to check each file with a HEAD request instead of a listing.
+        The upload is checked when ``confirm`` is true, and always when the
+        client does not report rejections.
+        ``HfApi.batch_bucket_files`` returns normally for a ``200`` answer
+        without a confirmation, so a write that deletes old files afterwards
+        (``mode="overwrite"``) must confirm it.
         """
-        sizes = {}
-        for local, destination in additions:
-            sizes[destination] = os.path.getsize(local)
         try:
             self.api.batch_bucket_files(self.bucket_id, add=additions)
         except HfHubHTTPError as error:
@@ -553,17 +616,28 @@ class StagedBackend(SinkBackend):
                 f"the upload to bucket {self.bucket_id!r} got no answer "
                 f"({type(error).__name__}: {error}). {_UNKNOWN_STATE}."
             ) from error
-        if not hub_reports_rejected_files():
-            self._verify_added(sizes, listing_prefix)
+        if confirm or not hub_reports_rejected_files():
+            self._verify_added(additions, listing_prefix)
 
-    def _verify_added(self, sizes: dict[str, int], listing_prefix: str) -> None:
-        """Raise if a file of ``{bucket path: size}`` is not in the bucket.
+    def _verify_added(
+        self, additions: list[tuple[str, str]], listing_prefix: str | None
+    ) -> None:
+        """Raise unless every staged file is in the bucket with its content.
 
-        huggingface_hub 1.x returns normally when the bucket rejects single
-        files, so the destination is listed once after the upload.
+        The destination is listed once (or each file is checked with a HEAD
+        request, without ``listing_prefix``). A file must have its size and,
+        when the Hub and ``hf_xet`` give one, its Xet hash: a rejected
+        replacement leaves the old object, which can have the same size.
         """
         try:
-            listed = self.list_files(listing_prefix)
+            if listing_prefix is None:
+                listed = {}
+                for _, path in additions:
+                    entry = self.file_entry(path)
+                    if entry is not None:
+                        listed[path] = entry
+            else:
+                listed = self._listed_files(listing_prefix)
         except Exception as error:
             raise BucketRegistrationError(
                 f"the upload to bucket {self.bucket_id!r} returned, but the "
@@ -572,17 +646,28 @@ class StagedBackend(SinkBackend):
                 f"registered. {_UNKNOWN_STATE}."
             ) from error
         failures = []
-        for path, size in sizes.items():
-            if path not in listed:
+        to_hash = []
+        for local, path in additions:
+            size = os.path.getsize(local)
+            entry = listed.get(path)
+            if entry is None:
                 error = "not in the bucket after the upload"
-            elif listed[path] != size:
-                error = f"has {listed[path]} bytes in the bucket, expected {size}"
+            elif entry.size is not None and entry.size != size:
+                error = f"has {entry.size} bytes in the bucket, expected {size}"
             else:
+                if entry.xet_hash:
+                    to_hash.append((local, path, entry.xet_hash))
                 continue
             failures.append({"path": path, "error": error})
+        hashes = local_xet_hashes([local for local, _, _ in to_hash])
+        if hashes is not None:
+            for (_, path, listed_hash), local_hash in zip(to_hash, hashes, strict=True):
+                if local_hash != listed_hash:
+                    error = "has other content in the bucket (another Xet hash)"
+                    failures.append({"path": path, "error": error})
         if failures:
             raise BucketRegistrationError(
-                _rejected(self.bucket_id, failures, len(sizes)), failures
+                _rejected(self.bucket_id, failures, len(additions)), failures
             )
 
     @contextmanager
@@ -597,7 +682,9 @@ class StagedBackend(SinkBackend):
         with self._staging() as directory:
             local = os.path.join(directory, "data")
             run_sink(local)
-            self._add([(local, path)], listing_prefix=path)
+            # One HEAD request: a replaced file must be confirmed. A listing of
+            # the string prefix would also list every sibling ("out.parquet.1").
+            self._add([(local, path)], listing_prefix=None, confirm=True)
         return [path]
 
     def write_partitioned(
@@ -622,7 +709,11 @@ class StagedBackend(SinkBackend):
             if local_additions:
                 # The directory, not the string prefix ("out/", not "out").
                 directory_prefix = f"{prefix}/" if prefix else ""
-                self._add(local_additions, listing_prefix=directory_prefix)
+                self._add(
+                    local_additions,
+                    listing_prefix=directory_prefix,
+                    confirm=spec.replaces,
+                )
         return [path for _, path in local_additions]
 
 
