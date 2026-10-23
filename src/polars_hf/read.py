@@ -1074,6 +1074,7 @@ class _BucketSource:
                 else:
                     mine[index] = Future()
                     self._resolving[index] = mine[index]
+            cached = None
         reused = len(urls) > 0
 
         try:
@@ -1084,7 +1085,10 @@ class _BucketSource:
                 urls[index] = pending.result()
         except BaseException:
             # The error is raised through this frame: no URL stays in it.
+            # The futures that are done hold URLs too.
             urls.clear()
+            mine.clear()
+            theirs.clear()
             raise
         return [urls[index] for index in range(start, stop)], reused
 
@@ -1155,8 +1159,9 @@ class _BucketSource:
         An error of the ``resolve`` request itself is raised as it is.
         """
         urls, reused = self._resolve(0, 1, "schema read of a scan_bucket query")
-        lf = pl.scan_parquet(urls, **self.scan_kwargs)
         try:
+            # In the try: polars can reject a scan option here.
+            lf = pl.scan_parquet(urls, **self.scan_kwargs)
             return lf.collect_schema(), None, reused
         except Exception as error:
             self._forget_urls(0, 1)
@@ -1273,16 +1278,17 @@ class _BucketSource:
         scope = "group of files of a scan_bucket query"
         urls, reused = self._resolve(start, stop, scope)
         uris_by_url = self._uris_by_url(start, urls)
-        lf = self._scan_group(urls, uris_by_url)
-        if remaining is not None:
-            lf = lf.head(remaining)
-        if predicate is not None:
-            lf = lf.filter(predicate)
-        if with_columns is not None:
-            lf = lf.select(with_columns)
 
         rows = 0
         try:
+            # In the try: polars can reject a scan option here.
+            lf = self._scan_group(urls, uris_by_url)
+            if remaining is not None:
+                lf = lf.head(remaining)
+            if predicate is not None:
+                lf = lf.filter(predicate)
+            if with_columns is not None:
+                lf = lf.select(with_columns)
             batches = lf.collect_batches(chunk_size=batch_size, engine="streaming")
             for batch in batches:
                 rows += batch.height

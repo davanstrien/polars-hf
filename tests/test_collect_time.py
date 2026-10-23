@@ -1515,6 +1515,44 @@ def test_traceback_of_a_resolve_error_holds_no_signed_url(
     assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
 
 
+def test_traceback_of_a_resolve_error_after_a_kept_url_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # The last file of the group has a kept URL and an earlier file is gone:
+    # the error of its resolve request passes through the frame that looked
+    # the kept URL up.
+    _put_numbered(fake_hub, fake_bucket, 2)
+    source = _source(fake_bucket, 2, schema={"id": pl.Int64, "label": pl.String})
+    source._resolve(1, 2, "test")
+    fake_hub.delete(fake_bucket, "data/p00.parquet")
+
+    with pytest.raises(FileNotFoundError) as error:
+        list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+
+
+@pytest.mark.parametrize("step", ["schema", "scan"])
+def test_traceback_of_an_invalid_scan_option_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str, step: str
+) -> None:
+    # pl.scan_parquet rejects the option (as Polars 2 does for retries=)
+    # after the URLs of the files are resolved.
+    _put_numbered(fake_hub, fake_bucket, 1)
+    source = _source(
+        fake_bucket, 1, schema={"id": pl.Int64, "label": pl.String}, not_an_option=1
+    )
+
+    with pytest.raises(TypeError) as error:
+        if step == "schema":
+            source.schema()
+        else:
+            list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 1
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
 def test_traceback_helper_finds_a_signed_url(
     fake_hub: FakeHub, fake_bucket: str
 ) -> None:
