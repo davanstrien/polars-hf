@@ -797,8 +797,21 @@ def _signed_urls(
         return []
     if len(paths) == 1:
         return [resolve(paths[0])]
+    # Not pool.map: its frame keeps the futures, whose results are signed
+    # URLs, in the traceback of the first error.
     with ThreadPoolExecutor(max_workers=min(_MAX_RESOLVE_WORKERS, len(paths))) as pool:
-        return list(pool.map(resolve, paths))
+        futures = [pool.submit(resolve, path) for path in paths]
+    failure = None
+    for pending in futures:
+        if pending.exception() is not None:
+            failure = pending.exception()
+            break
+    if failure is None:
+        return [pending.result() for pending in futures]
+    # The error is raised through this frame: no URL stays in it.
+    futures.clear()
+    pending = None
+    raise failure
 
 
 # ---- collect-time source ---------------------------------------------------

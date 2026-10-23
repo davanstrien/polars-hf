@@ -98,7 +98,8 @@ Things worth knowing:
   job that runs for hours keeps working.
 - **No credential in the plan.** A presigned URL lets anyone who has it read that file for about an
   hour. In the default mode it does not appear in `explain()`, `serialize()`, error messages or
-  tracebacks. Two things are outside the package's control: `POLARS_VERBOSE=1` makes Polars print
+  the local variables of tracebacks ([details](docs/reading.md)). Two things are outside the
+  package's control: `POLARS_VERBOSE=1` makes Polars print
   the URLs it reads, and DEBUG logging of the HTTP client prints them too.
 - **Use `count_rows` for counts.** In the default mode Polars asks for a whole column to count
   rows, which can mean downloading most of the data. `count_rows` reads only the footers.

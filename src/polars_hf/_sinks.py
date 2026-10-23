@@ -384,8 +384,14 @@ class SinkBackend(ABC):
         self.headers = build_hf_headers(token=token)
 
     @abstractmethod
-    def write_file(self, run_sink: RunSink, path: str) -> list[str]:
-        """Write one file to ``path``; return the bucket paths written."""
+    def write_file(
+        self, run_sink: RunSink, path: str, *, replaces: bool = False
+    ) -> list[str]:
+        """Write one file to ``path``; return the bucket paths written.
+
+        ``replaces`` is true for ``mode="overwrite"``: the write can replace
+        an object, and old files can be deleted after it.
+        """
 
     @abstractmethod
     def write_partitioned(
@@ -461,7 +467,9 @@ class SinkBackend(ABC):
         uri = f"hf://buckets/{self.bucket_id}/{path}"
         url = _resolve_url(self.api.endpoint, self.bucket_id, path)
         budget = _Budget(self.bucket_id, operation="sink_bucket")
-        response = _request("HEAD", url, self.headers, budget, "resolve")
+        # Uncompressed, so that the Content-Length of a 200 is the file size.
+        headers = {**self.headers, "Accept-Encoding": "identity"}
+        response = _request("HEAD", url, headers, budget, "resolve")
         status = response.status_code
         if status in _REDIRECT_CODES or status == 200:
             size = response.headers.get("x-linked-size")
@@ -592,17 +600,17 @@ class StagedBackend(SinkBackend):
         self,
         additions: list[tuple[str, str]],
         listing_prefix: str | None,
-        confirm: bool,
+        replaces: bool,
     ) -> None:
         """Upload ``(local path, bucket path)`` pairs with the public API.
 
         ``listing_prefix`` is a string prefix of all the bucket paths, or
         ``None`` to check each file with a HEAD request instead of a listing.
-        The upload is checked when ``confirm`` is true, and always when the
-        client does not report rejections.
-        ``HfApi.batch_bucket_files`` returns normally for a ``200`` answer
-        without a confirmation, so a write that deletes old files afterwards
-        (``mode="overwrite"``) must confirm it.
+        ``HfApi.batch_bucket_files`` does not always confirm the upload (see
+        :meth:`_verify_added`), so it is checked: for one file (one request),
+        for a write that ``replaces`` files (``mode="overwrite"`` deletes old
+        files afterwards), and for every write when the client does not
+        report rejected files.
         """
         try:
             self.api.batch_bucket_files(self.bucket_id, add=additions)
@@ -616,18 +624,29 @@ class StagedBackend(SinkBackend):
                 f"the upload to bucket {self.bucket_id!r} got no answer "
                 f"({type(error).__name__}: {error}). {_UNKNOWN_STATE}."
             ) from error
-        if confirm or not hub_reports_rejected_files():
-            self._verify_added(additions, listing_prefix)
+        check = replaces or listing_prefix is None or not hub_reports_rejected_files()
+        if check:
+            self._verify_added(additions, listing_prefix, replaces=replaces)
 
     def _verify_added(
-        self, additions: list[tuple[str, str]], listing_prefix: str | None
+        self,
+        additions: list[tuple[str, str]],
+        listing_prefix: str | None,
+        *,
+        replaces: bool,
     ) -> None:
         """Raise unless every staged file is in the bucket with its content.
 
         The destination is listed once (or each file is checked with a HEAD
-        request, without ``listing_prefix``). A file must have its size and,
-        when the Hub and ``hf_xet`` give one, its Xet hash: a rejected
-        replacement leaves the old object, which can have the same size.
+        request, without ``listing_prefix``). A file must have its size, and
+        its Xet hash when the Hub and ``hf_xet`` give one.
+
+        When the write ``replaces`` files, the Xet hash is required: a
+        rejected replacement keeps the old object, which can have the same
+        size. Without it the state is unknown and ``BucketRegistrationError``
+        is raised, so that no old file is deleted. Otherwise the size is
+        enough: the paths held no object before the write (``mode="error"``
+        checked it; ``mode="append"`` names are unique to the call).
         """
         try:
             if listing_prefix is None:
@@ -646,6 +665,7 @@ class StagedBackend(SinkBackend):
                 f"registered. {_UNKNOWN_STATE}."
             ) from error
         failures = []
+        unconfirmed = []
         to_hash = []
         for local, path in additions:
             size = os.path.getsize(local)
@@ -654,20 +674,33 @@ class StagedBackend(SinkBackend):
                 error = "not in the bucket after the upload"
             elif entry.size is not None and entry.size != size:
                 error = f"has {entry.size} bytes in the bucket, expected {size}"
+            elif entry.xet_hash:
+                to_hash.append((local, path, entry.xet_hash))
+                continue
             else:
-                if entry.xet_hash:
-                    to_hash.append((local, path, entry.xet_hash))
+                if replaces or entry.size is None:
+                    unconfirmed.append(path)
                 continue
             failures.append({"path": path, "error": error})
         hashes = local_xet_hashes([local for local, _, _ in to_hash])
-        if hashes is not None:
-            for (_, path, listed_hash), local_hash in zip(to_hash, hashes, strict=True):
-                if local_hash != listed_hash:
-                    error = "has other content in the bucket (another Xet hash)"
-                    failures.append({"path": path, "error": error})
+        for index, (_, path, listed_hash) in enumerate(to_hash):
+            if hashes is None:
+                if replaces:
+                    unconfirmed.append(path)
+            elif hashes[index] != listed_hash:
+                error = "has other content in the bucket (another Xet hash)"
+                failures.append({"path": path, "error": error})
         if failures:
             raise BucketRegistrationError(
                 _rejected(self.bucket_id, failures, len(additions)), failures
+            )
+        if unconfirmed:
+            raise BucketRegistrationError(
+                f"the upload to bucket {self.bucket_id!r} returned, but the "
+                f"content of {len(unconfirmed)} file(s) cannot be confirmed "
+                f"({unconfirmed[0]!r}): the Hub gave no Xet hash, or hf_xet "
+                "cannot compute one here. No old file was deleted. "
+                f"{_UNKNOWN_STATE}."
             )
 
     @contextmanager
@@ -678,13 +711,15 @@ class StagedBackend(SinkBackend):
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
-    def write_file(self, run_sink: RunSink, path: str) -> list[str]:
+    def write_file(
+        self, run_sink: RunSink, path: str, *, replaces: bool = False
+    ) -> list[str]:
         with self._staging() as directory:
             local = os.path.join(directory, "data")
             run_sink(local)
-            # One HEAD request: a replaced file must be confirmed. A listing of
-            # the string prefix would also list every sibling ("out.parquet.1").
-            self._add([(local, path)], listing_prefix=None, confirm=True)
+            # Checked with one HEAD request. A listing of the string prefix
+            # would also list every sibling ("out.parquet.1").
+            self._add([(local, path)], listing_prefix=None, replaces=replaces)
         return [path]
 
     def write_partitioned(
@@ -712,7 +747,7 @@ class StagedBackend(SinkBackend):
                 self._add(
                     local_additions,
                     listing_prefix=directory_prefix,
-                    confirm=spec.replaces,
+                    replaces=spec.replaces,
                 )
         return [path for _, path in local_additions]
 
@@ -970,7 +1005,10 @@ class StreamBackend(SinkBackend):
             operation["contentType"] = content_type
         return operation
 
-    def write_file(self, run_sink: RunSink, path: str) -> list[str]:
+    def write_file(
+        self, run_sink: RunSink, path: str, *, replaces: bool = False
+    ) -> list[str]:
+        # The registration answer confirms every file, replaced or not.
         def write(upload: _XetUpload) -> None:
             run_sink(upload.open(path))
 

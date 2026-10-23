@@ -1493,6 +1493,62 @@ def test_staged_overwrite_dropped_with_the_old_size_keeps_the_old_files(
     assert "out/stale.parquet" in fake_hub.files(fake_bucket)
 
 
+def _entry(path: str, size: int | None, xet_hash: str | None):
+    from polars_hf.read import _Entry
+
+    return _Entry(type="file", path=path, size=size, xet_hash=xet_hash)
+
+
+@pytest.mark.parametrize("case", ["no size and no hash", "no hash", "no local hash"])
+@pytest.mark.parametrize("replaces", [True, False])
+def test_verification_without_a_hash_confirms_only_a_new_file(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    replaces: bool,
+) -> None:
+    # A replacement needs the Xet hash: a rejected one keeps the old object,
+    # which can have the same size. A new path needs only the size.
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+    additions = _local_files(tmp_path, {"dir/a.bin": b"12345"})
+    entry = {
+        "no size and no hash": _entry("dir/a.bin", None, None),
+        "no hash": _entry("dir/a.bin", 5, None),
+        "no local hash": _entry("dir/a.bin", 5, "abc"),
+    }[case]
+    monkeypatch.setattr(backend, "file_entry", lambda path: entry)
+    if case == "no local hash":
+        monkeypatch.setattr(_sinks, "local_xet_hashes", lambda paths: None)
+
+    if replaces or case == "no size and no hash":
+        with pytest.raises(BucketRegistrationError, match="cannot be confirmed"):
+            backend._verify_added(additions, None, replaces=replaces)
+    else:
+        backend._verify_added(additions, None, replaces=replaces)
+
+
+def test_file_entry_of_a_direct_answer_uses_its_uncompressed_length(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    sent = []
+
+    def answer(method, url, headers, budget, kind):
+        sent.append(headers)
+        return httpx.Response(200, headers={"Content-Length": "7"})
+
+    monkeypatch.setattr(_sinks, "_request", answer)
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+
+    entry = backend.file_entry("a.bin")
+
+    assert (entry.size, entry.xet_hash) == (7, None)
+    assert sent[0]["Accept-Encoding"] == "identity"
+
+
 @pytest.mark.parametrize("listing_prefix", ["dir", None])
 def test_verification_reports_a_wrong_size_or_content(
     fake_hub: FakeHub, fake_bucket: str, tmp_path, listing_prefix: str | None
@@ -1504,7 +1560,7 @@ def test_verification_reports_a_wrong_size_or_content(
     backend = _sinks.StagedBackend(fake_bucket, token=None)
 
     good = {"dir/a.bin": b"12345", "dir/b.bin": b"123"}
-    backend._verify_added(_local_files(tmp_path, good), listing_prefix)
+    backend._verify_added(_local_files(tmp_path, good), listing_prefix, replaces=True)
     bad = {
         "dir/a.bin": b"12345",
         "dir/b.bin": b"1234",
@@ -1512,7 +1568,9 @@ def test_verification_reports_a_wrong_size_or_content(
         "dir/d.bin": b"new",
     }
     with pytest.raises(BucketRegistrationError) as error:
-        backend._verify_added(_local_files(tmp_path, bad), listing_prefix)
+        backend._verify_added(
+            _local_files(tmp_path, bad), listing_prefix, replaces=True
+        )
 
     assert error.value.failures == [
         {"path": "dir/b.bin", "error": "has 3 bytes in the bucket, expected 4"},
