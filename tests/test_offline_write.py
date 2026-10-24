@@ -1529,6 +1529,36 @@ def test_verification_without_a_hash_confirms_only_a_new_file(
         backend._verify_added(additions, None, replaces=replaces)
 
 
+@pytest.mark.parametrize("size", [5, None], ids=["size", "no size"])
+@pytest.mark.parametrize("replaces", [True, False])
+def test_verification_hashes_only_when_the_size_cannot_decide(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int | None,
+    replaces: bool,
+) -> None:
+    # Hashing re-reads the staged file: a new path with a matching size
+    # needs no hash.
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+    additions = _local_files(tmp_path, {"dir/a.bin": b"12345"})
+    monkeypatch.setattr(
+        backend, "file_entry", lambda path: _entry("dir/a.bin", size, "other")
+    )
+    hashed = []
+
+    def hashes(paths):
+        hashed.extend(paths)
+        return ["other"] * len(paths)
+
+    monkeypatch.setattr(_sinks, "local_xet_hashes", hashes)
+
+    backend._verify_added(additions, None, replaces=replaces)
+
+    assert bool(hashed) == (replaces or size is None)
+
+
 def test_file_entry_of_a_direct_answer_uses_its_uncompressed_length(
     fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

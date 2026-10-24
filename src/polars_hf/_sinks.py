@@ -638,8 +638,9 @@ class StagedBackend(SinkBackend):
         """Raise unless every staged file is in the bucket with its content.
 
         The destination is listed once (or each file is checked with a HEAD
-        request, without ``listing_prefix``). A file must have its size, and
-        its Xet hash when the Hub and ``hf_xet`` give one.
+        request, without ``listing_prefix``). A file must have its size. Its
+        Xet hash is compared only when the size cannot decide (see below, or
+        the Hub gives no size), because hashing re-reads the local file.
 
         When the write ``replaces`` files, the Xet hash is required: a
         rejected replacement keeps the old object, which can have the same
@@ -674,7 +675,8 @@ class StagedBackend(SinkBackend):
                 error = "not in the bucket after the upload"
             elif entry.size is not None and entry.size != size:
                 error = f"has {entry.size} bytes in the bucket, expected {size}"
-            elif entry.xet_hash:
+            elif entry.xet_hash and (replaces or entry.size is None):
+                # Hashing re-reads the file: only when the size cannot decide.
                 to_hash.append((local, path, entry.xet_hash))
                 continue
             else:
