@@ -41,7 +41,9 @@ every mode.
 The Hub token itself is held in memory by the package while it talks to the Hub, as in
 `huggingface_hub`, so a tool that captures the local variables of traceback frames can record it
 on a Hub error. What this section promises is about presigned URLs: none in plans, messages,
-exception chains and traceback frames of the default mode.
+exception chains and the local variables of traceback frames of the default mode. The scan object
+itself keeps the URLs it resolved in the last 5 minutes (to reuse them), and frames refer to it, so
+a tool that follows object attributes from a frame, not only its local variables, can reach them.
 
 **What the default mode costs.** Full scans, `head()` and selective queries take about as long as
 on the native node. A row count through the LazyFrame and `tail()` do not.
@@ -166,8 +168,9 @@ Rules for the URI itself:
 | a path that does not exist | 1 `resolve` + 1 listing |
 
 A glob whose only glob segment is the last one (`data/*.parquet`) lists that directory only. Other
-globs list the subtree below the text before their first glob character. An invalid glob raises
-before any request.
+globs list the subtree below the text before their first glob character. An invalid glob
+(`data/**.parquet`) lists its directory once, because a file can have exactly that name; it raises
+`ValueError` if none does.
 
 With `resolve="now"` the call then sends one `resolve` request for each of the N files. With the
 default `resolve="collect"` these requests are sent when a query runs:

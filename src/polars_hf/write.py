@@ -344,7 +344,7 @@ def sink_bucket(
 
     if not partitioned:
         _check_file_destination(sink, bp.path, uri, mode)
-        sink.write_file(run_sink, bp.path)
+        sink.write_file(run_sink, bp.path, replaces=mode == "overwrite")
         return
 
     _check_directory_destination(sink, prefix, uri, mode)
@@ -367,6 +367,7 @@ def sink_bucket(
         max_bytes_per_file=max_bytes_per_file,
         extension=_sinks.PARTITION_EXTENSION[fmt],
         suffix=suffix,
+        replaces=mode == "overwrite",
     )
     written = sink.write_partitioned(run_sink, prefix, spec)
     if not written:
@@ -375,7 +376,11 @@ def sink_bucket(
         empty = pl.LazyFrame(schema=lf.collect_schema())
         empty_name = f"00000000{suffix}.{spec.extension}"
         empty_path = _sinks.join_path(prefix, empty_name)
-        written = sink.write_file(_make_run_sink(empty, fmt, sink_kwargs), empty_path)
+        written = sink.write_file(
+            _make_run_sink(empty, fmt, sink_kwargs),
+            empty_path,
+            replaces=mode == "overwrite",
+        )
 
     if mode == "overwrite":
         kept = set(written)

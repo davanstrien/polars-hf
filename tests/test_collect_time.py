@@ -13,6 +13,7 @@ import io
 import pickle
 import threading
 import types
+from concurrent.futures import Future
 from urllib.parse import quote
 
 import polars as pl
@@ -1391,12 +1392,17 @@ def test_odd_file_names_and_hive_directories(
 
 
 def _strings_in(value: object, depth: int = 0) -> list[str]:
-    """The strings in ``value``: itself, or the items of lists, tuples and dicts."""
+    """The strings in ``value``: itself, the items of lists, tuples and dicts,
+    or the result of a finished ``Future``."""
     if isinstance(value, str):
         return [value]
     if isinstance(value, bytes):
         return [value.decode("latin-1")]
     if depth > 6:
+        return []
+    if isinstance(value, Future):
+        if value.done() and not value.cancelled() and value.exception() is None:
+            return _strings_in(value.result(), depth + 1)
         return []
     found: list[str] = []
     if isinstance(value, dict):
@@ -1513,6 +1519,66 @@ def test_traceback_of_a_resolve_error_holds_no_signed_url(
         list(source(None, None, None, None))
 
     assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+
+
+def test_traceback_of_a_resolve_error_after_a_kept_url_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # The last file of the group has a kept URL and an earlier file is gone:
+    # the error of its resolve request passes through the frame that looked
+    # the kept URL up.
+    _put_numbered(fake_hub, fake_bucket, 2)
+    source = _source(fake_bucket, 2, schema={"id": pl.Int64, "label": pl.String})
+    source._resolve(1, 2, "test")
+    fake_hub.delete(fake_bucket, "data/p00.parquet")
+
+    with pytest.raises(FileNotFoundError) as error:
+        list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+
+
+@pytest.mark.parametrize("step", ["schema", "scan"])
+def test_traceback_of_an_invalid_scan_option_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str, step: str
+) -> None:
+    # pl.scan_parquet rejects the option (as Polars 2 does for retries=)
+    # after the URLs of the files are resolved.
+    _put_numbered(fake_hub, fake_bucket, 1)
+    source = _source(
+        fake_bucket, 1, schema={"id": pl.Int64, "label": pl.String}, not_an_option=1
+    )
+
+    with pytest.raises(TypeError) as error:
+        if step == "schema":
+            source.schema()
+        else:
+            list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 1
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+def test_traceback_of_a_concurrent_resolve_error_holds_no_signed_url(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # The first of three files is gone; the other two are resolved by other
+    # threads of the pool. Their futures hold signed URLs.
+    _put_numbered(fake_hub, fake_bucket, 3)
+    source = _source(fake_bucket, 3, schema={"id": pl.Int64, "label": pl.String})
+    fake_hub.delete(fake_bucket, "data/p00.parquet")
+
+    with pytest.raises(FileNotFoundError) as error:
+        list(source(None, None, None, None))
+
+    assert _assert_no_signed_url_in_tracebacks(error.value, fake_hub) >= 2
+
+
+def test_traceback_helper_finds_a_signed_url_in_a_future() -> None:
+    future: Future = Future()
+    future.set_result("https://cdn.example/x?X-Amz-Signature=secret")
+
+    assert any("Signature" in text for text in _strings_in({"futures": [future]}))
 
 
 def test_traceback_helper_finds_a_signed_url(

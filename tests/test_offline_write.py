@@ -1252,6 +1252,25 @@ def test_transient_registration_error_is_retried(
     assert len(fake_hub.batch_calls) == 1
 
 
+@pytest.mark.parametrize("status", [429, 503])
+def test_registration_error_after_the_last_retry_is_a_registration_error(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    import huggingface_hub.utils._http
+
+    fake_hub.add_fault(
+        HUB, "POST", r"/batch$", status, times=100, headers={"Retry-After": "0"}
+    )
+    monkeypatch.setattr(huggingface_hub.utils._http.time, "sleep", lambda _: None)
+
+    df = pl.DataFrame({"a": [1]})
+    with pytest.raises(BucketRegistrationError, match="is unknown") as error:
+        sink_streamed(df, _uri(fake_bucket, "a.parquet"))
+
+    assert isinstance(error.value.__cause__, HfHubHTTPError)
+    assert fake_hub.files(fake_bucket) == []
+
+
 def _assert_incompatible(error: pytest.ExceptionInfo) -> None:
     import huggingface_hub
 
@@ -1431,18 +1450,165 @@ def test_hub_backend_verification_passes_and_costs_one_listing(
     assert listings == {True: 1, False: 2}
 
 
-def test_verification_reports_a_wrong_size(fake_hub: FakeHub, fake_bucket: str) -> None:
-    fake_hub.put(fake_bucket, "dir/a.bin", b"12345")
-    fake_hub.put(fake_bucket, "dir/b.bin", b"123")
+def _local_files(tmp_path, contents: dict[str, bytes]) -> list[tuple[str, str]]:
+    """``(local path, bucket path)`` pairs of files with these contents."""
+    additions = []
+    for number, (path, data) in enumerate(contents.items()):
+        local = tmp_path / f"{number}.bin"
+        local.write_bytes(data)
+        additions.append((str(local), path))
+    return additions
+
+
+@pytest.mark.parametrize("reports", [True, False], ids=["hub 2.x", "hub 1.x"])
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_staged_overwrite_dropped_with_the_old_size_keeps_the_old_files(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    monkeypatch: pytest.MonkeyPatch,
+    partitioned: bool,
+    reports: bool,
+) -> None:
+    # The client returns normally, but the bucket keeps the old object: a
+    # 200 answer without a confirmation (hub 2.x), or a rejection the client
+    # does not report (hub 1.x). The old object has the size of the new one,
+    # so only its Xet hash tells them apart; the overwrite must not go on to
+    # delete the other old files.
+    monkeypatch.setattr(_sinks, "hub_reports_rejected_files", lambda: reports)
+    df = pl.DataFrame({"n": range(10)})
+    path = "out/00000000.parquet" if partitioned else "out.parquet"
+    uri = _uri(fake_bucket, "out" if partitioned else path)
+    options = {"max_rows_per_file": 100} if partitioned else {}
+    sink_staged(df, uri, mode="overwrite", **options)
+    new = fake_hub.read(fake_bucket, path)
+    old = bytes(reversed(new))
+    fake_hub.put(fake_bucket, path, old)
+    fake_hub.put(fake_bucket, "out/stale.parquet", b"stale")
+    fake_hub.drop_paths = {path}
+
+    with pytest.raises(BucketRegistrationError, match="another Xet hash"):
+        sink_staged(df, uri, mode="overwrite", **options)
+
+    assert fake_hub.read(fake_bucket, path) == old
+    assert "out/stale.parquet" in fake_hub.files(fake_bucket)
+
+
+def _entry(path: str, size: int | None, xet_hash: str | None):
+    from polars_hf.read import _Entry
+
+    return _Entry(type="file", path=path, size=size, xet_hash=xet_hash)
+
+
+@pytest.mark.parametrize("case", ["no size and no hash", "no hash", "no local hash"])
+@pytest.mark.parametrize("replaces", [True, False])
+def test_verification_without_a_hash_confirms_only_a_new_file(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    replaces: bool,
+) -> None:
+    # A replacement needs the Xet hash: a rejected one keeps the old object,
+    # which can have the same size. A new path needs only the size.
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+    additions = _local_files(tmp_path, {"dir/a.bin": b"12345"})
+    entry = {
+        "no size and no hash": _entry("dir/a.bin", None, None),
+        "no hash": _entry("dir/a.bin", 5, None),
+        "no local hash": _entry("dir/a.bin", 5, "abc"),
+    }[case]
+    monkeypatch.setattr(backend, "file_entry", lambda path: entry)
+    if case == "no local hash":
+        monkeypatch.setattr(_sinks, "local_xet_hashes", lambda paths: None)
+
+    if replaces or case == "no size and no hash":
+        with pytest.raises(BucketRegistrationError, match="cannot be confirmed"):
+            backend._verify_added(additions, None, replaces=replaces)
+    else:
+        backend._verify_added(additions, None, replaces=replaces)
+
+
+@pytest.mark.parametrize("size", [5, None], ids=["size", "no size"])
+@pytest.mark.parametrize("replaces", [True, False])
+def test_verification_hashes_only_when_the_size_cannot_decide(
+    fake_hub: FakeHub,
+    fake_bucket: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int | None,
+    replaces: bool,
+) -> None:
+    # Hashing re-reads the staged file: a new path with a matching size
+    # needs no hash.
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+    additions = _local_files(tmp_path, {"dir/a.bin": b"12345"})
+    monkeypatch.setattr(
+        backend, "file_entry", lambda path: _entry("dir/a.bin", size, "other")
+    )
+    hashed = []
+
+    def hashes(paths):
+        hashed.extend(paths)
+        return ["other"] * len(paths)
+
+    monkeypatch.setattr(_sinks, "local_xet_hashes", hashes)
+
+    backend._verify_added(additions, None, replaces=replaces)
+
+    assert bool(hashed) == (replaces or size is None)
+
+
+def test_file_entry_of_a_direct_answer_uses_its_uncompressed_length(
+    fake_hub: FakeHub, fake_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    sent = []
+
+    def answer(method, url, headers, budget, kind):
+        sent.append(headers)
+        return httpx.Response(200, headers={"Content-Length": "7"})
+
+    monkeypatch.setattr(_sinks, "_request", answer)
     backend = _sinks.StagedBackend(fake_bucket, token=None)
 
-    backend._verify_added({"dir/a.bin": 5, "dir/b.bin": 3}, "dir")
+    entry = backend.file_entry("a.bin")
+
+    assert (entry.size, entry.xet_hash) == (7, None)
+    assert sent[0]["Accept-Encoding"] == "identity"
+
+
+@pytest.mark.parametrize("listing_prefix", ["dir", None])
+def test_verification_reports_a_wrong_size_or_content(
+    fake_hub: FakeHub, fake_bucket: str, tmp_path, listing_prefix: str | None
+) -> None:
+    # With a listing (partitioned writes) and with HEAD requests (one file).
+    fake_hub.put(fake_bucket, "dir/a.bin", b"12345")
+    fake_hub.put(fake_bucket, "dir/b.bin", b"123")
+    fake_hub.put(fake_bucket, "dir/d.bin", b"old")
+    backend = _sinks.StagedBackend(fake_bucket, token=None)
+
+    good = {"dir/a.bin": b"12345", "dir/b.bin": b"123"}
+    backend._verify_added(_local_files(tmp_path, good), listing_prefix, replaces=True)
+    bad = {
+        "dir/a.bin": b"12345",
+        "dir/b.bin": b"1234",
+        "dir/c.bin": b"1",
+        "dir/d.bin": b"new",
+    }
     with pytest.raises(BucketRegistrationError) as error:
-        backend._verify_added({"dir/a.bin": 5, "dir/b.bin": 4, "dir/c.bin": 1}, "dir")
+        backend._verify_added(
+            _local_files(tmp_path, bad), listing_prefix, replaces=True
+        )
 
     assert error.value.failures == [
         {"path": "dir/b.bin", "error": "has 3 bytes in the bucket, expected 4"},
         {"path": "dir/c.bin", "error": "not in the bucket after the upload"},
+        {
+            "path": "dir/d.bin",
+            "error": "has other content in the bucket (another Xet hash)",
+        },
     ]
 
 
@@ -1647,17 +1813,20 @@ def test_existence_checks_cost_a_bounded_number_of_requests(
     assert _checks(fake_hub) == [("GET", "tree")]
 
     # Single file, mode="error": one HEAD and one listing page of "path/".
+    # The staged backend confirms the upload with one more HEAD.
+    confirm = [("HEAD", "resolve/out.parquet")] if sink is sink_staged else []
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "out.parquet"))
     assert _checks(fake_hub) == [
         ("HEAD", "resolve/out.parquet"),
         ("GET", "tree/out.parquet%2F"),
+        *confirm,
     ]
 
     # Single file, mode="overwrite": one listing page of "path/".
     fake_hub.reset_log()
     sink(df, _uri(fake_bucket, "out.parquet"), mode="overwrite")
-    assert _checks(fake_hub) == [("GET", "tree/out.parquet%2F")]
+    assert _checks(fake_hub) == [("GET", "tree/out.parquet%2F"), *confirm]
 
 
 @both_sinks

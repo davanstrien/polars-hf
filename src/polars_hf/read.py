@@ -600,11 +600,19 @@ def _glob_files(
     """The files that ``pattern`` names: an exact file name, else the matches.
 
     A file whose name is exactly ``pattern`` (``data[1].parquet``) is read
-    literally. Raises ``ValueError`` for an invalid pattern before any request.
+    literally. An invalid pattern (``data/**.parquet``) can still be the
+    exact name of a file: its directory is listed once, and ``ValueError`` is
+    raised when no file has that name.
     """
-    matcher = glob_to_regex(pattern)
-    if _glob_is_in_one_directory(pattern):
-        # A glob in the last segment only: list its directory, not the subtree.
+    invalid = None
+    try:
+        matcher = glob_to_regex(pattern)
+    except ValueError as error:
+        invalid = error
+        matcher = None
+    if matcher is None or _glob_is_in_one_directory(pattern):
+        # A glob in the last segment only, or an invalid one: list its
+        # directory, not the subtree.
         parent = pattern.rpartition("/")[0]
         entries = _list_tree(
             endpoint,
@@ -631,6 +639,8 @@ def _glob_files(
     selected = _exact_file(files, pattern)
     if selected:
         return selected
+    if invalid is not None:
+        raise invalid
     for file in files:
         if matcher.fullmatch(file.path):
             selected.append(file)
@@ -787,8 +797,21 @@ def _signed_urls(
         return []
     if len(paths) == 1:
         return [resolve(paths[0])]
+    # Not pool.map: its frame keeps the futures, whose results are signed
+    # URLs, in the traceback of the first error.
     with ThreadPoolExecutor(max_workers=min(_MAX_RESOLVE_WORKERS, len(paths))) as pool:
-        return list(pool.map(resolve, paths))
+        futures = [pool.submit(resolve, path) for path in paths]
+    failure = None
+    for pending in futures:
+        if pending.exception() is not None:
+            failure = pending.exception()
+            break
+    if failure is None:
+        return [pending.result() for pending in futures]
+    # The error is raised through this frame: no URL stays in it.
+    futures.clear()
+    pending = None
+    raise failure
 
 
 # ---- collect-time source ---------------------------------------------------
@@ -1074,6 +1097,7 @@ class _BucketSource:
                 else:
                     mine[index] = Future()
                     self._resolving[index] = mine[index]
+            cached = None
         reused = len(urls) > 0
 
         try:
@@ -1084,7 +1108,10 @@ class _BucketSource:
                 urls[index] = pending.result()
         except BaseException:
             # The error is raised through this frame: no URL stays in it.
+            # The futures that are done hold URLs too.
             urls.clear()
+            mine.clear()
+            theirs.clear()
             raise
         return [urls[index] for index in range(start, stop)], reused
 
@@ -1155,8 +1182,9 @@ class _BucketSource:
         An error of the ``resolve`` request itself is raised as it is.
         """
         urls, reused = self._resolve(0, 1, "schema read of a scan_bucket query")
-        lf = pl.scan_parquet(urls, **self.scan_kwargs)
         try:
+            # In the try: polars can reject a scan option here.
+            lf = pl.scan_parquet(urls, **self.scan_kwargs)
             return lf.collect_schema(), None, reused
         except Exception as error:
             self._forget_urls(0, 1)
@@ -1273,16 +1301,17 @@ class _BucketSource:
         scope = "group of files of a scan_bucket query"
         urls, reused = self._resolve(start, stop, scope)
         uris_by_url = self._uris_by_url(start, urls)
-        lf = self._scan_group(urls, uris_by_url)
-        if remaining is not None:
-            lf = lf.head(remaining)
-        if predicate is not None:
-            lf = lf.filter(predicate)
-        if with_columns is not None:
-            lf = lf.select(with_columns)
 
         rows = 0
         try:
+            # In the try: polars can reject a scan option here.
+            lf = self._scan_group(urls, uris_by_url)
+            if remaining is not None:
+                lf = lf.head(remaining)
+            if predicate is not None:
+                lf = lf.filter(predicate)
+            if with_columns is not None:
+                lf = lf.select(with_columns)
             batches = lf.collect_batches(chunk_size=batch_size, engine="streaming")
             for batch in batches:
                 rows += batch.height
