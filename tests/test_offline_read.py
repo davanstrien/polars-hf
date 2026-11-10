@@ -500,13 +500,29 @@ def test_string_prefix_sibling_adds_no_listing_pages(
     assert listings[0].query == "recursive=true"
 
 
-def test_invalid_glob_makes_no_request(fake_hub: FakeHub, fake_bucket: str) -> None:
+def test_invalid_glob_costs_one_listing(fake_hub: FakeHub, fake_bucket: str) -> None:
     fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(0, 5))
 
     with pytest.raises(ValueError, match="must be a whole path segment"):
         plhf.scan_bucket(_uri(fake_bucket, "data/**.parquet"))
 
-    assert fake_hub.matching(origin=HUB) == []
+    # The directory is listed for a file with exactly this name.
+    listings = fake_hub.matching(origin=HUB)
+    assert len(listings) == 1
+    assert listings[0].path.endswith("/tree/data")
+
+
+def test_file_named_like_an_invalid_glob_is_scanned(
+    fake_hub: FakeHub, fake_bucket: str
+) -> None:
+    # Found by the weekly random Hypothesis run (test_properties.py).
+    df = _numbered_frame(0, 5)
+    fake_hub.put_parquet(fake_bucket, "data/**.parquet", df)
+    fake_hub.put_parquet(fake_bucket, "data/a.parquet", _numbered_frame(5, 5))
+
+    got = plhf.scan_bucket(_uri(fake_bucket, "data/**.parquet")).collect()
+
+    assert_frame_equal(got, df)
 
 
 @pytest.mark.usefixtures("allow_signed_urls_in_plan")

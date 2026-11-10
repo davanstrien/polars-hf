@@ -178,6 +178,14 @@ def _error_reply(status: int, code: str, message: str) -> _Reply:
     return reply
 
 
+def _local_content_hashes(paths: list[str]) -> list[str]:
+    hashes = []
+    for path in paths:
+        with open(path, "rb") as file:
+            hashes.append(_content_hash(file.read()))
+    return hashes
+
+
 def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -525,6 +533,8 @@ class FakeHub:
         monkeypatch.setattr(_sinks, "open_xet_commit", self.open_commit)
         monkeypatch.setattr(_sinks, "stream_unavailable_reason", lambda: None)
         monkeypatch.setattr(_sinks, "abort_xet_session", self._abort_session)
+        # The fake names content by its sha256, not by its Xet hash.
+        monkeypatch.setattr(_sinks, "local_xet_hashes", _local_content_hashes)
 
         def _batch_bucket_files(
             api, bucket_id, *, add=None, copy=None, delete=None, token=None, **_

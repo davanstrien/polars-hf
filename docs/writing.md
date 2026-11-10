@@ -101,10 +101,24 @@ Notes on the `"staged"` backend:
 
 - It stages in the directory named by `POLARS_HF_STAGING_DIR`, else in the system temporary
   directory, and removes the files when the write ends.
-- With `huggingface_hub` 1.x, `HfApi.batch_bucket_files` does not report files that the bucket
-  rejected. The backend then lists the destination once after the upload (one extra listing of the
-  file's string prefix, or of the base prefix, per write) and raises if a file is missing or has
-  another size. `huggingface_hub` 2.x reports rejected files itself, and no listing is made.
+- `HfApi.batch_bucket_files` does not always confirm the upload: `huggingface_hub` 1.x does not
+  report files that the bucket rejected, and 2.x returns normally for a `200` answer that confirms
+  nothing. The backend therefore checks the destination after the upload and raises
+  `BucketRegistrationError` if a file is missing or has another size.
+- With `mode="overwrite"` the Xet hash must match: a rejected replacement keeps the old object,
+  which can have the same size. If the Hub gives no Xet hash, or `hf_xet` is not installed (it is
+  installed with `huggingface_hub` on x86_64 and arm64 only), the write raises
+  `BucketRegistrationError` and deletes no old file. With `mode="error"` and `mode="append"` the
+  paths held no object before the write, so the size is enough and no hash is computed. The
+  hash re-reads each staged file with `hf_xet` (about 0.7 GiB/s for one file and 3.8 GiB/s for
+  several files on a laptop).
+- The check is one HEAD request for a single file, and one listing of the base prefix for a
+  partitioned write. With `huggingface_hub` 2.x, a partitioned write checks only with
+  `mode="overwrite"`; `mode="error"` and `mode="append"` make no listing, so a file that 2.x
+  reports as uploaded is not checked.
+- The check runs right after the upload, with no retry. If the Hub answered with stale metadata,
+  the write raises although the files are registered; a listing of the destination shows the
+  state. No old file is deleted in that case.
 
 **Memory.** In laptop runs with outputs up to 4.5 GB, the `"stream"` backend used 0.5–1.8 GB more
 memory than Polars alone. A bound on its memory use is not proven. See
